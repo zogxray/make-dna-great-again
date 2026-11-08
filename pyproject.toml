@@ -1,0 +1,23 @@
+[project]
+name = "make-dna-great-again"
+version = "0.1.0"
+description = "Make DNA Great Again — local TUI for your genotype (Y tree, PGS, AADR)"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.80",
+    "numpy>=1.24",
+    "google-genai>=1.0",
+    "duckdb>=1.1",
+    "pyarrow>=14",
+]
+
+[project.scripts]
+ydna = "ydna.__main__:main"
+mdga = "ydna.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ydna*"]

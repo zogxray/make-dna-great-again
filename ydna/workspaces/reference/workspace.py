@@ -1,0 +1,1116 @@
+"""Режим Reference (F5): AADR по эпохам — список, карта, карточка группы; f3 в фоне."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from rich.text import Text
+from textual import on
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import OptionList, Static
+from textual.widgets.option_list import Option
+
+from ...core import aadr, admix, fstats, genome_db, kg, ref_db
+from ...core.jobs import JOBS
+from ...core.pgs import SUPERPOPS
+from ...core.store import Store
+from ...core.ylink import YBranch, YLink, active_genome, link_genome, load_haplotree, our_branch
+from ..base import KeyBar, ModeBar, Workspace, alt_keys, busy_progress, fit, hide_busy, show_busy
+from ..data.workspace import job_line
+from .view import (REGIONS, card, decide_key, draw_map, draw_y_map, epoch_bar, group_prompt,
+                   layers_view, ranks_of, region_bar, region_of, sort_tuple, source_bar,
+                   tab_bar, tree_view)
+
+JOB = "aadr-f3"
+JOB_KG = "kg-f3"
+JOB_PCA = "aadr-pca"
+JOB_QPADM = "aadr-qpadm"
+JOB_IMPUTE = "aadr-impute"
+JOB_PAINT = "kg-paint"
+JOBS_ALL = (JOB, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT)
+TABS = ("map", "y", "tree", "layers")
+
+
+class ReferenceWorkspace(Workspace):
+    mode_key = "reference"
+    DEFAULT_CSS = """
+    #main { height: 1fr; }
+    #left-col { width: 58; height: 1fr; }
+    #groups-box { height: 2fr; border: round $primary; }
+    #card-box { height: 1fr; border: round $primary; }
+    #map-box { width: 1fr; border: round $primary; }
+    #groups-box:focus-within, #map-box:focus-within, #card-box:focus-within { border: round $accent; }
+    #groups { height: 1fr; border: none; background: transparent; }
+    #source, #epochs, #regions, #view-tabs { height: 1; padding: 0 1; }
+    #map-scroll { height: 1fr; overflow-x: hidden; scrollbar-size-vertical: 1; background: #1E1923; }
+    #card-scroll { height: 1fr; scrollbar-size-vertical: 1; }
+    #map { padding: 0; background: #1E1923; }
+    #card { padding: 0 1; }
+    #help { height: 1; padding: 0 1; color: $text-muted; }
+    #status { height: 1; padding: 0 1; background: $boost; }
+    """
+    BINDINGS = [
+        Binding("left", "epoch_prev", "Epoch −"),
+        Binding("right", "epoch_next", "Epoch +"),
+        Binding("space", "toggle_play", "Play epochs", show=False),
+        Binding(alt_keys("f"), "score", "Scan f3"),
+        Binding(alt_keys("y"), "toggle_y", "Y line"),
+        Binding(alt_keys("p"), "toggle_people", "People"),
+        Binding(alt_keys("u"), "toggle_quest", "Questionable"),
+        Binding(alt_keys("w"), "toggle_world", "World map"),
+        Binding(alt_keys("r"), "region_next", "Region"),
+        Binding(alt_keys("g"), "toggle_source", "AADR/1000G"),
+        Binding(alt_keys("v"), "toggle_tab", "Map/Tree/Layers"),
+        Binding(alt_keys("c"), "cancel", "Cancel"),
+    ]
+
+    def __init__(self, store: Store) -> None:
+        super().__init__()
+        self.store = store
+        self.cat: aadr.Catalog | None = None
+        self.problem = ""
+        self.genome: Path | None = None
+        self.results: dict[str, aadr.F3] = {}
+        self.people: dict[str, aadr.F3] = {}
+        self.ranks: dict[str, float] = {}
+        self.people_ranks: dict[str, float] = {}
+        self.hits: dict[str, aadr.Hit] = {}
+        self.hits_people: dict[str, aadr.Hit] = {}
+        self.y_branch: YBranch | None = None
+        self.y_ours_other: set[str] = set()
+        self.check: dict | None = None
+        self.epoch = "all"
+        self.y_only = False
+        self.people_mode = False
+        self.questionable = False
+        self.world = True
+        self.playing = False
+        self.source = "aadr"
+        self.area = "all"
+        self.tab = "map"
+        self.paint: dict | None = None
+        self.phase: dict | None = None
+        self.kg_people_groups: list[aadr.Group] = []
+        self.pca: dict | None = None
+        self.qpadm: list | None = None
+        self.imputed: dict[str, aadr.F3] = {}
+        self.kg_groups: list[aadr.Group] = []
+        self.kg_problem = ""
+        self.stamp: tuple | None = None
+        self.layer_stamp: tuple | None = None
+        self.layer_aadr: aadr.Bundle | None = None
+        self.layer_aadr_imp: aadr.Bundle | None = None
+        self.layer_kg: kg.Bundle | None = None
+        self.layer_kg_imp: kg.Bundle | None = None
+        self.seen_job: set[int] = {id(j) for k in JOBS_ALL if (j := JOBS.get(k))}
+        self._play = None
+        self._meta_by_name: dict[str, dict] = {}
+        self.loading_msg: str | None = None
+        self._load_gen = 0
+
+    def compose(self) -> ComposeResult:
+        yield ModeBar(self.mode_key)
+        yield Static(id="source")
+        yield Static(id="epochs")
+        yield Static(id="regions")
+        with Horizontal(id="main"):
+            with Vertical(id="left-col"):
+                with Vertical(id="groups-box"):
+                    yield OptionList(id="groups")
+                with Vertical(id="card-box"):
+                    with VerticalScroll(id="card-scroll"):
+                        yield Static(id="card")
+            with Vertical(id="map-box"):
+                yield Static(id="view-tabs")
+                with VerticalScroll(id="map-scroll"):
+                    yield Static(id="map")
+        yield KeyBar([("←→", "Epoch", "screen.epoch_step(1)"), ("Space", "Play", "screen.toggle_play"),
+                      ("F", "Scan f3", "screen.score"), ("G", "AADR/1000G", "screen.toggle_source"),
+                      ("V", "View", "screen.toggle_tab"),
+                      ("Y", "Y line", "screen.toggle_y"),
+                      ("P", "People", "screen.toggle_people"),
+                      ("U", "Questionable", "screen.toggle_quest"),
+                      ("W", "World/fit", "screen.toggle_world"),
+                      ("R", "Region", "screen.region_next"),
+                      ("C", "Cancel", "screen.cancel"),
+                      ("Tab", "Panel", "app.focus_next"),
+                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+        yield Static(id="status")
+
+    def on_mount(self) -> None:
+        self.query_one("#groups-box").border_title = "GROUPS"
+        self.query_one("#map-box").border_title = "MAP"
+        self.query_one("#card-box").border_title = "GROUP"
+        self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
+        self.reload()
+        self.query_one("#groups", OptionList).focus()
+        self.set_interval(0.5, self._tick)
+        self._play = self.set_interval(2.4, self._play_tick, pause=True)
+
+    def on_screen_resume(self) -> None:
+        folder = self.store.path("aadr")
+        folder_changed = folder != (self.cat.folder if self.cat else None)
+        genome = self._active()
+        if folder_changed or self.cat is None:
+            self.reload()
+        elif genome != self.genome:
+            self.refresh_genome()
+
+    def on_resize(self) -> None:
+        self.refresh_map()
+
+    def _active(self) -> Path | None:
+        ws = getattr(self.app, "genome_ws", None)
+        if ws and ws.active and ws.active.exists():
+            return ws.active
+        return active_genome()
+
+    def _set_groups_title(self) -> None:
+        box = self.query_one("#groups-box")
+        if self.loading_msg:
+            box.border_title = f"GROUPS · {self.loading_msg}"
+        elif self.genome:
+            box.border_title = f"GROUPS · for {self.genome.name}"
+        else:
+            box.border_title = "GROUPS · no genome (F1)"
+
+    def _begin_load(self, msg: str, *, title: str) -> int:
+        self._load_gen += 1
+        self.loading_msg = msg
+        self.genome = self._active()
+        self._set_groups_title()
+        self.update_status()
+        show_busy(self.app, title, msg)
+        busy_progress(self.app, msg, frac=0.02)
+        return self._load_gen
+
+    def reload(self) -> None:
+        """Полная перезагрузка каталога + результатов + Y — в фоне, модальный BusyModal."""
+        gen = self._begin_load("Loading AADR…", title="Reference")
+        self.run_worker(lambda: self._reload_work(gen), thread=True, exclusive=True, group="ref-load")
+
+    def refresh_genome(self) -> None:
+        """Смена генома без перечитывания AADR-каталога."""
+        g = self._active()
+        msg = f"Updating Y for {g.name}…" if g else "Updating…"
+        gen = self._begin_load(msg, title="Reference")
+        self.run_worker(lambda: self._genome_work(gen), thread=True, exclusive=True, group="ref-load")
+
+    def _reload_work(self, gen: int) -> None:
+        store = self.store
+        source = self.source
+        questionable = self.questionable
+        genome = self._active()
+        folder = store.path("aadr")
+        cat = None
+        aadr_problem = ""
+        if not folder:
+            aadr_problem = "Set the AADR folder in F2."
+        else:
+            try:
+                cat = aadr.load_catalog(folder)
+            except (OSError, RuntimeError, ValueError) as exc:
+                aadr_problem = str(exc)
+        kg_groups, kg_people, kg_problem = [], [], ""
+        try:
+            kg_groups = kg.groups(store)
+            kg_people = kg.person_groups(store)
+        except (OSError, RuntimeError, ValueError) as exc:
+            kg_problem = str(exc)
+        if not kg_groups and not kg_problem:
+            try:
+                kg.ref_path(store)
+            except RuntimeError as exc:
+                kg_problem = str(exc)
+        if genome:
+            self.app.call_from_thread(self._load_progress, gen,
+                                      f"Updating Y for {genome.name}…", 0.45)
+        results = self._read_results(genome, source, questionable)
+        if genome:
+            self.app.call_from_thread(self._load_progress, gen,
+                                      f"Updating Y for {genome.name}…", 0.7)
+        y = self._compute_y(cat, genome, store)
+        problem = aadr_problem if source == "aadr" else (
+            kg_problem or ("No 1000 Genomes pops." if not kg_groups else ""))
+        self.app.call_from_thread(self._apply_reload, gen, {
+            "genome": genome, "cat": cat, "problem": problem,
+            "kg_groups": kg_groups, "kg_people_groups": kg_people, "kg_problem": kg_problem,
+            **results, **y,
+        })
+
+    def _genome_work(self, gen: int) -> None:
+        genome = self._active()
+        source = self.source
+        questionable = self.questionable
+        cat = self.cat
+        self.app.call_from_thread(self._load_progress, gen,
+                                  f"Updating Y for {genome.name}…" if genome else "Updating…", 0.3)
+        results = self._read_results(genome, source, questionable)
+        self.app.call_from_thread(self._load_progress, gen,
+                                  f"Updating Y for {genome.name}…" if genome else "Updating…", 0.65)
+        y = self._compute_y(cat, genome, self.store)
+        self.app.call_from_thread(self._apply_genome, gen, {
+            "genome": genome, **results, **y,
+        })
+
+    def _load_progress(self, gen: int, msg: str, frac: float = 0.1) -> None:
+        if gen != self._load_gen:
+            return
+        self.loading_msg = msg
+        self._set_groups_title()
+        self.update_status()
+        busy_progress(self.app, msg, frac=frac, title="Reference", subtitle=msg)
+
+    def _apply_reload(self, gen: int, data: dict) -> None:
+        if gen != self._load_gen:
+            return
+        self.loading_msg = None
+        hide_busy(self.app)
+        self.genome = data["genome"]
+        self.cat = data["cat"]
+        self.problem = data["problem"]
+        self.kg_groups = data["kg_groups"]
+        self.kg_people_groups = data["kg_people_groups"]
+        self.kg_problem = data["kg_problem"]
+        self._apply_results_y(data)
+        self.fill_list()
+        self.refresh_all()
+
+    def _apply_genome(self, gen: int, data: dict) -> None:
+        if gen != self._load_gen:
+            return
+        self.loading_msg = None
+        hide_busy(self.app)
+        self.genome = data["genome"]
+        if self.source == "aadr":
+            self.problem = "" if self.cat else "Set the AADR folder in F2."
+        else:
+            self.problem = self.kg_problem or ("No 1000 Genomes pops." if not self.kg_groups else "")
+        self._apply_results_y(data)
+        self.fill_list()
+        self.refresh_all()
+
+    def _apply_results_y(self, data: dict) -> None:
+        self.results = data["results"]
+        self.people = data["people"]
+        self.ranks = data["ranks"]
+        self.people_ranks = data["people_ranks"]
+        self.check = data["check"]
+        self.pca = data["pca"]
+        self.qpadm = data["qpadm"]
+        self.imputed = data["imputed"]
+        self.paint = data["paint"]
+        self.phase = data["phase"]
+        self.stamp = data["stamp"]
+        self.hits = data["hits"]
+        self.hits_people = data["hits_people"]
+        self.y_branch = data["y_branch"]
+        self.y_ours_other = data["y_ours_other"]
+        # LAYERS: не читать aadr/kg бандлы второй раз, если _read_results уже их дал
+        self.layer_stamp = None
+        self._load_layer_bundles(self.genome, self.questionable,
+                                 reuse=data.get("reuse_layers"))
+
+    def _panel_stamp(self, genome: Path | None, source: str, questionable: bool) -> tuple[int, int]:
+        if not genome:
+            return (0, 0)
+        panel = "aadr" if source == "aadr" else "kg"
+        q = questionable if source == "aadr" else False
+        return ref_db.panel_stamps(genome, panel, q)
+
+    def _load_layer_bundles(self, genome: Path | None, questionable: bool,
+                            reuse: dict | None = None) -> None:
+        """Четыре бандла для LAYERS — один раз; tick только сверяет stamp."""
+        if not genome:
+            self.layer_aadr = self.layer_aadr_imp = None
+            self.layer_kg = self.layer_kg_imp = None
+            self.layer_stamp = (0, 0, 0, 0)
+            return
+        stamp = ref_db.layer_stamps(genome, questionable)
+        if stamp == self.layer_stamp and self.layer_aadr is not None:
+            return
+        reuse = reuse or {}
+        self.layer_aadr = reuse.get("aadr") or aadr.load_bundle(genome, questionable)
+        self.layer_aadr_imp = (reuse.get("aadr_imp")
+                               or aadr.load_bundle(genome, questionable, kind="imp"))
+        self.layer_kg = reuse.get("kg") or kg.load_bundle(genome)
+        self.layer_kg_imp = reuse.get("kg_imp") or kg.load_bundle(genome, kind="imp")
+        self.layer_stamp = stamp
+
+    def _read_results(self, genome: Path | None, source: str, questionable: bool) -> dict:
+        out = {
+            "results": {}, "people": {}, "ranks": {}, "people_ranks": {},
+            "check": None, "pca": None, "qpadm": None, "imputed": {},
+            "paint": None, "phase": None,
+            "stamp": self._panel_stamp(genome, source, questionable),
+            "reuse_layers": {},
+        }
+        if not genome:
+            return out
+        if source == "aadr":
+            bundle = aadr.load_bundle(genome, questionable)
+            out["results"], out["people"] = bundle.groups, bundle.people
+            out["check"], out["pca"], out["qpadm"] = bundle.check, bundle.pca, bundle.qpadm
+            imp = aadr.load_bundle(genome, questionable, kind="imp")
+            out["imputed"] = imp.groups
+            out["reuse_layers"] = {"aadr": bundle, "aadr_imp": imp}
+        else:
+            bundle = kg.load_bundle(genome)
+            out["results"], out["pca"] = bundle.groups, bundle.pca
+            out["people"] = bundle.people
+            out["paint"] = bundle.paint
+            out["phase"] = bundle.phase
+            imp = kg.load_bundle(genome, kind="imp")
+            out["imputed"] = imp.groups
+            if imp.paint:
+                out["paint"] = imp.paint
+            if imp.phase:
+                out["phase"] = imp.phase
+            out["reuse_layers"] = {"kg": bundle, "kg_imp": imp}
+        out["ranks"] = ranks_of(out["results"])
+        out["people_ranks"] = ranks_of(out["people"])
+        return out
+
+    def load_results(self) -> None:
+        """Синхронно (переключатель Q / тик по stamp) — каталог уже в памяти."""
+        data = self._read_results(self.genome, self.source, self.questionable)
+        self.results = data["results"]
+        self.people = data["people"]
+        self.ranks = data["ranks"]
+        self.people_ranks = data["people_ranks"]
+        self.check = data["check"]
+        self.pca = data["pca"]
+        self.qpadm = data["qpadm"]
+        self.imputed = data["imputed"]
+        self.paint = data["paint"]
+        self.phase = data["phase"]
+        self.stamp = data["stamp"]
+        self._load_layer_bundles(self.genome, self.questionable,
+                                 reuse=data.get("reuse_layers"))
+
+    def _compute_y(self, cat: aadr.Catalog | None, genome: Path | None, store: Store) -> dict:
+        hits: dict[str, aadr.Hit] = {}
+        hits_people: dict[str, aadr.Hit] = {}
+        y_branch: YBranch | None = None
+        y_ours_other: set[str] = set()
+        empty = {"hits": hits, "hits_people": hits_people, "y_branch": y_branch,
+                 "y_ours_other": y_ours_other}
+        if not cat:
+            return empty
+        tree_path = store.path("ftdna_haplotree")
+        disc = store.path("ftdna_discover")
+        link = None
+        g = None
+        ws = getattr(self.app, "genome_ws", None)
+        if ws and ws.genome and (not genome or genome_db.same_path(ws.genome, genome)):
+            g = ws.genome
+            if isinstance(getattr(ws, "link", None), YLink):
+                link = ws.link
+        # Ветка без haplotree: F3 workspace или tree.branches.
+        tws = getattr(self.app, "tree_ws", None)
+        if genome and tws and tws.branch and tws.branch_genome == genome:
+            y_branch = tws.branch
+        elif genome and tree_path:
+            try:
+                from ...core import tree_db
+                y_branch = tree_db.load_branch(genome, tree_path, disc)
+            except Exception:
+                y_branch = None
+        # При cache hit ветки — бейджи из ref.y_badges, без load_haplotree (~2s).
+        if genome and y_branch and tree_path:
+            try:
+                from ...core import tree_db
+                cat_key = aadr.catalog_cache_key(cat.folder)
+                if cat_key is not None:
+                    _gmt, tfp, dfp = tree_db.branch_fps(genome, tree_path, disc)
+                    cached = ref_db.load_y_badges(
+                        genome, ref_db.catalog_fingerprint(cat_key), tfp, dfp,
+                        y_branch.tip, y_branch.path, link,
+                    )
+                    if cached is not None:
+                        return {"hits": cached["hits"], "hits_people": cached["hits_people"],
+                                "y_branch": y_branch, "y_ours_other": cached["y_ours_other"]}
+            except Exception:
+                pass
+        tree = load_haplotree(tree_path) if tree_path and Path(tree_path).is_file() else None
+        if genome and tree and link is None:
+            try:
+                g = genome_db.get_y(genome, g, store=store)
+                got = link_genome(g, store)
+                link = got if isinstance(got, YLink) else None
+            except (OSError, ValueError, RuntimeError):
+                link = None
+        if isinstance(link, YLink) and tree and y_branch is None:
+            try:
+                from ...core import tree_db
+                y_branch = our_branch(link, tree, g, disc)
+                if y_branch and tree_path:
+                    try:
+                        tree_db.save_branch(genome, y_branch, tree_path, disc)
+                    except Exception:
+                        pass
+            except (OSError, ValueError, RuntimeError):
+                y_branch = None
+        if tree:
+            hits, hits_people = aadr.y_hits(cat, tree, link, y_branch)
+            extra: set[int] = set()
+            if isinstance(link, YLink) and link.derived:
+                on_path = set(y_branch.path) if y_branch else set()
+                extra = {tree.index[link.marks[i].node]
+                         for i in link.derived
+                         if link.marks[i].node in tree.index
+                         and link.marks[i].node not in on_path}
+            if extra:
+                for name, h in (*hits.items(), *hits_people.items()):
+                    if h.relation != "other":
+                        continue
+                    n = tree.index.get(h.node)
+                    if n is not None and extra & tree.lineage({n}):
+                        y_ours_other.add(name)
+            if genome and y_branch and tree_path:
+                try:
+                    from ...core import tree_db
+                    cat_key = aadr.catalog_cache_key(cat.folder)
+                    if cat_key is not None:
+                        _gmt, tfp, dfp = tree_db.branch_fps(genome, tree_path, disc)
+                        ref_db.save_y_badges(
+                            genome, ref_db.catalog_fingerprint(cat_key), tfp, dfp,
+                            y_branch.tip, y_branch.path, link,
+                            hits, hits_people, y_ours_other,
+                        )
+                except Exception:
+                    pass
+        return {"hits": hits, "hits_people": hits_people, "y_branch": y_branch,
+                "y_ours_other": y_ours_other}
+
+    def _on_line(self, name: str) -> bool:
+        return name in (self.hits_people if self.people_mode else self.hits)
+
+    def _y_rank(self, name: str) -> int:
+        h = self._hit_of(name)
+        if not h:
+            return 4
+        return {"same": 0, "ancestor": 1, "downstream": 2, "other": 3}.get(h.relation, 4)
+
+    def _kept(self, s: aadr.Sample) -> bool:
+        return s.keep or (self.questionable and s.questionable)
+
+    def _gcount(self, g: aadr.Group) -> int:
+        if not self.cat or not g.samples:
+            return g.n
+        return sum(1 for i in g.samples if self._kept(self.cat.samples[i]))
+
+    def _scores(self) -> dict[str, aadr.F3]:
+        return self.people if self.people_mode else self.results
+
+    def _ranks(self) -> dict[str, float]:
+        cached = self.people_ranks if self.people_mode else self.ranks
+        if cached:
+            return cached
+        return ranks_of(self._scores())
+
+    def _hit_of(self, name: str) -> aadr.Hit | None:
+        return (self.hits_people if self.people_mode else self.hits).get(name)
+
+    def _in_region(self, g: aadr.Group) -> bool:
+        if self.area == "all":
+            return True
+        return region_of(g.lat, g.lon) == self.area
+
+    def _row_key(self, g: aadr.Group, scores: dict[str, aadr.F3]) -> tuple:
+        """Один ряд: lo = est − 2·se, потом Z, SNP, Y."""
+        r = scores.get(g.name)
+        yr = self._y_rank(g.name)
+        n = self._gcount(g)
+        if r and r.ok:
+            return (0, -(r.est - 2 * r.se), -r.z, -r.snps, yr, g.name)
+        if r:
+            return (1, -r.snps, yr, g.name)
+        return (2, 0 if self._on_line(g.name) else 1, yr, -n, g.name)
+
+    def visible(self) -> list[aadr.Group]:
+        if self.source == "kg":
+            scores = self._scores()
+            pool = self.kg_people_groups if self.people_mode else self.kg_groups
+            rows = [g for g in pool
+                    if (self.epoch == "all" or g.epoch == self.epoch)
+                    and self._in_region(g)]
+            rows.sort(key=lambda g: self._row_key(g, scores))
+            if (self.epoch == "all" and self.area == "all" and self.people_mode
+                    and len(rows) > 250):
+                rows = self._cap_rows(rows, scores)
+            return rows
+        if not self.cat:
+            return []
+        scores = self._scores()
+        rows: list[aadr.Group] = []
+        if self.people_mode:
+            for s in self.cat.samples:
+                if not self._kept(s) or s.group == self.cat.outgroup:
+                    continue
+                g = aadr.as_group(s)
+                if self.epoch != "all" and g.epoch != self.epoch:
+                    continue
+                if not self._in_region(g):
+                    continue
+                if self.y_only and not self._on_line(s.gid):
+                    continue
+                if self.y_only or s.gid in self.hits_people or s.lat is not None or s.gid in self.people:
+                    rows.append(g)
+        else:
+            for g in self.cat.groups.values():
+                if self._gcount(g) <= 0:
+                    continue
+                if self.epoch != "all" and g.epoch != self.epoch:
+                    continue
+                if not self._in_region(g):
+                    continue
+                if self.y_only and not self._on_line(g.name):
+                    continue
+                if self.y_only or g.name in self.hits or g.lat is not None or g.name in self.results:
+                    rows.append(g)
+
+        rows.sort(key=lambda g: self._row_key(g, scores))
+        if (self.epoch == "all" and self.area == "all" and not self.y_only
+                and len(rows) > 250):
+            rows = self._cap_rows(rows, scores)
+        return rows
+
+    def _y_map_groups(self) -> list[aadr.Group]:
+        if not self.cat:
+            return []
+        hits = self.hits_people if self.people_mode else self.hits
+        rows: list[aadr.Group] = []
+        if self.people_mode:
+            for s in self.cat.samples:
+                if not self._kept(s) or s.gid not in hits:
+                    continue
+                g = aadr.as_group(s)
+                if self.epoch != "all" and g.epoch != self.epoch:
+                    continue
+                if not self._in_region(g):
+                    continue
+                rows.append(g)
+        else:
+            for g in self.cat.groups.values():
+                if g.name not in hits or self._gcount(g) <= 0:
+                    continue
+                if self.epoch != "all" and g.epoch != self.epoch:
+                    continue
+                if not self._in_region(g):
+                    continue
+                rows.append(g)
+        return rows
+
+    def _cap_rows(self, rows: list[aadr.Group], scores: dict[str, aadr.F3]) -> list[aadr.Group]:
+        """Первые 200 по lo, плюс Y-линия и хвост unscored — не больше 250."""
+        ok = [g for g in rows if (r := scores.get(g.name)) and r.ok]
+        other = [g for g in rows if g not in ok]
+        out: list[aadr.Group] = []
+        for g in ok[:200]:
+            out.append(g)
+        extra_y = [g for g in rows if self._on_line(g.name) and g not in out]
+        extra_y.sort(key=lambda g: self._y_rank(g.name))
+        for g in extra_y:
+            out.append(g)
+        for g in other:
+            if g not in out:
+                out.append(g)
+            if len(out) >= 250:
+                break
+        return out[:250]
+
+    def _list_meta(self, rows: list[aadr.Group]) -> list[dict]:
+        scores = self._scores()
+        meta = []
+        prev_ok: tuple | None = None
+        place = 0
+        ok_total = sum(1 for g in rows if (r := scores.get(g.name)) and r.ok)
+        seen_out = False
+        for g in rows:
+            r = scores.get(g.name)
+            hit = self._hit_of(g.name)
+            cur = sort_tuple(g, r, hit)
+            decide = decide_key(prev_ok if (r and r.ok) else None, cur, r)
+            outside = not (r and r.ok)
+            head = outside and not seen_out
+            if outside:
+                seen_out = True
+            if r and r.ok:
+                place += 1
+                prev_ok = cur
+                pl = place
+            else:
+                pl = None
+            meta.append({"g": g, "r": r, "hit": hit, "decide": decide,
+                         "place": pl, "ok_total": ok_total, "outside_head": head})
+        return meta
+
+    def fill_list(self) -> None:
+        ol = self.query_one("#groups", OptionList)
+        keep = self.current.name if self.current else None
+        rows = self.visible()
+        ranks = self._ranks()
+        meta = self._list_meta(rows)
+        self._meta_by_name = {m["g"].name: m for m in meta}
+        opts = []
+        for m in meta:
+            g = m["g"]
+            opts.append(Option(group_prompt(g, m["r"], m["hit"], ranks.get(g.name),
+                                            place=m["place"], decide=m["decide"],
+                                            outside_head=m["outside_head"]),
+                               id=g.name))
+        ol.clear_options()
+        ol.add_options(opts)
+        if rows:
+            ids = [g.name for g in rows]
+            ol.highlighted = ids.index(keep) if keep in ids else 0
+        bits = [f"{len(rows)} {'people' if self.people_mode else 'groups'}",
+                "lo › Z › SNP › Y"]
+        if self.y_only:
+            bits.append("Y-only")
+        if self.questionable:
+            bits.append("Q")
+        self.query_one("#groups-box").border_subtitle = " · ".join(bits)
+        self._set_groups_title()
+
+    @property
+    def current(self) -> aadr.Group | None:
+        ol = self.query_one("#groups", OptionList)
+        if ol.highlighted is None:
+            return None
+        opt = ol.get_option_at_index(ol.highlighted)
+        if not opt.id:
+            return None
+        if self.source == "kg":
+            pool = self.kg_people_groups if self.people_mode else self.kg_groups
+            return next((g for g in pool if g.name == opt.id), None)
+        if not self.cat:
+            return None
+        if self.people_mode:
+            i = self.cat.by_gid.get(opt.id)
+            return aadr.as_group(self.cat.samples[i]) if i is not None else None
+        return self.cat.groups.get(opt.id)
+
+    def present_epochs(self) -> list[str]:
+        if self.source == "kg":
+            have = {g.epoch for g in self.kg_groups if g.epoch}
+            return [k for k in ("EUR", "EAS", "SAS", "AFR", "AMR") if k in have]
+        if not self.cat:
+            return []
+        have: set[str] = set()
+        for g in self.cat.groups.values():
+            if self._gcount(g) > 0:
+                have.add(g.epoch)
+        return [k for k, *_ in reversed(aadr.EPOCHS) if k in have]
+
+    def present_regions(self) -> list[str]:
+        have: set[str] = set()
+        pool = (self.kg_people_groups if self.source == "kg" and self.people_mode
+                else self.kg_groups if self.source == "kg"
+                else (list(self.cat.groups.values()) if self.cat else []))
+        for g in pool:
+            r = region_of(g.lat, g.lon)
+            if r:
+                have.add(r)
+        return [r for r in REGIONS if r in have]
+
+    def _epoch_labels(self) -> dict[str, str]:
+        return dict(SUPERPOPS) if self.source == "kg" else aadr.EPOCH_LABEL
+
+    def refresh_all(self) -> None:
+        src = source_bar(self.source)
+        self.query_one("#source", Static).update(src)
+        self.query_one("#epochs", Static).update(
+            epoch_bar(self.epoch, self.present_epochs(), self.playing, self._epoch_labels()))
+        self.query_one("#regions", Static).update(
+            region_bar(self.area, self.present_regions()))
+        self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
+        title = {"map": "MAP", "y": "Y", "tree": "TREE", "layers": "LAYERS"}.get(self.tab, "MAP")
+        self.query_one("#map-box").border_title = title
+        self.refresh_map()
+        self.refresh_card()
+        self.update_status()
+
+    def refresh_map(self) -> None:
+        body = self.query_one("#map", Static)
+        if self.loading_msg and self.tab != "layers":
+            body.update(Text(self.loading_msg, style="#B04A4A"))
+            return
+        if self.problem and self.tab != "layers":
+            body.update(Text(self.problem, style="#B04A4A"))
+            return
+        vis = self.visible()
+        labels = self._epoch_labels()
+        if self.tab == "y":
+            self.query_one("#map-scroll").styles.overflow_y = "hidden"
+            if self.source != "aadr":
+                body.update(Text("Y map is AADR-only. Switch to AADR with G.", style="#AEA5B8"))
+                return
+            box = self.query_one("#map-box")
+            inner = self.query_one("#map-scroll")
+            w = inner.size.width or box.size.width
+            h = inner.size.height or box.size.height
+            cols = max(40, (w or 80) - 6)
+            rows_n = max(12, (h or 24) - 4)
+            if self.epoch == "all":
+                title = "Y"
+            else:
+                title = f"Y · {labels.get(self.epoch, self.epoch)}"
+            if self.people_mode:
+                title += " · people"
+            if self.y_branch:
+                title += f" · {self.y_branch.tip}"
+            hits = self.hits_people if self.people_mode else self.hits
+            body.update(draw_y_map(
+                self._y_map_groups(), self._scores(), self._ranks(), hits,
+                self.y_ours_other, self.current.name if self.current else None,
+                title, self.world, cols, rows_n))
+            return
+        if self.tab == "tree":
+            self.query_one("#map-scroll").styles.overflow_y = "auto"
+            body.update(tree_view(
+                vis, self._scores(), self._ranks(),
+                self.hits_people if self.people_mode else self.hits,
+                self.qpadm, self.present_epochs() if self.epoch == "all" else [self.epoch],
+                labels, self.current.name if self.current else None,
+                paint=self.paint))
+            return
+        if self.tab == "layers":
+            self.query_one("#map-scroll").styles.overflow_y = "auto"
+            self._load_layer_bundles(self.genome, self.questionable)
+            aadr_b, aadr_imp = self.layer_aadr, self.layer_aadr_imp
+            kg_b, kg_imp = self.layer_kg, self.layer_kg_imp
+            rows = admix.layer_state(self.store, self.genome, self.source,
+                                     aadr_b, kg_b, aadr_imp, kg_imp)
+            if self.source == "aadr":
+                chip = aadr_b.groups if aadr_b else {}
+                imp = aadr_imp.groups if aadr_imp else {}
+            else:
+                chip = kg_b.groups if kg_b else {}
+                imp = kg_imp.groups if kg_imp else {}
+            body.update(layers_view(rows, chip, imp))
+            return
+        box = self.query_one("#map-box")
+        inner = self.query_one("#map-scroll")
+        inner.styles.overflow_y = "hidden"
+        w = inner.size.width or box.size.width
+        h = inner.size.height or box.size.height
+        # scatter_map: 6-char lat gutter + cols; 4 chrome rows (title, 2 rules, lon axis)
+        cols = max(40, (w or 80) - 6)
+        rows_n = max(12, (h or 24) - 4)
+        if self.epoch == "all":
+            title = "ALL EPOCHS" if self.source == "aadr" else "1000 GENOMES"
+        else:
+            title = labels.get(self.epoch, self.epoch)
+        if self.people_mode:
+            title += " · people"
+        body.update(draw_map(vis, self._scores(), self._ranks(),
+                             self.current.name if self.current else None, title,
+                             self.world, cols, rows_n))
+
+    def refresh_card(self) -> None:
+        g = self.current
+        sample = None
+        if (self.source == "aadr" and self.people_mode and self.cat and g
+                and g.name in self.cat.by_gid):
+            sample = self.cat.samples[self.cat.by_gid[g.name]]
+        if g is None:
+            title = "GROUP"
+        elif sample is not None:
+            title = f"PERSON · {sample.gid}"
+        else:
+            title = f"GROUP · {g.name}"
+        self.query_one("#card-box").border_title = fit(title, 40)
+        info = self._meta_by_name.get(g.name) if g else None
+        ranks = self._ranks()
+        t = card(g, sample=sample,
+                 cat=self.cat if self.source == "aadr" else None,
+                 hit=self._hit_of(g.name) if g else None,
+                 branch=self.y_branch.tip if self.y_branch else None,
+                 questionable=self.questionable,
+                 qpadm=self.qpadm if self.source == "aadr" else None,
+                 paint=self.paint,
+                 result=self._scores().get(g.name) if g else None,
+                 place=info["place"] if info else None,
+                 ok_total=info["ok_total"] if info else 0,
+                 decide=info["decide"] if info else "lo",
+                 rank=ranks.get(g.name) if g else None)
+        self.query_one("#card", Static).update(t)
+
+    def update_status(self) -> None:
+        if self.loading_msg:
+            g = f"    GENOME: {self.genome.name}" if self.genome else "    GENOME: —"
+            self.query_one("#status", Static).update(f"{self.loading_msg}{g}")
+            return
+        scored = sum(1 for r in self.results.values() if r.ok)
+        if self.source == "aadr":
+            n = self.cat.n_pass if self.cat else 0
+            g = len(self.cat.groups) if self.cat else 0
+            og = self.cat.outgroup if self.cat else "—"
+            people = sum(1 for r in self.people.values() if r.ok)
+            line = f"AADR: {n:,} samples · {g:,} groups · outgroup {og}    f3: {scored}g/{people}p"
+            if self.y_branch:
+                line += f"    Y {self.y_branch.tip}"
+            if self.questionable:
+                line += "    Q"
+            if self.check:
+                mark = "ok" if self.check.get("ok") else f"#{self.check.get('rank')}"
+                line += f"    LOO {self.check.get('gid')}: {mark}"
+        else:
+            people_n = sum(1 for r in self.people.values() if r.ok)
+            line = f"1000G: {len(self.kg_groups)} pops · outgroup YRI    f3: {scored}g/{people_n}p"
+            if self.imputed:
+                line += f"    imputed {sum(1 for r in self.imputed.values() if r.ok)}"
+            if self.paint and self.paint.get("pops"):
+                line += "    painted"
+            if self.phase:
+                line += "    phased" if self.phase.get("phased") else "    unphased"
+        if self.genome:
+            line += f"    GENOME: {self.genome.name}"
+        else:
+            line += "    GENOME: — (F1)"
+        running = [j for k in JOBS_ALL if (j := JOBS.get(k)) and j.running]
+        if running:
+            job = running[0]
+            line += f"    ⚙ {job.title}: {job.stage} · {job_line(job)}"
+        self.query_one("#status", Static).update(line)
+
+    def _tick(self) -> None:
+        running = [j for k in JOBS_ALL if (j := JOBS.get(k)) and j.running]
+        if running or self.tab == "layers" or self.loading_msg:
+            self.update_status()
+            if self.tab == "layers" and not self.loading_msg:
+                self.refresh_map()
+        if self.genome and not self.loading_msg:
+            stamp = self._panel_stamp(self.genome, self.source, self.questionable)
+            layer_stamp = ref_db.layer_stamps(self.genome, self.questionable)
+            if stamp != self.stamp or layer_stamp != self.layer_stamp:
+                self.load_results()
+                self.fill_list()
+                self.refresh_all()
+        for k in JOBS_ALL:
+            job = JOBS.get(k)
+            if job and not job.running and id(job) not in self.seen_job:
+                self.seen_job.add(id(job))
+                sev = {"done": "information", "failed": "error"}.get(job.status, "warning")
+                self.app.notify(f"{job.title}: {job.message}", severity=sev, timeout=8)
+                self.refresh_all()
+
+    def _play_tick(self) -> None:
+        if self.playing:
+            self.action_epoch_step(1)
+
+    @on(OptionList.OptionHighlighted, "#groups")
+    def _highlighted(self) -> None:
+        self.refresh_card()
+        self.refresh_map()
+
+    def action_epoch(self, key: str) -> None:
+        self.epoch = key
+        if key == "all":
+            self.playing = False
+            if self._play:
+                self._play.pause()
+        self.fill_list()
+        self.refresh_all()
+
+    def action_region(self, key: str) -> None:
+        keys = ["all", *self.present_regions()]
+        if key not in keys:
+            key = "all"
+        self.area = key
+        self.fill_list()
+        self.refresh_all()
+
+    def action_region_next(self) -> None:
+        keys = ["all", *self.present_regions()]
+        if self.area not in keys:
+            self.area = "all"
+        i = keys.index(self.area) if self.area in keys else 0
+        self.action_region(keys[(i + 1) % len(keys)])
+
+    def action_epoch_prev(self) -> None:
+        self.action_epoch_step(-1)
+
+    def action_epoch_next(self) -> None:
+        self.action_epoch_step(1)
+
+    def action_epoch_step(self, d: int) -> None:
+        keys = self.present_epochs()
+        if not keys:
+            return
+        if self.epoch == "all" or self.epoch not in keys:
+            self.action_epoch(keys[0 if int(d) >= 0 else -1])
+            return
+        i = keys.index(self.epoch)
+        self.action_epoch(keys[(i + int(d)) % len(keys)])
+
+    def action_toggle_play(self) -> None:
+        self.playing = not self.playing
+        if self.playing:
+            if self.epoch == "all":
+                keys = self.present_epochs()
+                if keys:
+                    self.epoch = keys[0]
+                    self.fill_list()
+            if self._play:
+                self._play.resume()
+        elif self._play:
+            self._play.pause()
+        self.refresh_all()
+
+    def action_toggle_y(self) -> None:
+        if self.source != "aadr":
+            self.app.notify("Y line is AADR-only", timeout=4)
+            return
+        self.y_only = not self.y_only
+        self.fill_list()
+        self.refresh_all()
+        if self.y_only and self.y_branch:
+            off = sum(1 for h in self.hits.values() if h.relation == "other")
+            self.app.notify(f"Y branch {self.y_branch.tip} · {off} other Y still listed")
+
+    def action_toggle_people(self) -> None:
+        if self.source == "kg" and not self.kg_people_groups:
+            self.app.notify("1000G people appear after an f3 scan", timeout=4)
+        self.people_mode = not self.people_mode
+        self.fill_list()
+        self.refresh_all()
+
+    def action_toggle_quest(self) -> None:
+        if self.source != "aadr":
+            self.app.notify("Questionable is AADR-only", timeout=4)
+            return
+        self.questionable = not self.questionable
+        self.load_results()
+        self.fill_list()
+        self.refresh_all()
+        if self.questionable and not self.results:
+            self.app.notify("Questionable on — press F to rescan including them", timeout=6)
+
+    def action_toggle_world(self) -> None:
+        self.world = not self.world
+        self.refresh_map()
+
+    def action_score(self) -> None:
+        if not self.genome:
+            self.app.notify("Load a genotype file in F1 first", severity="warning")
+            return
+        gp, store = self.genome, self.store
+        ws = getattr(self.app, "genome_ws", None)
+        loaded = ws.genome if ws and genome_db.same_path(ws.genome, gp) else None
+        if self.source == "kg":
+            if self.kg_problem:
+                self.app.notify(self.kg_problem, severity="warning")
+                return
+            if (job := JOBS.get(JOB_KG)) and job.running:
+                self.app.notify("1000G f3 is already running (C cancels it)", severity="warning")
+                return
+            JOBS.start(JOB_KG, f"1000G · outgroup-f3 (YRI) · {gp.name}",
+                       lambda j: kg.scan_f3(store, gp, j, loaded))
+            self.update_status()
+            return
+        if self.loading_msg:
+            self.app.notify(self.loading_msg, severity="warning")
+            return
+        if self.problem:
+            self.app.notify(self.problem, severity="warning")
+            return
+        if not self.cat or not self.cat.files.get("geno"):
+            self.app.notify("AADR .geno is missing", severity="warning")
+            return
+        if (job := JOBS.get(JOB)) and job.running:
+            self.app.notify("f3 scan is already running (C cancels it)", severity="warning")
+            return
+        q = self.questionable
+        JOBS.start(JOB, f"AADR · outgroup-f3 · {gp.name}",
+                   lambda j, q=q: fstats.scan_f3(store, gp, j, loaded, q))
+        self.update_status()
+
+    def action_cancel(self) -> None:
+        stopped = 0
+        for k in JOBS_ALL:
+            job = JOBS.get(k)
+            if job and job.running:
+                job.cancel()
+                stopped += 1
+        if stopped:
+            self.app.notify(f"Cancelling {stopped} job(s)")
+        else:
+            self.app.notify("Nothing is running")
+
+    def action_source(self, key: str) -> None:
+        if key not in ("aadr", "kg") or key == self.source:
+            return
+        self.source = key
+        self.epoch = "all"
+        self.area = "all"
+        self.people_mode = False
+        self.y_only = False
+        self.reload()
+
+    def action_toggle_source(self) -> None:
+        self.action_source("kg" if self.source == "aadr" else "aadr")
+
+    def action_tab(self, key: str) -> None:
+        if key not in TABS or key == self.tab:
+            return
+        self.tab = key
+        self.refresh_all()
+        self.query_one("#map-scroll").scroll_home(animate=False)
+
+    def action_toggle_tab(self) -> None:
+        i = TABS.index(self.tab) if self.tab in TABS else 0
+        self.action_tab(TABS[(i + 1) % len(TABS)])
+
+    def action_layer(self, kind: str) -> None:
+        if not self.genome:
+            self.app.notify("Load a genotype file in F1 first", severity="warning")
+            return
+        if self.loading_msg:
+            self.app.notify(self.loading_msg, severity="warning")
+            return
+        gp, store = self.genome, self.store
+        ws = getattr(self.app, "genome_ws", None)
+        loaded = ws.genome if ws and genome_db.same_path(ws.genome, gp) else None
+        q = self.questionable
+        if kind == "pca":
+            if (job := JOBS.get(JOB_PCA)) and job.running:
+                self.app.notify("smartpca is already running", severity="warning")
+                return
+            JOBS.start(JOB_PCA, f"AADR · smartpca · {gp.name}",
+                       lambda j, q=q: admix.run_smartpca(store, gp, j, loaded, q))
+        elif kind == "qpadm":
+            if (job := JOBS.get(JOB_QPADM)) and job.running:
+                self.app.notify("qpAdm is already running", severity="warning")
+                return
+            JOBS.start(JOB_QPADM, f"AADR · qpAdm · {gp.name}",
+                       lambda j, q=q: admix.run_qpadm(store, gp, j, loaded, q))
+        elif kind == "impute":
+            if (job := JOBS.get(JOB_IMPUTE)) and job.running:
+                self.app.notify("imputation is already running", severity="warning")
+                return
+            JOBS.start(JOB_IMPUTE, f"Beagle · impute · {gp.name}",
+                       lambda j, q=q: admix.run_impute(store, gp, j, loaded, q))
+        elif kind == "paint":
+            if (job := JOBS.get(JOB_PAINT)) and job.running:
+                self.app.notify("ChromoPainter is already running", severity="warning")
+                return
+            JOBS.start(JOB_PAINT, f"1000G · ChromoPainter · {gp.name}",
+                       lambda j: admix.run_paint_job(store, gp, j, loaded))
+        else:
+            self.app.notify(f"Unknown layer {kind}", severity="warning")
+            return
+        self.tab = "layers"
+        self.refresh_all()
+
+    def action_select(self, name: str) -> None:
+        ol = self.query_one("#groups", OptionList)
+        for i in range(ol.option_count):
+            if ol.get_option_at_index(i).id == name:
+                ol.highlighted = i
+                ol.focus()
+                return

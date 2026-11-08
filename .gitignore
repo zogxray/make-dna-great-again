@@ -1,0 +1,102 @@
+# ── data/: only directory skeleton (.gitkeep). Never names or content. ─
+# (genome kits, Discover JSON, AADR, 1000G, PGS — all stay local)
+/data/**
+!/data/**/
+!/data/**/.gitkeep
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+cython_debug/
+
+# ── virtualenvs ───────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+.env/
+.envrc
+
+# ── secrets / local env ───────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ── IDE / editors ─────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+*.code-workspace
+.history/
+.cursor/
+
+# ── OS ────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ── logs / temp / local run artifacts ─────────────────────────────────
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+.cache/
+tmp/
+temp/
+*.part
+
+# ── local one-off scripts / DuckDB scratch (not shipped) ──────────────
+/local/
+*.duckdb
+*.duckdb.wal

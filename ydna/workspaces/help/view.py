@@ -1,0 +1,164 @@
+"""Текст F7 Help: флоу и UX для продвинутого любителя (не мануал по API)."""
+
+from __future__ import annotations
+
+from rich.console import Group, RenderableType
+from rich.markdown import Markdown
+from rich.padding import Padding
+
+HELP_MD = """\
+# Make DNA Great Again · how to use it
+
+This is a **local** tool for one person’s genotype file. Not a web report factory:
+you keep the data, you choose what to run, and screens stay inspectable.
+
+Intended reader: you already know haplogroups and PCA-ish ancestry talk, you are
+tired of black-box consumer sites, but you are not living in R/`admixture` yet.
+Technical guts exist under the hood; this page is about **what to do** and
+**what you will see**.
+
+---
+
+## Suggested path (first hour)
+
+1. **F1 Genome** — open your RAW/TXT (23andMe, Ancestry, Argenética, …).
+2. **F2 Data** — point paths at the references you care about (at least FTDNA
+   Haplotree; Discover folder if you want rich Y cards; AADR if you want F5).
+3. **F3 Tree** — walk the Y tree with **your** branch highlighted (**O** = Our Y).
+4. **F4 PGS** — polygenic scores when you have a models folder from F2.
+5. **F5 Reference** — f3 / ancient & 1000 Genomes panels against AADR (or 1000G).
+6. **F6 Chat** — ask Gemini with the same context you already loaded (API key in F2).
+7. **F7 Help** — you are here.
+
+You can skip screens. Nothing forces a “full report”.
+
+---
+
+## F1 · Genome
+
+**Job:** pick the active genotype and see what is in the file.
+
+- Add files (**O** / Ins), choose one as active (Enter).
+- Chromosome panel + summary: builds, call rates, named Y markers when linked.
+- First open may take a few seconds (parse into the local DB, then link Y names
+  to the haplotree from F2). Later opens reuse that store.
+
+**UX tip:** F1 is the “who am I looking at?” switch for every other mode.
+Change the active file here; F3/F5 follow it.
+
+---
+
+## F2 · Data
+
+**Job:** tell the app where reference datasets live, download or verify them.
+
+Grouped sources (FTDNA, YFull/TheYtree overlays, PGS models, AADR, Gemini key…).
+Each row: path status, size hints, optional fetch/verify in the background.
+
+**Minimum for a useful Y session**
+
+- FTDNA **Haplotree** JSON → F3 topology + Y linking.
+- FTDNA **Discover** folder → dates, countries, ancient cards on nodes (optional
+  but the tree feels empty without it).
+
+**Minimum for F5**
+
+- **AADR** folder (the classic `.geno` / `.ind` / `.anno` trio).
+
+Paths and keys are remembered. Background jobs keep running if you leave F2.
+
+---
+
+## F3 · Tree
+
+**Job:** browse the FTDNA Y tree with **your** path marked.
+
+On enter: load tree (cached after first build), then resolve **Our Y** (saved per
+genome; recalculated only when inputs change). Loader stays until both finish so
+the tree does not flash “empty of me”.
+
+Useful reflexes
+
+- **O** — jump to / show Our Y tip.
+- Search `/`, filter **F**, sort **S**, rich branches **B**.
+- Card tabs on the right: overview, variants, ancient, map… Discover pages hydrate
+  on demand (not everything is kept fully expanded in memory).
+- **D** / Shift+D — fetch missing Discover JSON for a node or branch (needs F2 path).
+
+Overlays (YFull / TheYtree) appear as read-only extras when those sources are set
+in F2 — they do not rewrite FTDNA topology.
+
+---
+
+## F4 · PGS
+
+**Job:** score curated polygenic models on the active genome; optionally compare
+to another file or 1000 Genomes-style references shipped with the catalog.
+
+- Left: model lists (curated / themes).
+- Center: card for the selected model.
+- **G** / **A** — score theme or all; results stick for that genome.
+
+This is “effect sizes on *your* SNPs”, not medical advice. Treat extremes as
+conversation starters, not diagnoses.
+
+---
+
+## F5 · Reference
+
+**Job:** put your genome next to published panels — mainly **AADR** ancients
+(and optionally 1000 Genomes), with f3-style results you already computed offline.
+
+What loads when you open F5
+
+- AADR **catalog** (who the groups are, including Y labels on ancients).
+- **Your result bundles** for this genome (the scan you ran earlier).
+- **Y relation tags** on groups (same / ancestor / downstream / other) using the
+  same Our Y idea as F3.
+
+So “Loading AADR…” is really “catalog + my results + Y badges”. If the scan is
+done, numbers appear from the local store; the catalog is still needed to name
+and tag the rows.
+
+**F** starts / manages scoring jobs when you need a new panel. **G** toggles
+AADR ↔ 1000G. Map / tree / layers views are different lenses on the same groups.
+
+---
+
+## F6 · Chat
+
+**Job:** notebook-ish threads with Gemini (key + model in F2).
+
+- Left: chats. Center: transcript. Right: free NOTES (yours, not the model).
+- Enter sends; replies stream into the thread and are stored locally.
+- **YOU** vs **GEMINI** are styled differently on purpose.
+- **N** copies the last model reply into NOTES; **S** select-mode for copy/paste.
+
+The model does not automatically see your RAW file; talk in terms of what you
+already found in F3–F5, or paste snippets into NOTES / the prompt yourself.
+
+---
+
+## Mental model
+
+| Mode | Question it answers |
+|------|---------------------|
+| F1 | Which file is active? What SNPs / Y names does it carry? |
+| F2 | Where is the reference data? Is it complete? |
+| F3 | Where am I on the Y tree? What do Discover cards say? |
+| F4 | How do PGS models land on *my* genotypes? |
+| F5 | How do I sit among ancients / reference pops (f3 + Y tags)? |
+| F6 | Can I think out loud with a model, with notes beside? |
+
+Everything important stays on your machine. Slow first opens are usually
+“build or unpack a cache once”; warm revisits should feel light.
+
+**Q** quits (with confirm). **F1–F7** switch modes anytime.
+
+Only one app window at a time. If a second start says “already running”, close the
+other window or `kill` that PID — you do not need to touch any database files.
+"""
+
+
+def help_view() -> RenderableType:
+    return Padding(Markdown(HELP_MD), (1, 2, 1, 2))
