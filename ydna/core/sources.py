@@ -20,7 +20,14 @@ from pathlib import Path
 from . import pgs
 from .jobs import USER_AGENT, Job, ensure_space, fetch, md5_file, run_tool
 from .store import Store, data_dir
-from .ylink import Coverage, coverage, eta_text, fetch_cost, fetch_resources
+from .ylink import (Coverage, FetchPlan, coverage, eta_text, fetch_cost,
+                    fetch_plan, fetch_resources)
+
+
+def _stage_fact(n: int) -> str:
+    if not n:
+        return "done"
+    return f"{n:,} · {fetch_cost(n)}"
 
 
 def human_size(n: float | None) -> str:
@@ -69,6 +76,7 @@ class Source:
     can_download = False
     can_verify = False
     can_fetch = False             # докачка недостающего на месте, без выбора пути
+    needs_genome = False          # D требует активный геном F1 (покрытие / Y-link)
     download_note = ""
 
     def check(self, path: Path | None, store: Store | None = None) -> Status:
@@ -170,29 +178,43 @@ class FtdnaDiscover(Source):
             st.facts.insert(2, ("Haplotree coverage", cov))
             return
         st.coverage = cov
+        plan = fetch_plan(store)
         n = st.summary.split(" ", 1)[0]
-        st.summary = f"{n} · {cov.percent:.1f}% of haplotree · {len(cov.missing_mine):,} to fetch"
+        if isinstance(plan, FetchPlan):
+            pending = (plan.count("our") + plan.count("children") + plan.count("genome")
+                       + plan.count("all_genomes"))
+            st.summary = (f"{n} · {cov.percent:.1f}% of haplotree · stages 1–4 left {pending:,}"
+                          f" · tip {plan.tip or '—'}")
+        else:
+            st.summary = f"{n} · {cov.percent:.1f}% of haplotree · {len(cov.missing_mine):,} to fetch"
         rows = [("Haplotree coverage", f"{cov.downloaded:,} of {cov.tree_nodes:,} haplogroups "
                  f"({cov.percent:.2f}%)")]
         if cov.outside:
             rows.append(("Not in haplotree", f"{cov.outside:,} downloaded haplogroups are absent from the "
                          "current haplotree (renamed or removed)"))
-        if cov.named and not cov.found:
+        if isinstance(plan, FetchPlan):
+            tip = plan.tip or "—"
+            rows += [
+                ("Fetch stages", f"tip {tip} · genome {plan.genome_label} · {plan.n_genomes} file(s) in F1"),
+                ("  1 Our path", _stage_fact(plan.count("our"))),
+                ("  2 Children", _stage_fact(plan.count("children"))),
+                ("  3 This genome", _stage_fact(plan.count("genome"))
+                 + " · exclusive of 1–2"),
+                ("  4 All genomes", _stage_fact(plan.count("all_genomes"))
+                 + " · other F1 files, exclusive of 1–3"),
+                ("  5 Whole tree", _stage_fact(plan.count("tree"))),
+            ]
+        elif cov.named and not cov.found:
             rows.append(("Your Y markers", f"{cov.marker_source}: none of {cov.named:,} named SNPs is a "
                          "haplotree variant (e.g. 23andMe internal i-IDs); markers come from the active "
                          "file in F1"))
         elif cov.named:
             rows += [("Your Y markers", f"{cov.marker_source} (active in F1): {cov.named:,} named, "
                       f"{cov.found:,} found in haplotree"),
-                     ("  their haplogroups", f"{cov.linked:,}, downloaded {cov.linked_have:,} "
-                      f"({100 * cov.linked_have / max(1, cov.linked):.1f}%)"),
-                     ("  with all ancestors", f"{cov.lineage:,}, downloaded {cov.lineage_have:,} "
-                      f"({100 * cov.lineage_have / max(1, cov.lineage):.1f}%)"),
                      ("  can be fetched", f"{len(cov.missing_mine):,}"
-                      + (f" ({eta_text(len(cov.missing_mine))} at 2–5 s per request)" if cov.missing_mine else ""))]
+                      + (f" ({eta_text(len(cov.missing_mine))})" if cov.missing_mine else ""))]
         else:
             rows.append(("Your Y markers", "no active genome in F1 and no progress.csv"))
-        rows.append(("Whole tree", f"{cov.n_missing_all:,} not downloaded ({fetch_cost(cov.n_missing_all)})"))
         if cov.not_found:
             rows.append(("Not in Discover", f"{cov.not_found:,} haplogroups: no Search hint and no "
                          "resource JSON, or only a Discover alias (skipped when fetching)"))
@@ -1108,38 +1130,61 @@ class PgsModels(Source):
     key = "pgs_models"
     title = "PGS Catalog models"
     url = "https://www.pgscatalog.org"
-    about = ("Polygenic score models selected by build_catalog.py: catalog/catalog.tsv (status ok = themed, "
-             "mostly European training sample, good coverage of a consumer chip) and their weight files "
-             "data/PGS*.txt.gz. The PGS mode (F4) scores them against 1000 Genomes.")
-    size_hint = "~1–2 MB per model; the reference panel built from 1000 Genomes is ~300 MB"
-    download_note = "Built by build_catalog.py (PGS Catalog metadata + weights); point to its work folder."
+    about = ("Local catalog of polygenic scores from the PGS Catalog API: themed traits "
+             "(intelligence, sleep, brain, appearance, body, fitness, behavior, diet), "
+             "clinical phenotypes kept as excluded_disease, plus coverage vs your F1 genome. "
+             "Files: catalog/catalog.tsv and data/PGS*.txt.gz. F4 scores them against 1000 Genomes.")
+    size_hint = "API metadata cache + ~1–2 MB per weight file; first build can take a while"
+    can_download = True
+    needs_genome = True
+    download_note = ("D builds/updates the catalog here (API metadata + weights + coverage vs F1). "
+                     "Or P to an existing catalog folder.")
 
     def _check(self, path: Path) -> Status:
         if not path.is_dir():
             return Status("missing", "folder not found")
         cat = pgs.catalog_path(path)
         if not cat.exists():
-            return Status("missing", "catalog/catalog.tsv not found")
-        models = pgs.load_catalog(path, force_sync=False)
-        have = [m for m in models if pgs.weights_path(path, m.pgs_id).exists()]
-        by_theme = Counter(m.theme for m in models)
-        facts = [("Models (status ok)", f"{len(models):,}"),
-                 ("Weight files", f"{len(have):,} of {len(models):,}"),
-                 ("By theme", " · ".join(f"{pgs.THEME_LABEL.get(t, t)} {n}" for t, n in by_theme.items())),
-                 ("Catalog", f"{mtime_label(cat)}")]
+            return Status("missing", "catalog/catalog.tsv not found — press D to build")
+        # Полный индекс (любой status), не только ok — для DISEASES / LOW COV вкладок F4.
+        index = pgs.read_catalog_index(path)
+        models = list(index.values())
+        ok = [m for m in models if m.status == "ok"]
+        have = [m for m in ok if pgs.weights_path(path, m.pgs_id).exists()]
+        by_status = Counter(m.status or "?" for m in models)
+        by_theme = Counter(m.theme for m in ok)
+        facts = [
+            ("Rows in catalog", f"{len(models):,}"),
+            ("Status ok", f"{len(ok):,}"),
+            ("Weight files (ok)", f"{len(have):,} of {len(ok):,}"),
+            ("Statuses", " · ".join(f"{s} {n}" for s, n in by_status.most_common(6))),
+            ("Ok by theme", " · ".join(
+                f"{pgs.THEME_LABEL.get(t, t)} {n}" for t, n in by_theme.items()) or "—"),
+            ("Catalog", mtime_label(cat)),
+        ]
         info = pgs.panel_info()
         facts.append(("Reference panel", f"{info['variants']:,} SNPs from {info['models']} models, built "
                       f"{info['built'].replace('T', ' ')}" if info else
                       "not built yet; F4 builds it on the first run (needs 1000 Genomes)"))
         files = [FileRow("catalog/catalog.tsv", cat.stat().st_size, mtime_label(cat))]
-        missing = len(models) - len(have)
+        meta = path / "catalog" / "scores_all.json"
+        if meta.exists():
+            files.append(FileRow("catalog/scores_all.json", meta.stat().st_size, "API metadata cache"))
+        missing = len(ok) - len(have)
+        if not ok:
+            return Status("partial", f"{len(models)} rows · no status=ok yet", facts, files)
         if missing:
             files.append(FileRow(f"{missing} weight file(s)", None, "missing in data/", False))
-            return Status("partial", f"{len(models)} models · {missing} without weights", facts, files)
-        return Status("ok", f"{len(models)} models · {len(by_theme)} themes", facts, files)
+            return Status("partial", f"{len(ok)} ok · {missing} without weights", facts, files)
+        return Status("ok", f"{len(ok)} ok · {len(by_theme)} themes · {len(models)} total", facts, files)
 
     def suggest(self, store: Store) -> Path:
         return store.path(self.key) or data_dir() / "pgs"
+
+    def download(self, path: Path, job: Job) -> str:
+        from . import pgs_catalog
+        path.mkdir(parents=True, exist_ok=True)
+        return pgs_catalog.build(path, job)
 
 
 class Gemini(Source):

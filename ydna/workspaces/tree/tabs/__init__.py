@@ -2,7 +2,7 @@
 
 Новая вкладка — это функция `render(ctx, doc, node)` с декоратором `@tab("Название")`
 в любом модуле этого пакета (модуль нужно импортировать внизу файла).
-Порядок регистрации = порядок вкладок; клавиши 1–9 строятся из реестра автоматически.
+Порядок регистрации = порядок вкладок; клавиши 1–9,0,-,= строятся из реестра.
 Если вкладке нужны свои клавиши: `@tab("Название", keys={"x": handler})`, handler(ctx).
 """
 
@@ -36,19 +36,37 @@ def tab(title: str, keys: dict[str, Callable[[Any], None]] | None = None):
 
 
 class Doc:
-    """Небольшой построитель Rich Text для правой панели."""
+    """Rich Text инспектора · Magazine: секция → воздух → тело.
+
+    title() даёт ровно одну пустую строку перед секцией (не в начале документа).
+    Карточки сами оставляют один воздух снизу — title это учитывает.
+    """
 
     def __init__(self) -> None:
         self.t = Text()
 
+    def _ensure_section_gap(self) -> None:
+        """Ровно одна пустая строка перед новым блоком (idempotent)."""
+        plain = self.t.plain
+        if not plain:
+            return
+        if plain.endswith("\n\n"):
+            return
+        if plain.endswith("\n"):
+            self.t.append("\n")
+        else:
+            self.t.append("\n\n")
+
     def title(self, s: str) -> None:
-        self.t.append(f"\n{s}\n", style="bold #FBF6F0")
+        self._ensure_section_gap()
+        self.t.append(f"{s}\n", style="bold #FBF6F0")
 
     def head(self, s: str, style: str = "bold #D4AD72") -> None:
+        self._ensure_section_gap()
         self.t.append(s + "\n", style=style)
         self.t.append("━" * min(len(s) + 8, 60) + "\n", style="#5A5361")
 
-    def line(self, s: str, style: str = "", indent: int = 0) -> None:
+    def line(self, s: str, style: str = "", indent: int = 1) -> None:
         self.t.append("  " * indent + s + "\n", style=style)
 
     def link(self, name: str, style: str = "") -> None:
@@ -59,6 +77,10 @@ class Doc:
         value = clean(value)
         self.t.append("  " * indent + f"{key}: ", style="#AEA5B8")
         self.t.append(f"{value}\n")
+
+    def sub(self, s: str, indent: int = 1) -> None:
+        """Подзаголовок внутри секции (без лишнего воздуха и без рамки)."""
+        self.t.append("  " * indent + s + "\n", style="bold #D4AD72")
 
 
 def _scalar(v: Any) -> bool:
@@ -93,11 +115,13 @@ def dump(doc: Doc, value: Any, indent: int = 1, skip: tuple[str, ...] = ()) -> N
 class Ctx:
     """Общий контекст вкладок: данные дерева и блоки, которые нужны нескольким вкладкам."""
 
-    def __init__(self, nodes: dict, children: dict, folder: Path, stats: dict) -> None:
+    def __init__(self, nodes: dict, children: dict, folder: Path, stats: dict,
+                 store=None) -> None:
         self.nodes = nodes
         self.children = children
         self.folder = folder
         self.stats = stats
+        self.store = store  # тот же Store, что у TreeWorkspace (без нового connect)
         self.ours: set[str] = set()
         self.tip: str | None = None
         self.raw_full = False
@@ -114,8 +138,7 @@ class Ctx:
             return self._overlays
         try:
             from ....core.overlays import load_overlays
-            from ....core.store import Store
-            idx = load_overlays(Store())
+            idx = load_overlays(self.store)
         except Exception:  # noqa: BLE001
             idx = None
         self._overlays = idx if idx is not None else False
@@ -322,12 +345,19 @@ class Ctx:
     # — общие блоки —
     def class_label(self, node: dict) -> str:
         s, c = self.stats, node.get("rich", "normal")
+
+        def thr(key: str) -> str:
+            v = s.get(key) if isinstance(s, dict) else None
+            if isinstance(v, (int, float)):
+                return f"{int(v):,}"
+            return "?"
+
         return {
-            "hub": f"HUB · ≥ {s.get('hub_thr', '?'):,} descendants (top 1%)",
-            "rich": f"RICH · ≥ {s.get('rich_thr', '?'):,} descendants (top 5%)",
+            "hub": f"HUB · ≥ {thr('hub_thr')} descendants (top 1%)",
+            "rich": f"RICH · ≥ {thr('rich_thr')} descendants (top 5%)",
             "normal": "normal",
             "dead": "dead end · ≤ 1 descendant",
-        }[c]
+        }.get(c, str(c or "normal"))
 
     def branch_block(self, doc: Doc, node: dict) -> None:
         doc.title("BRANCH SIZE")
@@ -387,3 +417,22 @@ class Ctx:
 
 
 from . import node as _node_tabs  # noqa: E402,F401  (регистрирует вкладки узла)
+
+# Порядок для пользователя: кто узел → путь вверх → мутации → где люди/древние
+# → матчи → маршруты → лор → сырьё. Блоки внутри вкладок не трогаем.
+_TAB_ORDER = (
+    "Overview",
+    "Ancestors",
+    "SNPs",
+    "Geography",
+    "Ancient DNA",
+    "Matches",
+    "Migration Map",
+    "Famous",
+    "Projects",
+    "Raw JSON",
+)
+_by_title = {t.title: t for t in TABS}
+TABS[:] = [_by_title[name] for name in _TAB_ORDER if name in _by_title]
+# на случай новых вкладок, ещё не перечисленных в _TAB_ORDER
+TABS.extend(t for t in _by_title.values() if t not in TABS)

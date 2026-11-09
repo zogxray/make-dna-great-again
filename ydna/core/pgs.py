@@ -1,6 +1,6 @@
 """Полигенные оценки (PGS) генома из F1 против 1000 Genomes. Без UI.
 
-Модели — строки catalog.tsv со статусом ok (build_catalog.py) и их файлы весов из PGS Catalog.
+Модели — строки catalog.tsv (сборка F2 / pgs_catalog) и их файлы весов из PGS Catalog.
 Референс — «тонкая» панель: из полного PGEN 1000G один раз извлекаются биаллельные SNP, чьи rsID
 есть в весах моделей. Образец считается здесь же, панель — plink2 --score на том же наборе вариантов.
 
@@ -32,7 +32,44 @@ from .ylink import cache_dir
 THEMES = (("intelligence_emotions", "Intelligence & emotions"), ("sleep", "Sleep"),
           ("behavior", "Behavior"), ("brain", "Brain"), ("appearance", "Appearance"),
           ("body", "Body"), ("fitness", "Fitness"), ("diet", "Diet"))
-THEME_LABEL = dict(THEMES)
+# Подгруппы вкладки DISEASES (excluded_disease из pgs_catalog.EXCLUDE_RE).
+DISEASE_GROUPS = (
+    ("cancer", "Cancer"),
+    ("sleep_clinical", "Sleep clinical"),
+    ("psych", "Psych"),
+    ("other", "Other"),
+)
+THEME_LABEL = {**dict(THEMES), **dict(DISEASE_GROUPS)}
+
+_DISEASE_BUCKETS = (
+    ("cancer", re.compile(
+        r"cancer|carcinoma|neoplasm|tumou?r|leuk[a]?emia|lymphoma|melanoma|glioma", re.I)),
+    ("sleep_clinical", re.compile(r"sleep apn|obstructive sleep|restless", re.I)),
+    ("psych", re.compile(
+        r"anxiety|depress|ptsd|schizophren|bipolar|autis|\badhd\b|attention deficit|"
+        r"panic|anorexia|bulimia|eating disorder|delirium|dementia|amnestic|"
+        r"post-traumatic|major depress", re.I)),
+)
+
+
+def disease_group(trait: str, efo: str = "") -> str:
+    """Cancer / Sleep clinical / Psych / Other — по trait+EFO excluded_disease."""
+    text = f"{trait} {efo}"
+    for key, rx in _DISEASE_BUCKETS:
+        if rx.search(text):
+            return key
+    return "other"
+
+
+def sections_for(models: list["Model"]) -> list[tuple[str, str]]:
+    """Порядок секций для overview/compare: DISEASE_GROUPS или THEMES по составу списка."""
+    present = {m.theme for m in models}
+    primary = DISEASE_GROUPS if present & set(dict(DISEASE_GROUPS)) else THEMES
+    out = [(k, lab) for k, lab in primary if k in present]
+    known = {k for k, _ in out}
+    for k in sorted(present - known):
+        out.append((k, THEME_LABEL.get(k, k)))
+    return out
 
 # Кураторское меню из GENETIC_IQ_TEST/run_pgs_v4.py TRAITS (уникальные ID, свой порядок и подписи).
 # (pgs_id, theme, label)
@@ -211,6 +248,26 @@ def catalog_path(folder: Path) -> Path:
 
 def weights_path(folder: Path, pgs_id: str) -> Path:
     return folder / "data" / f"{pgs_id}.txt.gz"
+
+
+def ensure_weights(folder: Path, pgs_id: str, job: Job | None = None) -> Path:
+    """Путь к весам; если файла нет — скачать с FTP PGS Catalog."""
+    dest = weights_path(folder, pgs_id)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    from .pgs_catalog import fetch_weights  # лениво: pgs_catalog импортирует pgs
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    prev = job.stage if job else None
+    if job:
+        job.set_stage(f"downloading weights · {pgs_id}")
+    try:
+        ok = fetch_weights({"id": pgs_id, "ftp": ""}, dest)
+    finally:
+        if job and prev is not None:
+            job.stage = prev
+    if not ok or not dest.exists() or dest.stat().st_size <= 0:
+        raise RuntimeError(f"could not download weight file for {pgs_id}")
+    return dest
 
 
 def _model_from_row(r: dict) -> Model | None:
@@ -557,7 +614,7 @@ def _reference_scores(panel: Panel, model: Model, common: dict[str, tuple[str, s
 
 def score_model(model: Model, folder: Path, geno: Genotypes, panel: Panel, job: Job) -> Result:
     res = Result(model.pgs_id, model.trait, model.theme, computed=datetime.now().isoformat(timespec="seconds"))
-    weights = read_weights(weights_path(folder, model.pgs_id))
+    weights = read_weights(ensure_weights(folder, model.pgs_id, job))
     res.weights = len(weights)
     matched = match(geno, weights)
     res.matched = len(matched)
@@ -667,6 +724,12 @@ def run_models(store: Store, genome_path: Path, models: list[Model], all_models:
     job.unit = "items"
     job.set_stage("reading the genome")
     geno = genotypes(genome_db.get(genome_path, genome))
+    # Докачать веса скорируемых моделей до сборки панели — иначе rsID не попадут в extract.
+    job.set_stage(f"ensuring weight files · {len(models)} model(s)", len(models))
+    for i, m in enumerate(models):
+        job.check()
+        ensure_weights(folder, m.pgs_id, job)
+        job.progress(i + 1)
     ensure_panel(ref, folder, all_models, geno, job)
     job.unit = "items"
     panel = load_panel(ref)

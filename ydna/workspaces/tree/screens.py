@@ -91,7 +91,7 @@ class HelpScreen(ModalDialog):
                 ("Tab / Esc", "switch panel / back to the tree"),
                 ("Mouse", "click a row to select; click the marker or ▸, or double-click, to expand"),
                 ("", "click names in the breadcrumbs, CHILDREN and LINEAGE to jump there"),
-                ("", "click section tabs, mode bar F1–F7 and the hint line; wheel scrolls"),
+                ("", "click section tabs, mode bar F1–F8 and the hint line; wheel scrolls"),
                 ("", "click outside a dialog to close it"),
                 ("RICH BRANCHES", None),
                 ("S", "sort children: oldest first → richest first → deepest first"),
@@ -101,14 +101,20 @@ class HelpScreen(ModalDialog):
                 ("/", "search haplogroup name, SNP or alias (list of matches)"),
                 ("N", "next match"),
                 ("F", "filter: country, dates, min descendants, min height"),
-                ("INSPECTOR", None),
-                (f"1–{min(len(TABS), 9)}", " · ".join(tab.title for tab in TABS)),
-                ("X", "Raw JSON: show all lines / collapse"),
-                ("Y", "copy haplogroup name"),
-                ("OTHER", None),
-                ("F1–F7", "switch mode: " + " · ".join(title for _, title in MODE_LABELS)),
-                ("I", "data issues found while loading"),
-                ("?  /  Q", "this help  /  quit")]
+                ("INSPECTOR", None)]
+        # Клавиши как в TreeWorkspace.SECTION_LABELS: 1–9, 0, -, =
+        _tab_keys = "1234567890-="
+        for i, tab in enumerate(TABS):
+            k = _tab_keys[i] if i < len(_tab_keys) else "·"
+            rows.append((k, tab.title))
+        rows += [("G / W", "Geography: regions · world DB; Migration Map: W = fit/world"),
+                 ("M", "fullscreen Migration Map (map + Contact log / routes)"),
+                 ("X", "Raw JSON: show all lines / collapse"),
+                 ("Y", "copy haplogroup name"),
+                 ("OTHER", None),
+                 ("F1–F8", "switch mode: " + " · ".join(title for _, title in MODE_LABELS)),
+                 ("I", "data issues found while loading"),
+                 ("?  /  Q", "this help  /  quit")]
         for k, v in rows:
             if v is None:
                 t.append(f"\n{k}\n", style="bold #FBF6F0")

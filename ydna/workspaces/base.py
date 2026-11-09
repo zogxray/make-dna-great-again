@@ -22,7 +22,7 @@ from ..theme.styles import HI, HI_REV, MUTED
 # Порядок = клавиши F1, F2, ...
 MODE_LABELS = [("genome", "Genome"), ("data", "Data"), ("tree", "Tree"),
                ("pgs", "PGS"), ("reference", "Reference"), ("chat", "Chat"),
-               ("help", "Help")]
+               ("jobs", "Jobs"), ("help", "Help")]
 
 
 RU_LAYOUT = dict(zip("qwertyuiopasdfghjklzxcvbnm", "йцукенгшщзфывапролдячсмить"))

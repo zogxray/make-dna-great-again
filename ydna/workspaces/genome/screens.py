@@ -13,7 +13,7 @@ from textual.widgets import Button, DirectoryTree, Input, Static
 
 from ..base import ModalDialog
 
-GENOME_SUFFIXES = {".txt", ".csv", ".tsv", ".zip", ".gz"}
+GENOME_SUFFIXES = {".txt", ".csv", ".tsv", ".vcf", ".zip", ".gz", ".bz2"}
 
 
 class GenomeFileTree(DirectoryTree):
@@ -40,8 +40,8 @@ class OpenFileScreen(ModalDialog):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Static("[b]Add genotype file[/b]  (23andMe, Argenética, MyHeritage, FTDNA, AncestryDNA; "
-                         ".txt .csv .tsv .zip .gz)")
+            yield Static("[b]Add genotype file[/b]  (23andMe, Argenética, MyHeritage, FTDNA, Big Y CSV, "
+                         "AncestryDNA, VCF; .txt .csv .tsv .vcf .zip .gz .bz2)")
             yield Input(value=f"{self.start}/", placeholder="path to a file or folder", id="path")
             yield GenomeFileTree(self.start)
             with Horizontal(id="bottom"):

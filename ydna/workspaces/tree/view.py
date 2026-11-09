@@ -14,8 +14,8 @@ from textual.strip import Strip
 from textual.widgets import Static
 
 from ...theme.styles import (
-    BRIGHT, DATE_STYLES, DIM, FAINT, GHOST, MAP, MUTED, NAME_STYLE, OK, OK_BOLD,
-    SIZE_STYLE, SOFT, WARN, WARN_BOLD, bold,
+    BRIGHT, BRIGHT_BOLD, DATE_STYLES, DIM, FAINT, GHOST, HI_REV, MAP, MUTED,
+    NAME_STYLE, OK, OK_BOLD, SIZE_STYLE, SOFT, WARN, WARN_BOLD, bold,
 )
 from .data import date_class, year_class, year_label
 
@@ -98,6 +98,26 @@ def glyph_legend(ours: str | None = None) -> Text:
         t.append("   ● ", style=OK_BOLD)
         t.append(f"our Y ({ours})", style=MUTED)
 
+    return t
+
+
+def no_haplotree_guide(path: str | None = None) -> Text:
+    """Empty-state F3: haplotree не задан / файл отсутствует — онбординг, не «поломка»."""
+    t = Text()
+    t.append(" TREE ", style=HI_REV)
+    t.append("  needs Haplotree\n", style=BRIGHT_BOLD)
+    if path:
+        t.append(f"  Path is set, but the file is missing:\n", style=DIM)
+        t.append(f"  {path}\n\n", style=WARN)
+    else:
+        t.append("  F3 builds the phylogenetic tree from the FTDNA Haplotree JSON.\n\n",
+                 style=DIM)
+    t.append("  1 · F2 Data\n", style=BRIGHT_BOLD)
+    t.append("  P         point to y-dna-haplotree.json (required)\n", style=BRIGHT)
+    t.append("  D / path  Discover folder — optional enrichment for cards\n\n", style=DIM)
+    t.append("  2 · Back here\n", style=BRIGHT_BOLD)
+    t.append("  F3        tree loads automatically once Haplotree is set\n\n", style=BRIGHT)
+    t.append("  Our Y (O) needs a genotype in F1 after the tree is up.\n", style=DIM)
     return t
 
 

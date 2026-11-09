@@ -21,7 +21,8 @@ from .data import (STAGES, _apply_discover, graft_path, hydrate_node, load_or_bu
                    load_resource, node_codes, relink_children, search_text)
 from .screens import FilterScreen, HelpScreen, IssuesScreen, SearchResults
 from .tabs import TABS, Ctx
-from .view import SHORT_CLASS, SORT_LABELS, SORT_MODES, BranchView, glyph_legend, legend_text
+from .view import (SHORT_CLASS, SORT_LABELS, SORT_MODES, BranchView, glyph_legend,
+                   legend_text, no_haplotree_guide)
 
 FETCH_JOB = "tree_discover_fetch"  # отдельно от F2 ftdna_discover, иначе джобы блокируют друг друга
 
@@ -67,6 +68,7 @@ class TreeWorkspace(Workspace):
         Binding("shift+d", "fetch_branch", "Fetch branch", show=False),
         Binding("l", "apply_local", "Apply local", show=False),
         Binding("c", "cancel_fetch", "Cancel fetch", show=False),
+        Binding("m", "map_fullscreen", "Map fullscreen", show=False),
         *[Binding(k, f"section({i})", t.title, show=False)
           for i, (k, t) in enumerate(zip(SECTION_KEYS, TABS))],
         Binding("left_square_bracket", "section_step(-1)", "Prev section", show=False),
@@ -158,14 +160,54 @@ class TreeWorkspace(Workspace):
             # Смена генома — только Our Y, без полного reload дерева.
             self.start_branch()
 
+    def on_resize(self, event) -> None:
+        # Пересчитать ширину инспектора для Map/Geography при ресайзе терминала.
+        if self.ready and self.current and self.ctx:
+            try:
+                self.ctx.panel_width = max(0, int(self.query_one("#insp-box").size.width) - 4)
+            except Exception:
+                pass
+            # Migration Map зависит от cols — перерисовать при ресайзе.
+            if 0 <= self.section < len(TABS) and TABS[self.section].title == "Migration Map":
+                self.refresh_inspector(keep_scroll=True)
+
     def start_load(self) -> None:
         self.stale = False
         ht = self.store.path("ftdna_haplotree")
+        if not ht or not Path(ht).is_file():
+            self._show_no_haplotree(None if not ht else str(ht))
+            return
         disc = self.folder if self.folder and Path(self.folder).is_dir() else None
         show_busy(self.app, "Y tree",
                   f"Building / loading haplotree skeleton"
                   + (f"\n+ Discover {disc}" if disc else "\n(Discover not set — skeleton only)"))
         self.run_worker(self._load, thread=True, exclusive=True, name="loader")
+
+    def _show_no_haplotree(self, missing_path: str | None) -> None:
+        """Онбординг вместо пустого дерева / error notify, когда Haplotree не готов."""
+        hide_busy(self.app)
+        self.ready = False
+        self.hg_nodes, self.hg_children, self.hg_roots = {}, {}, []
+        self.hg_stats, self.hg_issues, self.haystack = {}, {}, {}
+        self.ctx = None
+        self.vis_set, self.flt = None, {}
+        self.current, self.hits, self.hit_i = None, [], -1
+        self.branch, self.branch_genome, self.branch_busy = None, None, None
+        self.view.set_source({}, {}, [])
+        self.view.set_data(None)
+        self.view.mine = set()
+        self.view.tip = None
+        self.query_one("#tree-box").border_title = "TREE · needs Haplotree"
+        self.query_one("#stats", Static).update(
+            "Haplotree not set · F2 → P" if missing_path is None
+            else "Haplotree file missing · F2 → P")
+        self.query_one("#colhead", Static).update("")
+        self.query_one("#legend", Static).update(
+            Text("Discover is optional · Our Y needs a genome in F1 after the tree loads",
+                 style="#71697A"))
+        self.query_one("#inspector", Static).update(no_haplotree_guide(missing_path))
+        self.update_tabs()
+        self.update_status()
 
     def _load(self) -> None:
         names = [n for n, _ in STAGES]
@@ -186,11 +228,13 @@ class TreeWorkspace(Workspace):
         disc = self.folder if self.folder and Path(self.folder).is_dir() else None
         try:
             if not ht or not Path(ht).is_file():
-                raise FileNotFoundError(
-                    "FTDNA Haplotree is not set. Open F2 Data and point to y-dna-haplotree.json.")
+                # Гонка с F2: путь пропал после start_load — тихий empty-state, не error.
+                self.app.call_from_thread(
+                    self._show_no_haplotree, None if not ht else str(ht))
+                return
             data, cached = load_or_build(Path(ht), disc, prog)
         except Exception as exc:  # noqa: BLE001
-            msg = str(exc) if isinstance(exc, FileNotFoundError) else f"Failed to load data: {exc}"
+            msg = f"Failed to load data: {exc}"
             self.app.call_from_thread(self._failed, msg)
             return
         self.app.call_from_thread(self._loaded, data, cached)
@@ -198,10 +242,11 @@ class TreeWorkspace(Workspace):
     def _failed(self, msg: str) -> None:
         hide_busy(self.app)
         if not self.ready:
+            self.query_one("#tree-box").border_title = "TREE · load failed"
             self.query_one("#inspector", Static).update(
-                Text(f"{msg}\n\nF3 builds the tree from the FTDNA Haplotree (F2 → P). "
-                     f"Discover JSON is optional enrichment.", style="#8BAB4A"))
-            self.query_one("#stats", Static).update("No data · haplotree required")
+                Text(f"{msg}\n\nCheck the Haplotree path in F2 → P, then reopen F3.",
+                     style="#8BAB4A"))
+            self.query_one("#stats", Static).update("Load failed · see inspector")
         self.app.notify(msg, severity="error", timeout=10)
 
     def _loaded(self, data: dict, cached: bool) -> None:
@@ -210,9 +255,11 @@ class TreeWorkspace(Workspace):
         self.hg_stats, self.hg_issues, self.haystack = data["stats"], data["issues"], data["haystack"]
         folder = self._discover_folder() or Path(".")
         self.folder = folder if folder != Path(".") else self.folder
-        self.ctx = Ctx(self.hg_nodes, self.hg_children, folder, self.hg_stats)
+        self.ctx = Ctx(self.hg_nodes, self.hg_children, folder, self.hg_stats,
+                       store=self.store)
         self.view.set_source(self.hg_nodes, self.hg_children, self.hg_roots,
                              self.hg_stats.get("max_desc", 0))
+        self.query_one("#tree-box").border_title = "PHYLOGENETIC TREE"
         self.ready = True
         # BusyModal держим до Our Y — иначе дерево мигает без подсветки ветки.
         self.branch = None
@@ -484,6 +531,11 @@ class TreeWorkspace(Workspace):
         if node and node.get("placeholder") and self.section != 0:
             self.section = 0
         self._sync_fetch_ctx()
+        # Ширина инспектора для Map / Geography (иначе fallback ~60).
+        try:
+            self.ctx.panel_width = max(0, int(self.query_one("#insp-box").size.width) - 4)
+        except Exception:
+            self.ctx.panel_width = 0
         self.update_tabs()
         self.update_keybar()
         self.query_one("#inspector", Static).update(self.ctx.render(self.current, self.section))
@@ -719,6 +771,10 @@ class TreeWorkspace(Workspace):
 
     def update_crumbs(self) -> None:
         crumbs = self.query_one("#crumbs", Static)
+        if not self.ready:
+            crumbs.update(Text("Set FTDNA Haplotree in F2 → P, then return to F3.",
+                               style="#8A8294"))
+            return
         if not self.current or not self.ctx:
             crumbs.update("")
             return
@@ -804,6 +860,26 @@ class TreeWorkspace(Workspace):
         if handler:
             handler(self.ctx)
             self.refresh_inspector()
+
+    def action_map_fullscreen(self) -> None:
+        """M — полноэкранная Migration Map: карта + Contact log / Migration справа."""
+        if not self.ready or not self.current:
+            return
+        node = self.hg_nodes.get(self.current)
+        if not node:
+            return
+        if node.get("placeholder"):
+            self.app.notify("Fetch Discover JSON first (D) — map needs migration data",
+                            severity="information")
+            return
+        if self.folder:
+            hydrate_node(node, Path(self.folder))
+        if not node.get("migrationmap"):
+            self.app.notify("No migration map on this node", severity="information")
+            return
+        from .tabs.map_screen import MapScreen
+        world = bool(self.ctx and getattr(self.ctx, "map_world", False))
+        self.app.push_screen(MapScreen(node, world=world))
 
     def action_tree(self, name: str) -> None:
         """Действие левой панели (expand_all, collapse_all, …) — для кликов по строке подсказок."""

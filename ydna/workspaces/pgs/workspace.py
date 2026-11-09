@@ -9,7 +9,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import OptionList, Static
+from textual.widgets import Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core import genome_db, pgs, pgs_db
@@ -34,12 +34,15 @@ class PgsWorkspace(Workspace):
     #models-box:focus-within, #card-box:focus-within, #over-box:focus-within { border: round $accent; }
     #models { height: 1fr; border: none; background: transparent; }
     #list-tabs, #over-tabs { height: 1; padding: 0 1; }
+    #model-search { height: 1; margin: 0 1; border: none; background: transparent; }
     #card-scroll, #over-scroll { height: 1fr; scrollbar-size-vertical: 1; }
     #card, #over { padding: 0 1; }
     #help { height: 1; padding: 0 1; color: $text-muted; }
     #status { height: 1; padding: 0 1; background: $boost; }
     """
     BINDINGS = [
+        Binding("slash", "focus_search", "Search"),
+        Binding("escape", "clear_search", "Clear search", show=False),
         Binding(alt_keys("g"), "score_theme", "Score theme"),
         Binding(alt_keys("a"), "score_all", "Score all"),
         Binding(alt_keys("r"), "rescore", "Recompute"),
@@ -51,6 +54,12 @@ class PgsWorkspace(Workspace):
         Binding(alt_keys("d"), "toggle_big", "Only big Δ", show=False),
         Binding(alt_keys("x"), "score_other", "Score for B", show=False),
     ]
+
+    # Полные имена для subtitle / статуса (в ряду вкладок — короткие title из DB).
+    LIST_NAMES = {
+        "curated": "curated", "catalog": "catalog", "diseases": "diseases",
+        "low_coverage": "low coverage", "too_few_matched": "too few matched",
+    }
 
     def __init__(self, store: Store) -> None:
         super().__init__()
@@ -75,17 +84,29 @@ class PgsWorkspace(Workspace):
         self.choices: list[Path] = []
         self.sort_mode = "theme"
         self.only_big = False
+        self.search_q = ""
+
+    @property
+    def menu_models(self) -> list[pgs.Model]:
+        return self.models_by_menu.get(self.list_tab, [])
 
     @property
     def models(self) -> list[pgs.Model]:
-        return self.models_by_menu.get(self.list_tab, [])
+        """Текущая вкладка, опционально отфильтрованная поиском."""
+        ms = self.menu_models
+        q = self.search_q.strip().lower()
+        if not q:
+            return ms
+        return [
+            m for m in ms
+            if q in m.trait.lower() or q in m.pgs_id.lower()
+            or q in (m.efo or "").lower() or q in (m.theme or "").lower()
+            or q in (m.status or "").lower()
+        ]
 
     def _menu_title(self, menu_id: str | None = None) -> str:
         mid = menu_id or self.list_tab
-        for m in self.menus:
-            if m["id"] == mid:
-                return m["title"]
-        return mid.upper() if mid else ""
+        return self.LIST_NAMES.get(mid) or mid.replace("_", " ")
 
     def all_models(self) -> list[pgs.Model]:
         """Объединение всех вкладок для панели SNPs (без дублей ID)."""
@@ -95,12 +116,27 @@ class PgsWorkspace(Workspace):
                 out.setdefault(m.pgs_id, m)
         return list(out.values())
 
+    @staticmethod
+    def _models_for_menu(menu: dict, *, folder_ok: bool) -> list[pgs.Model]:
+        """Модели вкладки: catalog=ok, diseases=подгруппы, status=по id, иначе menu_items."""
+        kind = menu.get("kind") or ""
+        if not folder_ok and kind in ("catalog", "diseases", "status"):
+            return []
+        if kind == "catalog":
+            return pgs_db.load_catalog_ok()
+        if kind == "diseases":
+            return pgs_db.load_diseases()
+        if kind == "status":
+            return pgs_db.load_by_status(menu["id"])
+        return pgs_db.load_menu_models(menu["id"])
+
     # — компоновка —
     def compose(self) -> ComposeResult:
         yield ModeBar(self.mode_key)
         with Horizontal(id="main"):
             with Vertical(id="models-box"):
                 yield Static(id="list-tabs")
+                yield Input(placeholder="/ trait · PGS id · theme", id="model-search")
                 yield OptionList(id="models")
             with Vertical(id="card-box"):
                 with VerticalScroll(id="card-scroll"):
@@ -111,10 +147,10 @@ class PgsWorkspace(Workspace):
                     yield Static(id="over")
         yield KeyBar([("Enter", "Score", "screen.score_current"), ("G", "Score theme", "screen.score_theme"),
                       ("A", "Score all", "screen.score_all"), ("R", "Recompute", "screen.rescore"),
-                      ("L", "List", "screen.toggle_list"),
+                      ("L", "List", "screen.toggle_list"), ("/", "Search", "screen.focus_search"),
                       ("C", "Cancel", "screen.cancel"), ("V", "Compare", "screen.toggle_tab"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -150,13 +186,15 @@ class PgsWorkspace(Workspace):
 
     def _set_panel_subs(self) -> None:
         self.query_one("#over-box").border_subtitle = self._results_label()
-        which = self._menu_title().lower()
+        which = self._menu_title()
+        shown, total = len(self.models), len(self.menu_models)
+        count = f"{shown}/{total}" if self.search_q.strip() and shown != total else str(shown)
         if self.refreshing:
             self.query_one("#models-box").border_subtitle = "Refreshing models…"
         elif self.genome:
-            self.query_one("#models-box").border_subtitle = f"{len(self.models)} {which} · {self.genome.name}"
+            self.query_one("#models-box").border_subtitle = f"{count} {which} · {self.genome.name}"
         else:
-            self.query_one("#models-box").border_subtitle = f"{len(self.models)} {which} · no genome"
+            self.query_one("#models-box").border_subtitle = f"{count} {which} · no genome"
 
     def reload(self) -> None:
         """Каталог + results в фоне; прогресс — общий BusyModal."""
@@ -181,15 +219,12 @@ class PgsWorkspace(Workspace):
         if not folder:
             catalog_problem = (
                 "PGS catalog is not set.\n\n"
-                "In F2 → PGS models, point to the build_catalog.py work folder "
-                "(needs catalog/catalog.tsv).")
+                "In F2 → PGS models, press D to build it "
+                "(needs an active genome in F1), or P to an existing catalog folder.")
             pgs_db.seed_menus()
             menus = pgs_db.list_menus()
             for menu in menus:
-                if menu["kind"] == "catalog":
-                    models_by_menu[menu["id"]] = []
-                else:
-                    models_by_menu[menu["id"]] = pgs_db.load_menu_models(menu["id"])
+                models_by_menu[menu["id"]] = self._models_for_menu(menu, folder_ok=False)
         else:
             try:
                 # TSV→DB только если каталог пуст / устарел; иначе SELECT из DuckDB.
@@ -197,12 +232,10 @@ class PgsWorkspace(Workspace):
                     self.app.call_from_thread(
                         busy_progress, self.app, "Syncing catalog.tsv…", frac=0.45)
                     pgs_db.ensure_catalog(folder)
+                pgs_db.seed_menus()  # системные вкладки (в т.ч. DISEASES) без полного sync
                 menus = pgs_db.list_menus()
                 for menu in menus:
-                    if menu["kind"] == "catalog":
-                        models_by_menu[menu["id"]] = pgs_db.load_catalog_ok()
-                    else:
-                        models_by_menu[menu["id"]] = pgs_db.load_menu_models(menu["id"])
+                    models_by_menu[menu["id"]] = self._models_for_menu(menu, folder_ok=True)
             except OSError as exc:
                 catalog_problem = f"Cannot read the PGS catalog:\n{exc}"
             else:
@@ -289,14 +322,13 @@ class PgsWorkspace(Workspace):
         self._list_tabs()
 
     def _list_tabs(self) -> None:
+        """Короткие ярлыки без счётчиков — иначе ряд не влезает в ширину MODELS."""
         t = Text(no_wrap=True)
         for menu in self.menus:
             key, label = menu["id"], menu["title"]
-            n = len(self.models_by_menu.get(key, []))
             sty = "bold reverse #D4AD72" if key == self.list_tab else "#AEA5B8"
             t.append(f" {label} ", style=click(f"screen.list_tab({key!r})", sty))
-            t.append(f"{n} ", style="#8A8294")
-        t.append("L", style="#8A8294")
+        t.append(" L", style="#8A8294")
         self.query_one("#list-tabs", Static).update(t)
 
     def _header(self, theme: str) -> Text:
@@ -509,6 +541,32 @@ class PgsWorkspace(Workspace):
         ids = [m["id"] for m in self.menus]
         i = ids.index(self.list_tab) if self.list_tab in ids else -1
         self.action_list_tab(ids[(i + 1) % len(ids)])
+
+    def action_focus_search(self) -> None:
+        inp = self.query_one("#model-search", Input)
+        inp.focus()
+        inp.cursor_position = len(inp.value)
+
+    def action_clear_search(self) -> None:
+        inp = self.query_one("#model-search", Input)
+        if inp.has_focus or self.search_q:
+            inp.value = ""
+            self.search_q = ""
+            self.fill_list()
+            self.refresh_all()
+            self.query_one("#models", OptionList).focus()
+
+    @on(Input.Changed, "#model-search")
+    def _search_changed(self, event: Input.Changed) -> None:
+        self.search_q = event.value
+        self.fill_list()
+        self._set_panel_subs()
+        self.refresh_card()
+        self.refresh_over()
+
+    @on(Input.Submitted, "#model-search")
+    def _search_submitted(self) -> None:
+        self.query_one("#models", OptionList).focus()
 
     # — сравнение —
     def action_tab(self, key: str) -> None:

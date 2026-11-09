@@ -1,18 +1,20 @@
-"""Полноэкранная карта DEFCON поверх дерева (клавиша M)."""
+"""Полноэкранная карта DEFCON (клавиша M): карта слева, Contact log + Migration справа."""
 
 from __future__ import annotations
 
 from rich.text import Text
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
-from .data import year_label
-from .tabs.worldmap import defcon_map
+from ..data import year_label
+from . import Doc
+from .node import _WIDTH, render_migration
+from .worldmap import contact_log_lines, defcon_map
 
 
-class _Doc:
+class _MapDoc:
     """Минимальная замена Doc: defcon_map нужен только rich.Text в .t"""
 
     def __init__(self) -> None:
@@ -28,21 +30,29 @@ class MapScreen(ModalScreen):
     ]
     DEFAULT_CSS = """
     MapScreen { background: #1E1923; }
-    #mapscroll { width: 100%; height: 1fr; background: #1E1923; padding: 0 1;
+    #maprow { height: 1fr; }
+    #mapscroll { width: 1fr; height: 1fr; background: #1E1923; padding: 0 1;
                  scrollbar-size-vertical: 1; }
     #mapbody { width: auto; background: #1E1923; }
+    #sidescroll { width: 42; min-width: 34; max-width: 52; height: 1fr;
+                  background: #241E2A; border-left: tall #483A59; padding: 0 1;
+                  scrollbar-size-vertical: 1; }
+    #sidebody { width: 100%; background: #241E2A; }
     #maphelp { height: 1; background: #302838; color: #5882C7; padding: 0 1; }
     """
 
-    def __init__(self, node: dict) -> None:
+    def __init__(self, node: dict, *, world: bool = False) -> None:
         super().__init__()
         self.node = node
-        self.world = False
+        self.world = bool(world)
 
     def compose(self):
-        with VerticalScroll(id="mapscroll"):
-            yield Static(id="mapbody")
-        yield Static(" W — world / fit data    ↑↓ PgUp PgDn — scroll    Esc / M / Q — close",
+        with Horizontal(id="maprow"):
+            with VerticalScroll(id="mapscroll"):
+                yield Static(id="mapbody")
+            with VerticalScroll(id="sidescroll"):
+                yield Static(id="sidebody")
+        yield Static(" W — world / fit    ↑↓ scroll    Esc / M / Q — close",
                      id="maphelp")
 
     def on_mount(self) -> None:
@@ -60,12 +70,29 @@ class MapScreen(ModalScreen):
 
     def draw(self) -> None:
         width, height = self.size
-        if width < 30:  # раскладка ещё не посчитана
+        if width < 40:  # раскладка ещё не посчитана
             return
-        # 6 колонок — подписи широты слева; 2 padding; 1 скроллбар; 1 запас
-        cols = max(40, min(170, width - 6 - 2 - 1 - 1))
-        doc = _Doc()
-        defcon_map(doc, self.node.get("migrationmap"), self.node.get("ancient") or [],
-                   self.node.get("name", ""), year_label, world=self.world, cols=cols,
-                   max_rows=max(16, min(46, height - 10)))
+        side_w = 42 if width >= 100 else max(30, width // 3)
+        try:
+            self.query_one("#sidescroll").styles.width = side_w
+        except Exception:
+            pass
+        # карта: минус правая панель, подписи широты, padding, скролл
+        cols = max(36, min(140, width - side_w - 6 - 2 - 1 - 1))
+        doc = _MapDoc()
+        centers = defcon_map(
+            doc, self.node.get("migrationmap"), self.node.get("ancient") or [],
+            self.node.get("name", ""), year_label, world=self.world, cols=cols,
+            max_rows=max(16, min(46, height - 4)), with_log=False,
+        ) or []
         self.query_one("#mapbody", Static).update(doc.t)
+
+        side = Doc()
+        _WIDTH[0] = max(28, side_w - 4)
+        for text, style in contact_log_lines(centers, year_label, limit=60):
+            if style.startswith("bold"):
+                side.title(text)
+            else:
+                side.line(text, style, indent=0)
+        render_migration(side, self.node, compact=True)
+        self.query_one("#sidebody", Static).update(side.t)

@@ -136,7 +136,7 @@ class ReferenceWorkspace(Workspace):
                       ("R", "Region", "screen.region_next"),
                       ("C", "Cancel", "screen.cancel"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:

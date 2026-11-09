@@ -193,7 +193,13 @@ def set_active(path: Path | None) -> None:
             )
 
 
-def remove_file(path: Path, *, delete_calls: bool = True) -> None:
+def remove_file(
+    path: Path,
+    *,
+    delete_calls: bool = True,
+    progress: Progress | None = None,
+) -> None:
+    """Удалить индекс файла из DuckDB одной транзакцией (calls → chrom_stats → files)."""
     path = Path(path).expanduser().resolve()
     with db.locked():
         con = db.connect()
@@ -201,16 +207,59 @@ def remove_file(path: Path, *, delete_calls: bool = True) -> None:
             "SELECT id FROM genome.files WHERE path = ?", [str(path)]
         ).fetchone()
         if not row:
+            if progress:
+                progress(1.0, 0)
             return
         fid = int(row[0])
+        chroms: list[str] = []
         if delete_calls:
-            con.execute("DELETE FROM genome.calls WHERE file_id = ?", [fid])
-            con.execute("DELETE FROM genome.chrom_stats WHERE file_id = ?", [fid])
-        con.execute("DELETE FROM genome.files WHERE id = ?", [fid])
+            chroms = [
+                str(r[0]) for r in con.execute(
+                    "SELECT chrom FROM genome.chrom_stats WHERE file_id = ? ORDER BY chrom",
+                    [fid],
+                ).fetchall()
+            ]
+        total = max(1, len(chroms) + 2)  # chrom deletes + stats + files
+        step = 0
+
+        def _tick(stage_lines: int = 0) -> None:
+            nonlocal step
+            step += 1
+            if progress:
+                progress(min(1.0, step / total), stage_lines)
+
+        con.execute("BEGIN")
+        try:
+            if delete_calls:
+                if chroms:
+                    for chrom in chroms:
+                        con.execute(
+                            "DELETE FROM genome.calls WHERE file_id = ? AND chrom = ?",
+                            [fid, chrom],
+                        )
+                        _tick()
+                else:
+                    con.execute("DELETE FROM genome.calls WHERE file_id = ?", [fid])
+                    _tick()
+                con.execute("DELETE FROM genome.chrom_stats WHERE file_id = ?", [fid])
+                _tick()
+            con.execute("DELETE FROM genome.files WHERE id = ?", [fid])
+            _tick()
+            con.execute("COMMIT")
+        except Exception:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
     # сбросить RAM по этому path (любой mtime)
     with _genome_lock:
         for key in [k for k in _genome_cache if k[0] == str(path)]:
             _genome_cache.pop(key, None)
+        for key in [k for k in _y_genome_cache if k[0] == str(path)]:
+            _y_genome_cache.pop(key, None)
+    if progress:
+        progress(1.0, 0)
 
 
 def _vote_builds(con, file_id: int, store: Store | None) -> str | None:
@@ -320,6 +369,31 @@ def ingest(
     """Распарсить RAW (или взять готовый Genome), записать в DuckDB, проголосовать билд."""
     path = Path(path).expanduser().resolve()
     g = genome if genome is not None else load(path, progress)
+    # Big Y CSV / VCF: позиции Known SNP из дерева; placeholder Y:pos → имена.
+    # hg38: FTDNA haplotree; hg37: TheYtree hg19.
+    if store is not None and "Y" in g.chroms:
+        from .store import data_dir
+        from .ylink import annotate_genome_y, load_haplotree, resolve_genome_y_positions
+
+        tree = None
+        ht = store.path("ftdna_haplotree")
+        if ht is None or not ht.is_file():
+            cand = data_dir() / "ftdna" / "haplotree" / "y-dna-haplotree.json"
+            ht = cand if cand.is_file() else None
+        if ht is not None and ht.is_file():
+            try:
+                tree = load_haplotree(ht)
+            except Exception:  # noqa: BLE001
+                tree = None
+        overlays = None
+        try:
+            from .overlays import load_overlays
+            overlays = load_overlays(store)
+        except Exception:  # noqa: BLE001
+            overlays = None
+        if tree is not None or overlays is not None:
+            resolve_genome_y_positions(g, tree=tree, overlays=overlays)
+            annotate_genome_y(g, tree=tree, overlays=overlays)
     st = path.stat()
     header_text = "\n".join(g.header)
 

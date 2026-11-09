@@ -16,8 +16,8 @@ from ...core.genome import Genome
 from ...core import genome_db
 from ...core.store import Store, data_dir
 from ...core.ylink import YLink, link_genome
-from ..base import (KeyBar, ModeBar, Workspace, alt_keys, busy_progress, fit,
-                    hide_busy, short_path, show_busy)
+from ..base import (ConfirmScreen, KeyBar, ModeBar, Workspace, alt_keys,
+                    busy_progress, fit, hide_busy, short_path, show_busy)
 from .screens import OpenFileScreen
 from .summary import (STATE_WORD, human_size, linking_summary, onboarding_summary,
                       summary_text)
@@ -194,7 +194,7 @@ class GenomeWorkspace(Workspace):
                       ("Z", "Collapse all", "screen.collapse_all"),
                       ("N", "Next derived Y", "screen.next_derived"), ("Esc", "Clear filter", None),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -515,18 +515,95 @@ class GenomeWorkspace(Workspace):
         view.focus()
 
     def action_remove(self, anywhere: bool = False) -> None:
-        """Del работает только в списке файлов; клик по подсказке — для подсвеченного файла где угодно."""
+        """Del — ConfirmScreen, затем BusyModal + транзакционное удаление индекса."""
         ol = self.query_one("#files", OptionList)
         if not (anywhere or ol.has_focus) or ol.highlighted is None or not self.files:
             return
-        path = self.files.pop(ol.highlighted)
-        self.cache.pop(str(path), None)
+        path = self.files[ol.highlighted]
+        info = self.info.get(str(path)) or {}
+        snps = info.get("snps")
+        detail = f"{snps:,} SNPs in the index · " if isinstance(snps, int) else ""
+        detail += "RAW file on disk is not deleted"
+
+        def done(ok: bool | None) -> None:
+            if not ok:
+                return
+            self._remove_confirmed(path)
+
+        self.app.push_screen(
+            ConfirmScreen(
+                f"Remove · {path.name}",
+                f"{detail}",
+                ok="Remove",
+                danger=True,
+            ),
+            done,
+        )
+
+    def _remove_confirmed(self, path: Path) -> None:
+        if path not in self.files:
+            return
+        # Прервать чужой лоадер по этому файлу, затем свой Remove-прогресс.
+        if self.load_path == path:
+            self.load_path = None
+            self.phase = None
+        hide_busy(self.app)
+        self.phase = "removing"
+        self.load_path = path
+        show_busy(self.app, "Removing from index", path.name)
+        busy_progress(self.app, "Starting…", frac=0.0)
+        self.run_worker(
+            lambda: self._remove_worker(path),
+            thread=True,
+            exclusive=True,
+            group="genome",
+        )
+
+    def _remove_worker(self, path: Path) -> None:
+        def prog(frac: float | None, _lines: int) -> None:
+            self.app.call_from_thread(self._remove_progress, path, frac)
+
         try:
-            genome_db.remove_file(path)
-        except Exception:
-            pass
+            genome_db.remove_file(path, progress=prog)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self._remove_failed, path, exc)
+            return
+        self.app.call_from_thread(self._remove_done, path)
+
+    def _remove_progress(self, path: Path, frac: float | None) -> None:
+        if path != self.load_path or self.phase != "removing":
+            return
+        detail = f"{frac:.0%}" if frac is not None else "…"
+        busy_progress(
+            self.app,
+            f"Deleting DuckDB rows · {detail}",
+            frac=frac,
+            title="Removing from index",
+            subtitle=path.name,
+        )
+        self.update_status(detail)
+
+    def _remove_failed(self, path: Path, exc: Exception) -> None:
+        if path != self.load_path or self.phase != "removing":
+            return
+        self.load_path = None
+        self.phase = None
+        hide_busy(self.app)
+        self.update_status()
+        self.app.notify(f"Remove failed: {path.name}: {exc}", severity="error")
+
+    def _remove_done(self, path: Path) -> None:
+        if path != self.load_path or self.phase != "removing":
+            return
+        self.load_path = None
+        self.phase = None
+        hide_busy(self.app)
+        if path in self.files:
+            self.files.remove(path)
+        self.cache.pop(str(path), None)
+        self.info.pop(str(path), None)
         if path == self.active:
-            self.active, self.genome, self.load_path, self.phase = None, None, None, None
+            self.active, self.genome = None, None
             self.link = None
             self.query_one(ChromView).set_genome(None)
             self._set_panel_titles(None)

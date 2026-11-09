@@ -90,7 +90,7 @@ class ChatWorkspace(Workspace):
                       ("Del", "Delete chat", "screen.delete_chat"),
                       ("C", "Cancel", "screen.cancel"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def _active(self) -> Path | None:
@@ -383,11 +383,15 @@ class ChatWorkspace(Workspace):
             if self.current and self.current.id == t.id:
                 self.current = None
             self.reload()
+            self.app.notify(f"Deleted: {title}")
 
         self.app.push_screen(
-            ConfirmScreen(f"Delete chat · {title}",
-                          f"{n} turn{'s' if n != 1 else ''} · this cannot be undone",
-                          ok="Delete", danger=True),
+            ConfirmScreen(
+                f"Delete chat · {title}",
+                f"{n} turn{'s' if n != 1 else ''} · this cannot be undone",
+                ok="Delete",
+                danger=True,
+            ),
             done,
         )
 

@@ -1,18 +1,14 @@
-"""Вкладки узла: Overview, SNPs, Geography, Matches, Ancient DNA, Famous, Ancestors,
-Projects, Migration, Map, Raw JSON.
+"""Вкладки узла: Overview, Ancestors, SNPs, Geography, Ancient DNA, Famous, …
 
-Визуальная версия: шкалы доверительных интервалов, гистограммы, цветные бейджи,
-флаги стран, лестница предков, подсветка JSON.
+Визуальная версия: шкалы, гистограммы, бейджи, флаги, лестница предков, JSON.
 
-Верстка: элементы (образец, персона, проект, бейдж, блок Y-STR / Big Y, маршрут) оформлены
-карточками с левой рамкой ╭─ │ ╰─; группы по общему предку — баннерами ━━ ⑂.
+Верстка · Magazine:
+  секция (CAPS title) → одна пустая строка → тело (kv/put indent=1);
+  карточки ╭│╰ только у сущностей (образец, персона, проект, бейдж, маршрут);
+  стат-блоки (Y-STR / Big Y counters) — плоские секции без рамки.
 
-Порядок: везде от более актуального к более древнему — и списки, и диапазоны дат
-(span), и горизонтальные шкалы (новое слева). Перепутанные oldest/youngest исправляет
-_fix / norm_tmrca в одном месте.
-
-Перенос строк: put() сам переносит текст по ширине панели (см. fit / _WIDTH) и рисует
-рамку и отступ на каждой строке-продолжении.
+Порядок дат/списков: от актуального к древнему; oldest/youngest чинит _fix.
+Перенос: put() по ширине панели (_WIDTH), рамка карточки на каждой строке.
 """
 
 from __future__ import annotations
@@ -143,8 +139,9 @@ def put(doc: Doc, *parts: Any, indent: int = 1) -> None:
 
 @contextmanager
 def card(doc: Doc, *head: Any, rail: str = "#5A5361"):
-    """Карточка: ╭─ заголовок / │ содержимое / ╰────.  Содержимое выводить через put().
-    Заголовок переносится по ширине панели; на продолжениях рисуется рамка │."""
+    """Карточка сущности: ╭─ заголовок / │ тело / ╰──── + ровно одна пустая строка.
+    Для стат-блоков Magazine не использовать — там doc.title + put/kv."""
+    doc._ensure_section_gap()
     segs = [(p[0], p[1]) if isinstance(p, tuple) else (str(p), "") for p in head]
     for i, line in enumerate(_wrap_segs(segs, max(10, _WIDTH[0] - 5))):
         doc.t.append("  ")
@@ -159,7 +156,7 @@ def card(doc: Doc, *head: Any, rail: str = "#5A5361"):
         _RAIL[0] = None
         doc.t.append("  ")
         doc.t.append("╰" + "─" * max(4, min(CARD_W, _WIDTH[0] - 4)) + "\n", rail)
-        doc.t.append("\n")
+        doc.t.append("\n")  # воздух до следующей секции / карточки
 
 
 def _tag_flag(tag: str) -> str:
@@ -220,14 +217,16 @@ def sparkline(values: list[float], bins: int = 40, transform=None) -> tuple[str,
 
 
 def banner(doc: Doc, name: str, subtitle: str = "") -> None:
+    """Шапка вкладки один раз (Overview) — без лишнего воздуха сверху."""
     line = "━" * max(4, min(64, _WIDTH[0] - 4))
-    doc.t.append(f"\n  {line}\n", "#433F47")
+    doc.t.append(f"  {line}\n", "#433F47")
     doc.t.append("   ◆ ", "bold #B04A4A")
     doc.t.append(f"{name}", "bold #D4AD72")
     if subtitle:
         doc.t.append(f"   {subtitle}", "#AEA5B8")
     doc.t.append("\n")
     doc.t.append(f"  {line}\n", "#433F47")
+    doc.t.append("\n")  # одна пустая до первой секции
 
 
 def norm_tmrca(d: dict) -> tuple[dict, bool]:
@@ -426,6 +425,8 @@ def person_line(doc: Doc, p: dict[str, Any]) -> None:
     gen = [f"Y: {p.get('haplogroup_y') or '—'}", f"MRCA: {p.get('haplogroup_mrca') or '—'}"]
     if p.get("root_y"):
         gen.append(f"root {p['root_y']}")
+    if p.get("haplogroup_mt"):
+        gen.append(f"mt {p['haplogroup_mt']}")
     ctx_bits = []
     if mean is not None:
         ctx_bits.append(f"MRCA {dv(mean)}")
@@ -444,7 +445,9 @@ def person_line(doc: Doc, p: dict[str, Any]) -> None:
             put(doc, (" · ".join(ctx_bits), "#8A8294"), indent=1)
         lo_a, hi_a = p.get("age_estimate_lower"), p.get("age_estimate_upper")
         if lo_a is not None and hi_a is not None and lo_a != hi_a:
-            put(doc, (f"📏 age estimate {span(lo_a, hi_a)}", "#8A8294"), indent=1)
+            # FTDNA lower/upper часто «наоборот»; span() сортирует newer→older (yrs BP).
+            put(doc, (f"📏 age span {span(lo_a, hi_a)}  ·  yrs BP, newer–older",
+                      "#8A8294"), indent=1)
         for ln in media_links(p):
             put(doc, (ln, "underline #71697A"), indent=1)
         txt = excerpt(p.get("story_individual"), 300)
@@ -624,17 +627,15 @@ def ascii_map(doc: Doc, mm: Any, width: int = 84, height: int = 22) -> None:
         (" path   ", "#AEA5B8"), ("✚", "bold #B04A4A"), (" ancient sample", "#AEA5B8"))
 
 
-def mrca_header(doc: Doc, s: dict, count: int | None = None) -> None:
-    """Баннер группы по общему предку (легенда шкалы — один раз в заголовке секции):
-    ━━ ⑂ MRCA · N / предок · современных · rarity / интервалы / шкала."""
+def mrca_header(doc: Doc, s: dict, count: int | None = None, indent: int = 1) -> None:
+    """Сводка clade внутри рамки-хозяина: CLADE · N / MRCA / modern / rarity / интервалы."""
     tm = s.get("time_mrca")
     mean = tm.get("mean") if isinstance(tm, dict) else None
-    doc.t.append("\n")
-    head: list[Any] = [("━━ ", "#5A5361"), ("⑂ ", "bold #49AE6B"),
-                       (str(s.get("haplogroup_mrca") or "— no MRCA"), "bold #49AE6B")]
+    head: list[Any] = [("CLADE  ", "bold #FBF6F0"),
+                       (str(s.get("haplogroup_mrca") or "— no MRCA"), "bold #D4AD72")]
     if count is not None:
-        head.append((f"  · {count}", "bold #FBF6F0"))
-    put(doc, *head)
+        head.append((f" · {count}", "bold #FBF6F0"))
+    put(doc, *head, indent=indent)
     sub: list[Any] = []
     if mean is not None:
         sub.append((f"MRCA {dv(mean)}", "#B04A4A"))
@@ -648,11 +649,11 @@ def mrca_header(doc: Doc, s: dict, count: int | None = None) -> None:
             if i:
                 parts.append((" · ", "#5A5361"))
             parts.append(seg)
-        put(doc, *parts, indent=2)
+        put(doc, *parts, indent=indent + 1)
     iv = interval_line(tm)
     if iv:
-        put(doc, (iv, "#8A8294"), indent=2)
-        conf_bar(doc, tm, width=40, indent=2, legend=False)
+        put(doc, (iv, "#8A8294"), indent=indent + 1)
+        conf_bar(doc, tm, width=40, indent=indent + 1, legend=False)
 
 
 def _aad_text(aad: dict) -> str:
@@ -670,18 +671,13 @@ def _aad_text(aad: dict) -> str:
     return f"☠ {aad.get('description') or ''} {rng} {aad.get('unit') or ''}".strip()
 
 
-def sample_block(doc: Doc, s: dict, lo_t: float, span_t: float) -> None:
-    """Карточка образца. lo_t / span_t — начало и размах шкалы времени В ЕДИНИЦАХ _tt.
-    Мини-шкала: слева новое, справа древнее."""
+def sample_block(doc: Doc, s: dict) -> None:
+    """Дочерняя карточка образца (шкала времени — только в рамке-хозяине секции)."""
     code = s.get("code") or s.get("name") or "Unnamed sample"
     full_name = s.get("name") if s.get("name") and s.get("name") != code else None
     country = s.get("country_name") or s.get("geography") or "location unknown"
     age = s.get("age_estimate_mean")
     sex = {"M": "♂", "F": "♀"}.get(str(s.get("sex") or "").upper(), "?")
-    mini = ["·"] * 16
-    if age is not None:
-        idx = 15 - round((_tt(age) - lo_t) / span_t * 15)
-        mini[max(0, min(15, idx))] = "●"
     uncertain = bool(s.get("uncertain_placement"))
     gen = [f"Y {s.get('haplogroup_y') or '—'}"]
     if s.get("root_y"):
@@ -705,7 +701,8 @@ def sample_block(doc: Doc, s: dict, lo_t: float, span_t: float) -> None:
         extra.append(f"📍 {place}")
     lo_a, hi_a = s.get("age_estimate_lower"), s.get("age_estimate_upper")
     if lo_a is not None and hi_a is not None:
-        extra.append(f"📏 age {span(lo_a, hi_a)}")
+        # FTDNA lower/upper; показываем отсортированный span newer→older (yrs BP).
+        extra.append(f"📏 age span {span(lo_a, hi_a)} · yrs BP, newer–older")
     if s.get("time_haplogroup") is not None:
         extra.append(f"🌿 own clade formed ~ {dv(s['time_haplogroup'])}")
     if s.get("kinship"):
@@ -721,10 +718,8 @@ def sample_block(doc: Doc, s: dict, lo_t: float, span_t: float) -> None:
     if s.get("studies"):
         extra.append("📚 " + "; ".join(s["studies"]))
 
-    # заголовок короткий: шкала, возраст, пол и код; остальное — в теле карточки
-    with card(doc, ("".join(mini), "#8A8294"), " ",
-              (f"{dv(age):>12}", "bold #B04A4A"), "  ",
-              (f"{sex} {code}", "bold #D4AD72"),
+    age_h = (f"{dv(age)}", "bold #B04A4A") if age is not None else ("—", "#8A8294")
+    with card(doc, age_h, "  ", (f"{sex} {code}", "bold #D4AD72"),
               rail="#B04A4A" if uncertain else "#5A5361"):
         who: list[Any] = []
         if full_name:
@@ -812,9 +807,7 @@ def badges_block(doc: Doc, badges: list) -> None:
 def _sources_status_block(ctx, doc: Doc, node: dict) -> None:
     """Сразу в Overview: какие базы включены и есть ли матч имени у текущего узла."""
     from ....core.overlays import resolve_overlay_dir
-    from ....core.store import Store
 
-    store = Store()
     name = str(node.get("name") or "")
     doc.title("SOURCES")
 
@@ -831,8 +824,14 @@ def _sources_status_block(ctx, doc: Doc, node: dict) -> None:
             ("  ·  card loaded", "#8A8294"), indent=1)
 
     ov = ctx.overlays()
-    yf_dir = resolve_overlay_dir(store, "yfull_ytree")
-    tt_dir = resolve_overlay_dir(store, "theytree")
+    store = getattr(ctx, "store", None)
+    yf_dir = tt_dir = None
+    if store is not None:
+        try:
+            yf_dir = resolve_overlay_dir(store, "yfull_ytree")
+            tt_dir = resolve_overlay_dir(store, "theytree")
+        except Exception:  # noqa: BLE001
+            yf_dir = tt_dir = None
 
     if ov and (ov.meta.get("yfull") or yf_dir):
         yf = ov.meta.get("yfull") or {}
@@ -867,6 +866,30 @@ def _sources_status_block(ctx, doc: Doc, node: dict) -> None:
                   "#71697A"), indent=1)
 
 
+def _overview_lineage(ctx, doc: Doc, name: str) -> None:
+    """Компактный путь с кликами — детали / funnel на вкладке Ancestors."""
+    chain = ctx.lineage(name)
+    doc.title(f"LINEAGE · {len(chain)}  ·  Ancestors tab for funnel")
+    if not chain:
+        doc.line("—", "#8A8294", 1)
+        return
+    doc.t.append("  ")
+    for i, n in enumerate(chain):
+        if i:
+            doc.t.append(" › ", style="#8A8294")
+        node = ctx.nodes.get(n) or {}
+        if n == name:
+            style = "bold #53A94B" if n in ctx.ours else "bold #D4AD72"
+        elif n in ctx.ours:
+            style = "#53A94B"
+        elif node.get("placeholder"):
+            style = "#8A8294"
+        else:
+            style = "#D4AD72"
+        doc.link(n, style)
+    doc.t.append("\n")
+
+
 @tab("Overview")
 def overview(ctx, doc: Doc, node: dict) -> None:
     fit(ctx)
@@ -881,15 +904,29 @@ def overview(ctx, doc: Doc, node: dict) -> None:
         psuffix = ""
     doc.title("HAPLOGROUP")
     doc.kv("Name", node["name"])
-    doc.kv("Parent", (parent + psuffix) if parent else "— (root)")
+    if parent:
+        doc.t.append("  Parent: ", style="#AEA5B8")
+        if parent in ctx.nodes:
+            doc.link(parent, "#D4AD72")
+            doc.t.append(psuffix + "\n", style="#8A8294")
+        else:
+            doc.t.append(f"{parent}{psuffix}\n")
+    else:
+        doc.kv("Parent", "— (root)")
     doc.kv("Status", "LOADED")
     if node.get("root") is not None:
         doc.kv("Root", node["root"])
-    doc.kv("ID / placements", f"{node.get('hg_id')} / {node.get('placements')}")
+    if node.get("hg_id") is not None:
+        doc.kv("Haplogroup ID", node["hg_id"])
+    placements = node.get("placements")
+    if placements is None:
+        doc.kv("Placements", "—")
+    else:
+        doc.kv("Placements", f"{placements:,}" if placements else "0 · none reported")
 
     badges_block(doc, node["badges"])
 
-    date_block(doc, "FORMATION", node.get("formed"))
+    date_block(doc, "FORMED", node.get("formed"))
     if parent and pnode and not pnode.get("placeholder"):
         doc.kv("Parent formed", pnode["date"])
     date_block(doc, "TMRCA", node.get("tmrca"))
@@ -900,7 +937,8 @@ def overview(ctx, doc: Doc, node: dict) -> None:
         doc.title("TMRCA · BIG Y")
         tmrca_explained(doc, bigy_tm)
 
-    doc.title("GEOGRAPHY")
+    # Краткая сводка — детали на вкладке Geography.
+    doc.title("GEOGRAPHY · summary  ·  Geography tab for maps")
     labels = []
     for n in node["countries"]:
         cc = country_code(n)
@@ -922,7 +960,7 @@ def overview(ctx, doc: Doc, node: dict) -> None:
 
     ctx.children_block(doc, node["name"])
     _overlay_children_block(ctx, doc, node)
-    ctx.lineage_block(doc, node["name"])
+    _overview_lineage(ctx, doc, node["name"])
     doc.title("RESOURCE")
     doc.kv("Source", "FamilyTreeDNA Discover")
     tree = _dict(node.get("tree"))
@@ -1047,8 +1085,12 @@ def snps(ctx, doc: Doc, node: dict) -> None:
     fit(ctx)
     variants, markers = node["variants"], node["markers"]
     ov = ctx.overlays()
-    doc.title(f"DOWNLOADED MARKERS · {len(markers)}")
-    doc.line(", ".join(markers) if markers else "—", "", 1)
+    doc.title(f"SEARCH MARKERS · {len(markers)}")
+    if markers:
+        doc.line(", ".join(markers), "", 1)
+    else:
+        doc.line("— none · optional progress.csv names (not Discover variants)",
+                 "#8A8294", 1)
     doc.title(f"GENETIC VARIANTS · {len(variants)}"
               + (" · overlay aliases / coords / QC" if ov else ""))
     for v in variants:
@@ -1063,13 +1105,27 @@ def snps(ctx, doc: Doc, node: dict) -> None:
         if v.get("anc") is not None or v.get("der") is not None:
             put(doc, ("mutation  ", "#AEA5B8"), (anc, "bold #53A94B"), (" ──▶ ", "#8A8294"),
                 (der, "bold #8BAB4A"), indent=3)
+        # Discover aliases — в основной карточке, не только в dump.
+        raw_aliases = v.get("aliases")
+        disc_aliases: list[str] = []
+        if isinstance(raw_aliases, list):
+            disc_aliases = [str(a) for a in raw_aliases if a]
+        elif isinstance(raw_aliases, str) and raw_aliases.strip():
+            disc_aliases = [raw_aliases.strip()]
+        if disc_aliases:
+            put(doc, ("aliases   ", "#AEA5B8"),
+                (", ".join(disc_aliases[:12])
+                 + (f" · +{len(disc_aliases) - 12}" if len(disc_aliases) > 12 else ""),
+                 "#C3BCCC"), indent=3)
         if ov:
             hit = ov.snp(name)
             if hit:
-                if hit.aliases:
-                    put(doc, ("aliases   ", "#AEA5B8"),
-                        (", ".join(hit.aliases[:12])
-                         + (f" · +{len(hit.aliases) - 12}" if len(hit.aliases) > 12 else ""),
+                extra_al = [a for a in (hit.aliases or [])
+                            if a and a not in disc_aliases and a != name]
+                if extra_al:
+                    put(doc, ("overlay = ", "#AEA5B8"),
+                        (", ".join(extra_al[:12])
+                         + (f" · +{len(extra_al) - 12}" if len(extra_al) > 12 else ""),
                          "#D4AD72"), indent=3)
                 for lab, coord in (("hg19", hit.hg19), ("hg38", hit.hg38), ("T2T ", hit.t2t)):
                     if not coord:
@@ -1090,7 +1146,7 @@ def snps(ctx, doc: Doc, node: dict) -> None:
                 if hit.haplogroups:
                     put(doc, ("in trees  ", "#AEA5B8"),
                         (", ".join(hit.haplogroups[:6]), "#AEA5B8"), indent=3)
-        dump(doc, v, 2, skip=("name", "position", "anc", "der"))
+        dump(doc, v, 2, skip=("name", "position", "anc", "der", "aliases"))
 
     # Defining SNPs с YFull, которых нет в Discover variants (дополнение).
     if ov:
@@ -1374,21 +1430,33 @@ _YSTR = {
     "surnames": ("📛", "Surnames", "distinct surnames among matches"),
     "haplogroups": ("🧬", "Haplogroups", "clades matches fall into"),
 }
-# В карточке Big Y остаётся только выборка. TMRCA вынесен в Overview;
-# «Наука» и «Структура ветки» дублируют вкладки Ancient DNA / Overview / Migration.
+# Big Y на Matches: выборка + счётчики науки/структуры.
+# TMRCA → Overview; globetrekker_paths → Migration.
 _BIGY_GROUPS = (
     ("Sample", (
         ("matches", "👥", "Big Y matches", "full Y-sequence tests"),
         ("countries", "🌍", "Countries", "test geography"),
     )),
+    ("Science", (
+        ("academic_samples", "📚", "Academic samples", "published research kits"),
+        ("academic_studies", "📄", "Academic studies", "papers citing this clade"),
+        ("ancient_samples", "🦴", "Ancient samples", "aDNA linked via Big Y"),
+        ("ancient_studies", "📜", "Ancient studies", "aDNA publications"),
+    )),
+    ("Structure", (
+        ("subclades", "🌿", "Subclades", "downstream Big Y branches"),
+        ("variants", "🧬", "Variants", "SNPs seen in Big Y tests"),
+        ("max_additional_depth", "↕", "Max added depth", "extra levels under this node"),
+    )),
 )
 _BIGY_MOVED = {
-    "tmrca", "academic_samples", "academic_studies", "ancient_samples", "ancient_studies",
-    "subclades", "variants", "max_additional_depth", "globetrekker_paths",
+    "tmrca",                 # подробный блок на Overview
+    "globetrekker_paths",    # Migration tab
 }
 
 
-def _stat(doc: Doc, icon: str, label: str, value: Any, hint: str = "") -> None:
+def _stat(doc: Doc, icon: str, label: str, value: Any, hint: str = "",
+          indent: int = 1) -> None:
     if value is None:
         v = "—"
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1398,7 +1466,7 @@ def _stat(doc: Doc, icon: str, label: str, value: Any, hint: str = "") -> None:
     quiet = value in (0, None)
     put(doc, (f"{icon} ", ""), (f"{label:<30}", "#AEA5B8"),
         (f"{v:>10}", "#8A8294" if quiet else "bold #D4AD72"),
-        (f"   {hint}" if hint else "", "#71697A"), indent=2)
+        (f"   {hint}" if hint else "", "#71697A"), indent=indent)
 
 
 def tmrca_explained(doc: Doc, tm: dict) -> None:
@@ -1437,51 +1505,52 @@ def matches(ctx, doc: Doc, node: dict) -> None:
     up = node["upgrades"]
     doc.title("MODERN MATCHES")
     if not up:
-        doc.line("—", "", 1)
+        doc.line("—")
         return
 
+    # Magazine: счётчики — плоские секции, не card (card = сущности).
     ystr = _dict(up.get("ystr"))
     if ystr:
-        with card(doc, ("Y-STR", "bold #49AE6B"), ("  — short tandem repeat (STR) test", "#8A8294"),
-                  rail="#49AE6B"):
-            shown = False
-            for k, (icon, label, hint) in _YSTR.items():
-                if k in ystr:
-                    _stat(doc, icon, label, ystr[k], hint)
-                    shown = True
-            for k, v in ystr.items():
-                if k not in _YSTR and k != "badges":
-                    _stat(doc, "•", str(k), v)
-                    shown = True
-            for b in ystr.get("badges") or []:
-                put(doc, ("🏅 ", ""), (str(b), "bold #B04A4A"), indent=2)
+        doc.title("Y-STR · short tandem repeat (STR) test")
+        shown = False
+        for k, (icon, label, hint) in _YSTR.items():
+            if k in ystr:
+                _stat(doc, icon, label, ystr[k], hint)
                 shown = True
-            if not shown:
-                put(doc, ("no data", "#8A8294"), indent=2)
+        for k, v in ystr.items():
+            if k not in _YSTR and k != "badges":
+                _stat(doc, "•", str(k), v)
+                shown = True
+        for b in ystr.get("badges") or []:
+            put(doc, ("🏅 ", ""), (str(b), "bold #B04A4A"))
+            shown = True
+        if not shown:
+            put(doc, ("no data", "#8A8294"))
 
     bigy = _dict(up.get("bigy"))
     if bigy:
-        with card(doc, ("Big Y", "bold #49AE6B"), ("  — full Y-chromosome sequencing", "#8A8294"),
-                  rail="#49AE6B"):
-            known = set(_BIGY_MOVED)
-            shown = False
-            for title, rows in _BIGY_GROUPS:
-                present = [r for r in rows if r[0] in bigy]
-                if not present:
-                    continue
-                put(doc, (title, "bold #FBF6F0"), indent=2)
-                for k, icon, label, hint in present:
-                    _stat(doc, icon, label, bigy[k], hint)
-                    known.add(k)
-                    shown = True
-            extra = {k: v for k, v in bigy.items() if k not in known}
-            if extra:
-                put(doc, ("Other", "bold #FBF6F0"), indent=2)
-                for k, v in extra.items():
-                    _stat(doc, "•", str(k), v)
+        doc.title("Big Y · full Y-chromosome sequencing")
+        known = set(_BIGY_MOVED)
+        shown = False
+        for title, rows in _BIGY_GROUPS:
+            present = [r for r in rows if r[0] in bigy]
+            if not present:
+                continue
+            doc.sub(title)
+            for k, icon, label, hint in present:
+                _stat(doc, icon, label, bigy[k], hint)
+                known.add(k)
                 shown = True
-            if not shown:
-                put(doc, ("no data · TMRCA is on the Overview tab", "#8A8294"), indent=2)
+        extra = {k: v for k, v in bigy.items() if k not in known}
+        if extra:
+            doc.sub("Other")
+            for k, v in extra.items():
+                _stat(doc, "•", str(k), v)
+            shown = True
+        if not shown:
+            put(doc, ("no data", "#8A8294"))
+        elif "tmrca" in bigy:
+            put(doc, ("TMRCA · see Overview", "#71697A"))
 
     rest = {k: v for k, v in up.items() if k not in ("ystr", "bigy")}
     if rest:
@@ -1494,36 +1563,40 @@ def ancient(ctx, doc: Doc, node: dict) -> None:
     placement_block(doc, node)
     here, up = ctx.split_mrca(node["ancient"], node)
 
-    # единая шкала времени для обеих секций: одна и та же дата — на одном месте
-    all_ages = [s.get("age_estimate_mean") for s in (*here, *up)
-                if isinstance(s, dict) and s.get("age_estimate_mean") is not None]
-    t_all = [_tt(x) for x in all_ages]
-    lo_t = min(t_all) if t_all else 0.0
-    span_t = ((max(t_all) if t_all else 1.0) - lo_t) or 1.0
-
     for title, items in (("IN THIS CLADE", here), ("FROM ANCESTORS UPSTREAM", up)):
-        doc.title(f"ANCIENT DNA · {title} · {len(items)}")
-        if items:
-            conf_legend(doc)
         dicts = [s for s in items if isinstance(s, dict)]
         ages = [s.get("age_estimate_mean") for s in dicts if s.get("age_estimate_mean") is not None]
-        if len(ages) > 1:
-            # лог-шкала времени: образцы от -121000 до +1189 иначе слипаются в пару ячеек
-            spark, lo, hi = sparkline(ages, transform=_tt)
-            put(doc, ("time distribution · log scale · newest left", "#AEA5B8"))
-            put(doc, (spark[::-1], "#D4AD72"))
-            a, b = dv(hi), dv(lo)
-            put(doc, (a, "#8A8294"), " " * max(1, 40 - len(a) - len(b)), (b, "#8A8294"))
-        for s in items:
-            if not isinstance(s, dict):
-                doc.line(f"• {s}", "", 1)
-        # группы: ближайший MRCA первым; внутри группы — от новых образцов к древним
-        for _, grp in _group_by_mrca(dicts):
-            mrca_header(doc, grp[0], len(grp))
+        groups = _group_by_mrca(dicts)
+
+        # рамка-хозяин: заголовок секции + ось времени + сводки clade
+        with card(doc, (f"ANCIENT · {title} · {len(items)}", "bold #FBF6F0"), rail="#D4AD72"):
+            if items:
+                conf_legend(doc, indent=1)
+            if len(ages) > 1:
+                # лог-шкала: образцы от -121000 до +1189 иначе слипаются в пару ячеек
+                spark, lo, hi = sparkline(ages, transform=_tt)
+                put(doc, ("newest ◂", "#8A8294"), (spark[::-1], "#D4AD72"),
+                    ("▸ older", "#8A8294"), indent=1)
+                a, b = dv(hi), dv(lo)
+                put(doc, (a, "#8A8294"), " " * max(1, 40 - len(a) - len(b)),
+                    (b, "#8A8294"), indent=1)
+                put(doc, ("log scale · sample ages", "#71697A"), indent=1)
+            elif len(ages) == 1:
+                put(doc, (f"single sample · {dv(ages[0])}", "#8A8294"), indent=1)
+
+            for _, grp in groups:
+                mrca_header(doc, grp[0], len(grp), indent=1)
+
+            for s in items:
+                if not isinstance(s, dict):
+                    put(doc, (f"• {s}", "#8A8294"), indent=1)
+            if not items:
+                put(doc, ("—", "#8A8294"), indent=1)
+
+        # дочерние карточки образцов — вне хозяина, группы уже в host
+        for _, grp in groups:
             for s in grp:
-                sample_block(doc, s, lo_t, span_t)
-        if not items:
-            doc.line("—", "", 1)
+                sample_block(doc, s)
 
 
 @tab("Famous")
@@ -1531,24 +1604,28 @@ def famous(ctx, doc: Doc, node: dict) -> None:
     fit(ctx)
     fam_here, fam_up = ctx.split_mrca(node["famous"], node)
     for title, group in (("IN CLADE", fam_here), ("FROM ANCESTORS", fam_up)):
-        doc.title(f"HISTORICAL · {title} · {len(group)}")
-        if not group:
-            doc.line("—", "", 1)
-            continue
-        conf_legend(doc)
-        cats: dict[str, int] = {}
-        for p_ in group:
-            if isinstance(p_, dict):
-                c = str(p_.get("category") or "—")
-                cats[c] = cats.get(c, 0) + 1
-        if cats:
-            put(doc, ("  ".join(f"{k} ×{v}" for k, v in sorted(cats.items(), key=lambda kv: (-kv[1], kv[0]))),
-                      "#49AE6B"))
-        for p_ in group:
-            if not isinstance(p_, dict):
-                doc.line(f"• {p_}", "", 1)
-        for _, grp in _group_by_mrca(group):
-            mrca_header(doc, grp[0], len(grp))
+        groups = _group_by_mrca([p for p in group if isinstance(p, dict)])
+        with card(doc, (f"HISTORICAL · {title} · {len(group)}", "bold #FBF6F0"), rail="#D4AD72"):
+            if group:
+                conf_legend(doc, indent=1)
+                cats: dict[str, int] = {}
+                for p_ in group:
+                    if isinstance(p_, dict):
+                        c = str(p_.get("category") or "—")
+                        cats[c] = cats.get(c, 0) + 1
+                if cats:
+                    put(doc, ("  ".join(
+                        f"{k} ×{v}" for k, v in sorted(cats.items(), key=lambda kv: (-kv[1], kv[0]))),
+                              "#49AE6B"), indent=1)
+                for _, grp in groups:
+                    mrca_header(doc, grp[0], len(grp), indent=1)
+                for p_ in group:
+                    if not isinstance(p_, dict):
+                        put(doc, (f"• {p_}", "#8A8294"), indent=1)
+            else:
+                put(doc, ("—", "#8A8294"), indent=1)
+
+        for _, grp in groups:
             for p_ in grp:
                 person_line(doc, p_)
 
@@ -1688,9 +1765,8 @@ def _path_lines(seg: list[str], color_for, newest_first: bool, width: int | None
     return lines
 
 
-@tab("Migration")
-def migration(ctx, doc: Doc, node: dict) -> None:
-    fit(ctx)
+def render_migration(doc: Doc, node: dict, *, compact: bool = False) -> None:
+    """Маршруты Globetrekker / endpoints / легенда. compact — для правой панели fullscreen."""
 
     def nm(x: Any) -> str:
         if isinstance(x, dict) and x.get("name"):
@@ -1700,8 +1776,8 @@ def migration(ctx, doc: Doc, node: dict) -> None:
         return str(x)
 
     steps: list = []
-    find_steps(node["migrationmap"], steps)
-    mm = _dict(node["migrationmap"])
+    find_steps(node.get("migrationmap"), steps)
+    mm = _dict(node.get("migrationmap"))
     colors = {}
     for item in mm.get("haplogroup_legend") or []:
         if isinstance(item, dict) and item.get("name"):
@@ -1752,9 +1828,22 @@ def migration(ctx, doc: Doc, node: dict) -> None:
             put(doc, ("🏁 ", ""), (str(d.get("name")), "bold #D4AD72"),
                 (f"   {dv(_year(d.get('tmrca')))}", "#B04A4A"),
                 (f"   children: {len(kids)}", "#AEA5B8"))
+    elif isinstance(desc, list):
+        put(doc, ("ENDPOINTS · none — FTDNA left descendants[] empty on this card",
+                  "#8A8294"))
+
+    if compact:
+        return
 
     if mm.get("time"):
-        doc.title(f"MIGRATION ROOT · {mm.get('haplogroup') or ''}")
+        # migrationmap.haplogroup — корень маршрута Globetrekker, не обязательно этот узел.
+        route_root = str(mm.get("haplogroup") or "")
+        here = str(node.get("name") or "")
+        doc.title("PATH ORIGIN · Globetrekker route root (not always this node)")
+        if route_root:
+            note = "  · this node" if route_root == here else "  · ancestor of this card"
+            put(doc, ("Starts at  ", "#AEA5B8"), (route_root, "bold #D4AD72"),
+                (note, "#8A8294"))
         doc.kv("Mean", dv(_dict(mm["time"]).get("mean")))
         conf_bar(doc, mm["time"])
         flags = [k for k in ("isAdam", "isRoot") if mm.get(k)]
@@ -1779,8 +1868,13 @@ def migration(ctx, doc: Doc, node: dict) -> None:
         else:
             dump(doc, legend, 1)
     put(doc, ("Globetrekker", "bold #FBF6F0"))
-    if node["globetrekker"]:
-        dump(doc, node["globetrekker"], 1)
+    gt = node.get("globetrekker") or {}
+    if isinstance(gt, dict) and gt and set(gt.keys()) <= {"start"}:
+        put(doc, ("start only  ", "#AEA5B8"), (str(gt.get("start")), "#D4AD72"), indent=1)
+        put(doc, ("no path payload in this card — routes above / Big Y path count",
+                  "#71697A"), indent=1)
+    elif gt:
+        dump(doc, gt, 1)
     else:
         doc.line("—", "", 1)
     paths = _dict(node["upgrades"].get("bigy")).get("globetrekker_paths")
@@ -1792,8 +1886,9 @@ def toggle_world(ctx) -> None:
     ctx.map_world = not getattr(ctx, "map_world", False)
 
 
-@tab("Map", keys={"w": toggle_world})
-def worldmap(ctx, doc: Doc, node: dict) -> None:
+@tab("Migration Map", keys={"w": toggle_world})
+def migration_map(ctx, doc: Doc, node: dict) -> None:
+    """Карта + Contact log + маршруты миграции (бывшие вкладки Map и Migration)."""
     fit(ctx)
     world = getattr(ctx, "map_world", False)
     doc.title("THEATER · " + ("WORLD" if world else "FIT") + " · W — view · M — fullscreen")
@@ -1801,11 +1896,13 @@ def worldmap(ctx, doc: Doc, node: dict) -> None:
         from .worldmap import defcon_map
     except ImportError:
         ascii_map(doc, node["migrationmap"])  # запасной вариант без береговых линий
+        render_migration(doc, node)
         return
     # ширину берём из панели инспектора (ctx.panel_width), иначе строки заворачиваются
     cols = max(34, min(140, int(getattr(ctx, "panel_width", 60)) - 6))
     defcon_map(doc, _dict(node["migrationmap"]), node["ancient"], node["name"], dv,
-               world=world, cols=cols)
+               world=world, cols=cols, with_log=True)
+    render_migration(doc, node)
 
 
 def toggle_raw(ctx) -> None:

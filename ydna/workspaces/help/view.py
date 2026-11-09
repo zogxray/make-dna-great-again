@@ -1,4 +1,4 @@
-"""Текст F7 Help: флоу и UX для продвинутого любителя (не мануал по API)."""
+"""Текст F8 Help: флоу и UX для продвинутого любителя (не мануал по API)."""
 
 from __future__ import annotations
 
@@ -28,7 +28,8 @@ Technical guts exist under the hood; this page is about **what to do** and
 4. **F4 PGS** — polygenic scores when you have a models folder from F2.
 5. **F5 Reference** — f3 / ancient & 1000 Genomes panels against AADR (or 1000G).
 6. **F6 Chat** — ask Gemini with the same context you already loaded (API key in F2).
-7. **F7 Help** — you are here.
+7. **F7 Jobs** — watch downloads / fetches / scores (cancel here; start them elsewhere).
+8. **F8 Help** — you are here.
 
 You can skip screens. Nothing forces a “full report”.
 
@@ -55,6 +56,11 @@ Change the active file here; F3/F5 follow it.
 Grouped sources (FTDNA, YFull/TheYtree overlays, PGS models, AADR, Gemini key…).
 Each row: path status, size hints, optional fetch/verify in the background.
 
+**Discover fetch stages (keys 1–5 / D)** on the FTDNA Discover source:
+
+1. Our path (tip→root) · 2. Children below Our · 3. This genome (exclusive) ·
+4. All F1 genomes (exclusive) · 5. Whole tree (confirm twice). Progress in **F7**.
+
 **Minimum for a useful Y session**
 
 - FTDNA **Haplotree** JSON → F3 topology + Y linking.
@@ -64,6 +70,11 @@ Each row: path status, size hints, optional fetch/verify in the background.
 **Minimum for F5**
 
 - **AADR** folder (the classic `.geno` / `.ind` / `.anno` trio).
+
+**PGS models (F4)**
+
+- **D** builds the local catalog (PGS Catalog API + weight files + coverage vs
+  the active F1 genome). Or **P** to an existing catalog folder.
 
 Paths and keys are remembered. Background jobs keep running if you leave F2.
 
@@ -93,9 +104,13 @@ in F2 — they do not rewrite FTDNA topology.
 ## F4 · PGS
 
 **Job:** score curated polygenic models on the active genome; optionally compare
-to another file or 1000 Genomes-style references shipped with the catalog.
+to another file or 1000 Genomes-style references from the catalog.
 
-- Left: model lists (curated / themes).
+Catalog comes from **F2 → PGS models → D** (or **P** to a folder with
+`catalog/catalog.tsv`).
+
+- Left: short lists (**L** — CUR / CAT / DIS / LOW / FEW) and **/** search
+  (trait, PGS id, theme).
 - Center: card for the selected model.
 - **G** / **A** — score theme or all; results stick for that genome.
 
@@ -139,6 +154,23 @@ already found in F3–F5, or paste snippets into NOTES / the prompt yourself.
 
 ---
 
+## F7 · Jobs
+
+**Job:** see what is running in the background.
+
+- Two panels: task list + detail (progress, rate, ETA, message).
+- Tasks still **start** in F2 / F3 / F4 / F6; F7 monitors them.
+- **P** pause/resume · **A** pause all · **C** cancel (or drop queued) · **X** clear finished · **/** filter.
+- Discover stages 1–5 on F2 **enqueue** if the slot is busy; F7 shows the queue.
+
+---
+
+## F8 · Help
+
+This page.
+
+---
+
 ## Mental model
 
 | Mode | Question it answers |
@@ -149,11 +181,13 @@ already found in F3–F5, or paste snippets into NOTES / the prompt yourself.
 | F4 | How do PGS models land on *my* genotypes? |
 | F5 | How do I sit among ancients / reference pops (f3 + Y tags)? |
 | F6 | Can I think out loud with a model, with notes beside? |
+| F7 | What is running in the background right now? |
+| F8 | What is the intended path through the app? |
 
 Everything important stays on your machine. Slow first opens are usually
 “build or unpack a cache once”; warm revisits should feel light.
 
-**Q** quits (with confirm). **F1–F7** switch modes anytime.
+**Q** quits (with confirm). **F1–F8** switch modes anytime.
 
 Only one app window at a time. If a second start says “already running”, close the
 other window or `kill` that PID — you do not need to touch any database files.

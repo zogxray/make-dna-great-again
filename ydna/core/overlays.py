@@ -84,6 +84,22 @@ class OverlayIndex:
     def snp(self, name: str) -> SnpOverlay | None:
         return self.snps.get(_snp_key(name))
 
+    def snp_by_pos(self, assembly: str = "hg38") -> dict[int, str]:
+        """позиция → имя SNP (hg19/37 или hg38). Первое имя на локусе."""
+        key = (assembly or "hg38").lower().replace("grch", "").replace("b", "")
+        use19 = key in ("19", "37", "hg19", "hg37")
+        attr = "_by_pos19" if use19 else "_by_pos38"
+        cached = getattr(self, attr, None)
+        if cached is None:
+            idx: dict[int, str] = {}
+            for snp in self.snps.values():
+                coord = snp.hg19 if use19 else snp.hg38
+                if coord and coord[0] and coord[0] not in idx:
+                    idx[int(coord[0])] = snp.name
+            setattr(self, attr, idx)
+            cached = idx
+        return cached
+
     def children_diff(self, name: str, ftdna_children: Iterable[str]) -> dict[str, Any] | None:
         """Сверка детей при точном совпадении имени. В дерево FTDNA ничего не пишет.
 

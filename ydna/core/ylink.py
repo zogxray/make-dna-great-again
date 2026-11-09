@@ -113,6 +113,19 @@ class Haplotree:
                 kids[p].append(i)
         return kids
 
+    def descendants_of(self, tip: int) -> set[int]:
+        """Все потомки tip (без самого tip)."""
+        kids = self.child_lists()
+        out: set[int] = set()
+        stack = list(kids[tip])
+        while stack:
+            i = stack.pop()
+            if i in out:
+                continue
+            out.add(i)
+            stack.extend(kids[i])
+        return out
+
     def positions(self) -> dict[int, list[tuple[int, str, str]]]:
         """позиция hg38 → [(узел, ancestral, derived), …]."""
         cached = getattr(self, "_positions", None)
@@ -122,6 +135,18 @@ class Haplotree:
                 if pos:
                     idx.setdefault(pos, []).append((node, anc, der))
             self._positions = idx
+            cached = idx
+        return cached
+
+    def snp_by_pos(self) -> dict[int, str]:
+        """позиция hg38 → первичное имя SNP (первое в индексе вариантов)."""
+        cached = getattr(self, "_snp_by_pos", None)
+        if cached is None:
+            idx: dict[int, str] = {}
+            for name, (_node, pos, _anc, _der) in self.variants.items():
+                if pos and pos not in idx:
+                    idx[pos] = name
+            self._snp_by_pos = idx
             cached = idx
         return cached
 
@@ -343,7 +368,121 @@ def progress_markers(path: Path) -> dict[str, list[str]]:
 # ───────────────────────── геном ─────────────────────────
 
 def is_named(rid: str) -> bool:
-    return not rid.startswith("rs")
+    """Именованный Y-маркер (BY/FT/M/…), не rs* и не VCF-заглушка chrom:pos."""
+    if not rid or rid == "." or rid.startswith("rs"):
+        return False
+    if ":" in rid:
+        return False
+    return True
+
+
+def _is_y_placeholder(rid: str, pos: int) -> bool:
+    """ID без имени: '.', пусто, Y:… / chrY:… или chrom:pos от VCF-парсера."""
+    if not rid or rid == ".":
+        return True
+    left, sep, right = rid.rpartition(":")
+    if not sep:
+        return False
+    head = left[3:] if left.upper().startswith("CHR") else left
+    if head.upper() in ("Y", "24"):
+        return True  # Y:2658271 / Y:000000 — синтетика чипа, не имя SNP
+    if right.isdigit() and int(right) == pos:
+        return True
+    return False
+
+
+def resolve_genome_y_positions(
+    genome: Genome,
+    tree: Haplotree | None = None,
+    overlays=None,
+) -> int:
+    """Для именованных Y-SNP с pos=0 (Big Y CSV Known SNP) — позиция из дерева.
+
+    Строки, у которых позицию так и не нашли, отбрасываются. → число заполненных.
+    """
+    y = genome.chroms.get("Y")
+    if not y or not y.n or (tree is None and overlays is None):
+        return 0
+    filled = 0
+    for i in range(y.n):
+        if int(y.pos[i]) > 0:
+            continue
+        rid = y.ids[i]
+        if not is_named(rid):
+            continue
+        pos = 0
+        if tree is not None:
+            v = tree.variants.get(rid)
+            if v and v[1]:
+                pos = int(v[1])
+        if not pos and overlays is not None:
+            snp = overlays.snp(rid)
+            if snp is not None:
+                build = (genome.build_detected or genome.build or "").strip()
+                coord = snp.hg19 if build == "37" else snp.hg38
+                if not coord:
+                    coord = snp.hg38 or snp.hg19
+                if coord and coord[0]:
+                    pos = int(coord[0])
+        if pos > 0:
+            y.pos[i] = pos
+            filled += 1
+    # без позиции в индексе не храним (иначе ломает сортировку / link)
+    keep = [i for i in range(y.n) if int(y.pos[i]) > 0]
+    if len(keep) != y.n:
+        y.ids = [y.ids[i] for i in keep]
+        y.gts = [y.gts[i] for i in keep]
+        y.pos = array("l", (int(y.pos[i]) for i in keep))
+        y.sorted_input = False
+        y.finalize()
+    elif filled:
+        y.sorted_input = False
+        y.finalize()
+    if filled and "Y positions from tree" not in (genome.layout or ""):
+        genome.layout = (genome.layout + " · Y positions from tree").strip(" ·")
+    return filled
+
+
+def annotate_genome_y(
+    genome: Genome,
+    tree: Haplotree | None = None,
+    overlays=None,
+) -> int:
+    """Подставить имена SNP в placeholder-ID на Y.
+
+    hg38 → FTDNA haplotree (и/или TheYtree hg38); hg37 → TheYtree hg19.
+    rs* не трогаем. → число замен.
+    """
+    y = genome.chroms.get("Y")
+    if not y or not y.n:
+        return 0
+    map38: dict[int, str] = tree.snp_by_pos() if tree is not None else {}
+    map37: dict[int, str] = {}
+    if overlays is not None:
+        if not map38:
+            map38 = overlays.snp_by_pos("hg38")
+        map37 = overlays.snp_by_pos("hg19")
+    if not map37 and not map38:
+        return 0
+    build = (genome.build_detected or genome.build or "").strip()
+    # Сборка из header / majority: 37 → сначала hg19-карта.
+    primary, secondary = (map37, map38) if build == "37" else (map38, map37)
+    n = 0
+    for i in range(y.n):
+        pos = int(y.pos[i])
+        if not _is_y_placeholder(y.ids[i], pos):
+            continue
+        name = primary.get(pos) or secondary.get(pos)
+        if not name:
+            continue
+        y.ids[i] = name
+        n += 1
+    if n:
+        y.finalize()
+        if "Y SNP names" not in (genome.layout or ""):
+            src = "tree/YFull catalogs"
+            genome.layout = (genome.layout + f" · Y SNP names from {src}").strip(" ·")
+    return n
 
 
 def allele_state(gt: str, anc: str, der: str) -> str:
@@ -740,6 +879,184 @@ def missing_all_names(store: Store) -> list[str]:
     return [tree.names[n] for n in range(len(tree)) if n not in have and n not in skip]
 
 
+# ───────────────────────── этапы Discover fetch (F2) ─────────────────────────
+
+FETCH_STAGES = (
+    ("our", "1 · Our path"),
+    ("children", "2 · Children below Our"),
+    ("genome", "3 · This genome"),
+    ("all_genomes", "4 · All genomes"),
+    ("tree", "5 · Whole tree"),
+)
+
+
+@dataclass
+class FetchPlan:
+    """Пять этапов докачки Discover. Списки — только ещё не скачанные (и не not_found).
+
+    UI-счётчики exclusive: 3 не включает 1–2, 4 не включает 1–3.
+    При старте job этап пересчитывается «как есть» (уже лежащее на диске пропускается).
+    """
+    tip: str | None
+    our: list[str]
+    children: list[str]
+    genome: list[str]          # exclusive of our∪children
+    all_genomes: list[str]     # exclusive of our∪children∪genome
+    n_tree: int
+    genome_label: str
+    n_genomes: int
+
+    def names(self, stage: str) -> list[str]:
+        if stage == "our":
+            return list(self.our)
+        if stage == "children":
+            return list(self.children)
+        if stage == "genome":
+            return list(self.genome)
+        if stage == "all_genomes":
+            return list(self.all_genomes)
+        if stage == "tree":
+            return []  # имена — missing_all_names() (лениво)
+        return []
+
+    def count(self, stage: str) -> int:
+        if stage == "tree":
+            return self.n_tree
+        return len(self.names(stage))
+
+
+def _have_skip(tree: Haplotree, disc: Discover) -> tuple[set[int], set[int]]:
+    have = {tree.index[n] for n in disc.names if n in tree.index}
+    skip = {tree.index[n] for n in disc.not_found if n in tree.index}
+    return have, skip
+
+
+def _missing_names(tree: Haplotree, nodes: set[int], have: set[int], skip: set[int]) -> list[str]:
+    ordered = sorted(
+        (n for n in nodes if n not in have and n not in skip),
+        key=lambda n: (tree.depth(n), tree.names[n]),
+    )
+    return [tree.names[n] for n in ordered]
+
+
+def _linked_nodes(tree: Haplotree, markers: list[str]) -> set[int]:
+    return {tree.variants[m][0] for m in markers if m in tree.variants}
+
+
+def _tip_path_indices(store: Store, tree: Haplotree) -> tuple[str | None, list[int]]:
+    """Our tip + path indices (корень→tip). Discover index не нужен — счёт по haplotree."""
+    from . import genome_db
+
+    path = active_genome()
+    if not path:
+        return None, []
+    try:
+        if genome_db.is_fresh(path):
+            g = genome_db.genome_from_db(path, only={"Y"})
+        else:
+            g = genome_db.get(path, store=store)
+    except Exception:  # noqa: BLE001
+        return None, []
+    link = link_y(g, tree, None)
+    if not link:
+        return None, []
+    branch = our_branch(link, tree, g, None)
+    if not branch:
+        return None, []
+    idxs = [tree.index[n] for n in branch.path if n in tree.index]
+    return branch.tip, idxs
+
+
+_plan_lock = threading.Lock()
+_plan_cache: tuple[tuple, FetchPlan | str] | None = None
+
+
+def _plan_fp(store: Store) -> tuple:
+    parts = list(_coverage_fp(store))
+    # все F1-файлы влияют на этап 4
+    for p in genome_files():
+        try:
+            st = p.stat()
+            parts.append(("gf", str(p.resolve()), st.st_mtime_ns, st.st_size))
+        except OSError:
+            parts.append(("gf", str(p), None))
+    return tuple(parts)
+
+
+def fetch_plan(store: Store) -> FetchPlan | str:
+    """План этапов 1–5. Кэш по fp tree/discover/genomes."""
+    global _plan_cache
+    fp = _plan_fp(store)
+    with _plan_lock:
+        if _plan_cache is not None and _plan_cache[0] == fp:
+            return _plan_cache[1]
+        result = _fetch_plan_compute(store)
+        _plan_cache = (fp, result)
+        return result
+
+
+def _fetch_plan_compute(store: Store) -> FetchPlan | str:
+    tree_path = store.path("ftdna_haplotree")
+    folder = store.path("ftdna_discover")
+    if not tree_path or not Path(tree_path).is_file():
+        return "set the FTDNA Y-DNA Haplotree path"
+    if not folder or not Path(folder).is_dir():
+        return "set the Discover folder"
+    tree = load_haplotree(Path(tree_path))
+    disc = discover_state(Path(folder))
+    have, skip = _have_skip(tree, disc)
+
+    tip, path_idxs = _tip_path_indices(store, tree)
+    path_set = set(path_idxs)
+    our = _missing_names(tree, path_set, have, skip)
+
+    child_set: set[int] = set()
+    if tip and tip in tree.index:
+        child_set = tree.descendants_of(tree.index[tip])
+    children = _missing_names(tree, child_set, have, skip)
+
+    active = active_genome()
+    g_label = active.name if active else "—"
+    this_linked: set[int] = set()
+    if active:
+        this_linked = _linked_nodes(tree, genome_markers(active))
+    prior = path_set | child_set
+    genome_excl = _missing_names(tree, this_linked - prior, have, skip)
+
+    all_linked: set[int] = set(this_linked)
+    files = genome_files()
+    for p in files:
+        if active and p.resolve() == active.resolve():
+            continue
+        try:
+            all_linked |= _linked_nodes(tree, genome_markers(p))
+        except Exception:  # noqa: BLE001
+            continue
+    all_excl = _missing_names(tree, all_linked - prior - this_linked, have, skip)
+
+    n_tree = sum(1 for n in range(len(tree)) if n not in have and n not in skip)
+    return FetchPlan(
+        tip=tip,
+        our=our,
+        children=children,
+        genome=genome_excl,
+        all_genomes=all_excl,
+        n_tree=n_tree,
+        genome_label=g_label,
+        n_genomes=len(files),
+    )
+
+
+def stage_fetch_names(store: Store, stage: str) -> list[str]:
+    """Имена для job этапа. tree — полный missing; остальные — из плана (уже exclusive)."""
+    if stage == "tree":
+        return missing_all_names(store)
+    plan = fetch_plan(store)
+    if isinstance(plan, str):
+        return []
+    return plan.names(stage)
+
+
 # ───────────────────────── докачка из Discover ─────────────────────────
 
 def _pause(job: Job, seconds: float) -> None:
@@ -822,12 +1139,17 @@ def _save_resource(folder: Path, log: Path, name: str, body: bytes) -> Path:
 
 
 def fetch_resources(folder: Path, names: list[str], job: Job) -> str:
-    """Докачка Discover: сначала HaplogroupSearch (подсказки имён), затем JSON.
-    Если Search ничего не вернул — пробуем resources/y-dna/{имя}.json напрямую."""
+    """Докачка Discover: сначала прямой JSON по имени, Search — только при 403/404.
+
+    Типичный haplotree-узел лежит под тем же ключом → один запрос вместо Search+JSON.
+    Если ресурса нет — HaplogroupSearch (alias) и JSON по подсказкам; уже пробованное
+    имя повторно не качаем. Уже лежащие *.json пропускаются без HTTP.
+    """
     folder.mkdir(parents=True, exist_ok=True)
     ensure_space(folder, len(names) * AVG_RESOURCE + (256 << 20))
     log = folder.parent.parent / "resources.csv"
     got = missing = aliased = 0
+    direct_hits = 0
     job.unit = "items"
     job.set_stage(f"fetching {len(names):,} haplogroups from Discover", len(names))
     for i, name in enumerate(names):
@@ -836,44 +1158,63 @@ def fetch_resources(folder: Path, names: list[str], job: Job) -> str:
             job.progress(i + 1)
             continue
 
+        # 1) Прямой resource — без Search.
+        job.stage = f"fetching {name} · {got:,} saved · {missing:,} missing"
+        _pause(job, random.uniform(*DELAY))
+        body = _get(RESOURCE_URL.format(name=urllib.parse.quote(name, safe="")), job, name)
+        if body is not None:
+            _save_resource(folder, log, name, body)
+            got += 1
+            direct_hits += 1
+            job.progress(i + 1)
+            continue
+
+        # 2) 403/404 → Search за alias, затем JSON по подсказкам (имя уже пробовали).
         job.stage = f"search {name} · {got:,} saved · {missing:,} missing"
         _pause(job, random.uniform(*DELAY))
         hints = _search_hints(name, job)
-        targets = hints if hints else [name]
         saved = 0
-
-        for target in targets:
+        for target in hints:
+            if target == name:
+                continue
             tdest = folder / f"{safe_stem(target)}.json"
             if tdest.exists():
                 saved += 1
                 continue
-            job.stage = (f"fetching {target}" + (f" (for {name})" if target != name else "")
-                         + f" · {got:,} saved · {missing:,} missing")
+            job.stage = (f"fetching {target} (for {name})"
+                         f" · {got:,} saved · {missing:,} missing")
             _pause(job, random.uniform(*DELAY))
-            body = _get(RESOURCE_URL.format(name=urllib.parse.quote(target, safe="")), job, target)
+            body = _get(RESOURCE_URL.format(name=urllib.parse.quote(target, safe="")),
+                        job, target)
             if body is None:
                 continue
             _save_resource(folder, log, target, body)
             got += 1
             saved += 1
 
-        if hints and not dest.exists():
-            if saved:
-                hint_path = folder / f"{safe_stem(hints[0])}.json"
+        if not dest.exists():
+            if saved and hints:
+                hint_path = next(
+                    (folder / f"{safe_stem(h)}.json" for h in hints
+                     if (folder / f"{safe_stem(h)}.json").is_file()),
+                    folder / f"{safe_stem(hints[0])}.json",
+                )
                 _log(log, name, "alias", hint_path,
-                     f"Discover Search → {', '.join(hints)}")
+                     f"direct miss → Search → {', '.join(hints)}")
                 aliased += 1
+            elif hints:
+                missing += 1
+                _log(log, name, "not_found", dest,
+                     f"direct 403/404; search hints {', '.join(hints)} but no resource JSON")
             else:
                 missing += 1
                 _log(log, name, "not_found", dest,
-                     f"search: hints {', '.join(hints)} but no resource JSON")
-        elif not hints and not saved:
-            missing += 1
-            _log(log, name, "not_found", dest,
-                 f"search: no hint; {_LEGACY_NOT_FOUND}")
+                     f"direct 403/404; search: no hint; {_LEGACY_NOT_FOUND}")
 
         job.progress(i + 1)
     bits = [f"{got:,} downloaded"]
+    if direct_hits:
+        bits.append(f"{direct_hits:,} direct (no Search)")
     if aliased:
         bits.append(f"{aliased:,} via Search alias")
     if missing:

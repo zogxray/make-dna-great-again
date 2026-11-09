@@ -4,9 +4,10 @@ from .chat import ChatWorkspace
 from .data import DataWorkspace
 from .genome import GenomeWorkspace
 from .help import HelpWorkspace
+from .jobs import JobsWorkspace
 from .pgs import PgsWorkspace
 from .reference import ReferenceWorkspace
 from .tree import TreeWorkspace
 
 __all__ = ["TreeWorkspace", "DataWorkspace", "GenomeWorkspace", "PgsWorkspace",
-           "ReferenceWorkspace", "ChatWorkspace", "HelpWorkspace"]
+           "ReferenceWorkspace", "ChatWorkspace", "JobsWorkspace", "HelpWorkspace"]

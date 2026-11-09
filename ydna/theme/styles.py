@@ -100,6 +100,8 @@ STATE_ICON_STYLE = {
 }
 JOB_STYLE = {
     "running": HI,
+    "paused": WARN,
+    "queued": DIM,
     "done": OK,
     "failed": BAD,
     "cancelled": WARN,

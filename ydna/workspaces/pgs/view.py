@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from rich.text import Text
 
-from ...core.pgs import HIST_BINS, POPS, SUPERPOPS, THEME_LABEL, THEMES, GroupStat, Model, Pair, Result
+from ...core.pgs import (
+    HIST_BINS, POPS, SUPERPOPS, THEME_LABEL, GroupStat, Model, Pair, Result, sections_for,
+)
 from ...theme.harmony import BrandAnchor, DIATONIC_HUE_STEP, muted_fill
 from ...theme.styles import A_STYLE, B_STYLE, BAD, DIM, OK, WARN
 from ..base import click, fit
@@ -230,7 +232,7 @@ def overview(models: list[Model], results: dict[str, Result], genome: str | None
     for r in far:
         _ov_row(d.t, r)
     by_id = {m.pgs_id: m for m in models}
-    for theme, label in THEMES:
+    for theme, label in sections_for(models):
         rows = sorted((r for r in ok if by_id.get(r.pgs_id) and by_id[r.pgs_id].theme == theme),
                       key=lambda r: -r.eur.pct)
         if rows:
@@ -367,7 +369,7 @@ def compare_view(models: list[Model], ra: dict[str, Result], rb: dict[str, Resul
             d.title("BIGGEST DIFFERENCES")
             for p in sorted(rows, key=lambda p: -p.delta)[:8]:
                 _pair_row(d.t, p, width)
-        for theme, label in THEMES:
+        for theme, label in sections_for([p.model for p in rows]):
             group = [p for p in rows if p.model.theme == theme]
             if group:
                 d.title(label.upper())

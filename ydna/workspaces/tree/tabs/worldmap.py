@@ -269,9 +269,38 @@ def _contacts(ancient: list, mm: dict) -> list[dict]:
     return out
 
 
+def contact_log_lines(centers: list, fmt: Callable[[Any], str] = str,
+                      limit: int = 40) -> list[tuple[str, str]]:
+    """Строки CONTACT LOG (newest first) для правой панели / Doc: [(text, style), ...]."""
+    out: list[tuple[str, str]] = []
+    if not centers:
+        return out
+    out.append((f"CONTACT LOG · newest first · {len(centers)}", "bold #B04A4A"))
+    for i, _cx, _cy, cl in centers[:limit]:
+        ages = [x.get("age_estimate_mean") for x in cl if x.get("age_estimate_mean") is not None]
+        when = fmt(max(ages)) if ages else "?"
+        if len(ages) > 1 and min(ages) != max(ages):
+            when = f"{fmt(max(ages))} … {fmt(min(ages))}"
+        first = cl[0]
+        place = first.get("site") or first.get("geography") or first.get("country_name") or "?"
+        country = first.get("country_name") or ""
+        hg = first.get("haplogroup_y") or ""
+        bit = f"▲{i}  {when}  {place}"
+        if country and country != place:
+            bit += f"  · {country}"
+        if hg:
+            bit += f"  · {hg}"
+        bit += f"  ×{len(cl)}"
+        out.append((bit, "#AEA5B8"))
+    if len(centers) > limit:
+        out.append((f"… {len(centers) - limit} more", "#8A8294"))
+    return out
+
+
 def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
                fmt: Callable[[Any], str] = str, world: bool = False, cols: int = 96,
-               max_rows: int = 30) -> None:
+               max_rows: int = 30, with_log: bool = True) -> list:
+    """Рисует карту. Возвращает centers [(i, cx, cy, cluster), ...] newest first."""
     cols = max(30, cols)
     mm = _d(mm)
     segs, nodes, origin, deg = _extract(mm)
@@ -296,11 +325,14 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
     for s in contacts:
         clusters.setdefault((round(float(s["longitude"]) * 2), round(float(s["latitude"]) * 2)), []).append(s)
 
-    def age_of(cl: list[dict]) -> float:
+    def age_key(cl: list[dict]) -> tuple:
+        # Календарные годы (отриц. = BCE): сначала новые, без даты — в конце.
         a = [x.get("age_estimate_mean") for x in cl if x.get("age_estimate_mean") is not None]
-        return min(a) if a else 0
+        if not a:
+            return (True, 0)
+        return (False, -max(a))
 
-    ordered = sorted(clusters.values(), key=age_of)
+    ordered = sorted(clusters.values(), key=age_key)
 
     # ── охват карты ──
     pts = [p for c, _ in segs for p in c] + [(float(s["longitude"]), float(s["latitude"])) for s in contacts]
@@ -476,14 +508,14 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
         leg += [("   ··", "#3C3247"), (f" ring {gstep}°", "#AEA5B8")]
     pad_line(leg)
 
-    # ── журнал контактов ──
-    if centers:
-        pad_line([(" CONTACT LOG", "bold #B04A4A")], 12)
+    # ── журнал контактов (newest first; на полноэкране — в правой панели) ──
+    if with_log and centers:
+        pad_line([(" CONTACT LOG · newest first", "bold #B04A4A")], 28)
         for i, cx, cy, cl in centers[:18]:
             ages = [x.get("age_estimate_mean") for x in cl if x.get("age_estimate_mean") is not None]
-            when = fmt(min(ages)) if ages else "?"
+            when = fmt(max(ages)) if ages else "?"
             if len(ages) > 1 and min(ages) != max(ages):
-                when += f" … {fmt(max(ages))}"
+                when = f"{fmt(max(ages))} … {fmt(min(ages))}"
             first = cl[0]
             place = first.get("site") or first.get("geography") or first.get("country_name") or "?"
             country = first.get("country_name") or ""
@@ -498,6 +530,8 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
             pad_line(parts)
         if len(centers) > 18:
             pad_line([(f" … {len(centers) - 18} more", "#AEA5B8")], 14)
+
+    return centers
 
 
 _SMALL_GLYPH = {"●": "·", "○": "◦", "▲": "▴", "▼": "▾"}

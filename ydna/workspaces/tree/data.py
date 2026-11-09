@@ -193,9 +193,11 @@ def haplotree_stub(name: str, parent: str | None) -> dict[str, Any]:
         "countries": _EL, "flags": _EL, "placed_samples": 0, "uncertain_samples": 0,
         # markers — свой список: progress.csv делает append до замены в finalize.
         "markers": [], "variants": _EL, "ancient": _EL, "countries_data": _EL,
-        "geochart_countries": _EL, "ancestors": _EL, "upgrades": _ED, "famous": _EL,
+        "geochart_countries": _EL, "google_countries": _ED,
+        "ancestors": _EL, "upgrades": _ED, "famous": _EL,
         "projects": _EL, "badges": _EL, "globetrekker": _ED, "migrationmap": _ED,
         "placements": None, "declared_children": _EL, "tree_version": None,
+        "tree_start": None, "tree": _ED,
         "source_file": None, "placeholder": True, "haplotree": True,
         "rich": "normal", "crown": False, "deep": False,
         "children_count": 0, "descendants_count": 0, "height": 0,
@@ -239,6 +241,18 @@ def _apply_discover(node: dict[str, Any], data: dict[str, Any], source_file: str
     node["ancient"] = _list(data.get("ancient"))
     node["countries_data"] = _list(data.get("countries"))
     node["geochart_countries"] = _list(data.get("geochart_countries"))
+    # Мировая база FTDNA (country → test count); не география клады — вкладка Geography · W.
+    raw_world = data.get("google_countries")
+    if isinstance(raw_world, dict):
+        world: dict[str, int] = {}
+        for k, v in raw_world.items():
+            try:
+                world[str(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
+        node["google_countries"] = world
+    else:
+        node["google_countries"] = {}
     node["ancestors"] = _list(data.get("ancestors"))
     node["upgrades"] = _dict(data.get("upgrades"))
     node["famous"] = _list(data.get("famous"))
@@ -250,7 +264,17 @@ def _apply_discover(node: dict[str, Any], data: dict[str, Any], source_file: str
     node["declared_children"] = [
         c.get("name") if isinstance(c, dict) else str(c) for c in _list(desc.get("children"))
     ]
-    node["tree_version"] = _dict(data.get("tree")).get("version")
+    # Discover JSON: tree.version_major/minor/micro + start (не tree.version).
+    tree = _dict(data.get("tree"))
+    node["tree"] = tree
+    parts = [tree.get(k) for k in ("version_major", "version_minor", "version_micro")]
+    if any(p is not None for p in parts):
+        node["tree_version"] = ".".join(str(p) for p in parts if p is not None)
+    elif tree.get("version") is not None:
+        node["tree_version"] = str(tree.get("version"))
+    else:
+        node["tree_version"] = None
+    node["tree_start"] = tree.get("start")
     node["source_file"] = source_file
     node["placeholder"] = False
 

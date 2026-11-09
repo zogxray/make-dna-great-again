@@ -11,12 +11,16 @@ from . import db
 
 
 def seed_menus(con=None) -> None:
-    """Системные вкладки: catalog (все ok) + curated (selection из CURATED)."""
+    """Системные вкладки: curated / catalog / diseases / low cov / too few."""
     from .pgs import CURATED
 
+    # Короткие ярлыки: ряд вкладок должен влезать в узкую колонку MODELS (~46).
     menus = [
-        ("curated", "CURATED", "selection", 0, True),
-        ("catalog", "CATALOG", "catalog", 1, True),
+        ("curated", "CUR", "selection", 0, True),
+        ("catalog", "CAT", "catalog", 1, True),
+        ("diseases", "DIS", "diseases", 2, True),
+        ("low_coverage", "LOW", "status", 3, True),
+        ("too_few_matched", "FEW", "status", 4, True),
     ]
     items = [
         (i, pid, label, theme)
@@ -181,12 +185,29 @@ _MODEL_COLS = (
 
 def load_catalog_ok() -> list:
     """Модели status=ok, как бывший load_catalog (порядок theme / cov_w)."""
+    return load_by_status("ok")
+
+
+def load_by_status(status: str) -> list:
+    """Модели с данным status (порядок theme / cov_w)."""
     from .pgs import THEMES
     order = {k: i for i, (k, _) in enumerate(THEMES)}
     rows = db.fetchall(f"""
-        SELECT {_MODEL_COLS} FROM pgs.models WHERE status = 'ok'
-    """)
+        SELECT {_MODEL_COLS} FROM pgs.models WHERE status = ?
+    """, [status])
     out = [_row_model(r) for r in rows]
+    out.sort(key=lambda m: (order.get(m.theme, 99), -(m.cov_w or 0), m.pgs_id))
+    return out
+
+
+def load_diseases() -> list:
+    """excluded_disease с theme → подгруппа Cancer / Sleep clinical / Psych / Other."""
+    from .pgs import DISEASE_GROUPS, disease_group
+
+    order = {k: i for i, (k, _) in enumerate(DISEASE_GROUPS)}
+    out = load_by_status("excluded_disease")
+    for m in out:
+        m.theme = disease_group(m.trait, m.efo)
     out.sort(key=lambda m: (order.get(m.theme, 99), -(m.cov_w or 0), m.pgs_id))
     return out
 

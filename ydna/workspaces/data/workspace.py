@@ -18,13 +18,14 @@ from ...core.jobs import JOBS, Job
 from ...core import sources_db
 from ...core.sources import BY_KEY, SOURCE_GROUPS, SOURCES, Source, Status, human_size
 from ...core.store import Store
-from ...core.ylink import active_genome, fetch_cost
+from ...core.ylink import (FETCH_STAGES, active_genome, fetch_cost, fetch_plan,
+                           stage_fetch_names)
 from ..base import KeyBar, ModeBar, Workspace, alt_keys, click, fit, short_path
 from .screens import PathScreen, TokenScreen
 
 from ...theme.styles import DIM, JOB_STYLE, STATE_ICON_STYLE
 
-PROMPT_W = 40                # #src-box 48 минус рамка, отступы и значок
+PROMPT_W = 36                # #src-box 42 минус рамка, отступы и значок
 
 STATE_ICON = {k: (glyph, STATE_ICON_STYLE[k]) for k, glyph in
               (("ok", "✔"), ("partial", "◐"), ("missing", "✖"), ("unset", "○"))}
@@ -87,19 +88,25 @@ class DataWorkspace(Workspace):
     mode_key = "data"
     DEFAULT_CSS = """
     #main { height: 1fr; }
-    #src-box { width: 48; border: round $primary; }
+    #src-box { width: 42; border: round $primary; }
     #det-box { width: 1fr; border: round $primary; }
-    #src-box:focus-within, #det-box:focus-within { border: round $accent; }
+    #act-box { width: 36; min-width: 32; border: round $primary; }
+    #src-box:focus-within, #det-box:focus-within, #act-box:focus-within { border: round $accent; }
     #sources { height: 1fr; border: none; background: transparent; }
-    #det-scroll { height: 1fr; scrollbar-size-vertical: 1; }
-    #details { padding: 0 1; }
+    #det-scroll, #act-scroll { height: 1fr; scrollbar-size-vertical: 1; }
+    #details, #actions { padding: 0 1; }
     #help { height: 1; padding: 0 1; color: $text-muted; }
     #status { height: 1; padding: 0 1; background: $boost; }
     """
     BINDINGS = [
         Binding(alt_keys("p"), "set_path", "Set path"),
-        Binding(alt_keys("d"), "download", "Download"),
-        Binding(alt_keys("a"), "fetch_all", "Fetch whole tree", show=False),
+        Binding(alt_keys("d"), "download", "Download / fetch stage 1"),
+        Binding("1", "fetch_stage('our')", "Fetch 1 Our", show=False),
+        Binding("2", "fetch_stage('children')", "Fetch 2 Children", show=False),
+        Binding("3", "fetch_stage('genome')", "Fetch 3 This genome", show=False),
+        Binding("4", "fetch_stage('all_genomes')", "Fetch 4 All genomes", show=False),
+        Binding("5", "fetch_stage('tree')", "Fetch 5 Whole tree", show=False),
+        Binding(alt_keys("a"), "fetch_stage('tree')", "Fetch whole tree", show=False),
         Binding(alt_keys("v"), "verify", "Verify"),
         Binding(alt_keys("r"), "recheck", "Recheck"),
         Binding(alt_keys("c"), "cancel_job", "Cancel"),
@@ -131,11 +138,15 @@ class DataWorkspace(Workspace):
             with Vertical(id="det-box"):
                 with VerticalScroll(id="det-scroll"):
                     yield Static(id="details")
+            with Vertical(id="act-box"):
+                with VerticalScroll(id="act-scroll"):
+                    yield Static(id="actions")
         yield KeyBar([("↑↓", "Source", None), ("P", "Set path", "screen.set_path"),
-                      ("D", "Download", "screen.download"), ("V", "Verify MD5", "screen.verify"),
+                      ("D/1–5", "Fetch stage", "screen.download"),
+                      ("V", "Verify MD5", "screen.verify"),
                       ("R", "Recheck", "screen.recheck"), ("C", "Cancel task", "screen.cancel_job"),
                       ("Del", "Forget path", "screen.clear_path"), ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def _menu_options(self) -> list[Option]:
@@ -166,6 +177,8 @@ class DataWorkspace(Workspace):
         self.genome = self._active()
         self.query_one("#src-box").border_title = "SOURCES"
         self.query_one("#det-box").border_title = "DETAILS"
+        self.query_one("#act-box").border_title = "ACTIONS"
+        self.query_one("#act-box").border_subtitle = "click or key"
         ol = self.query_one("#sources", OptionList)
         ol.add_options(self._menu_options())
         ol.highlighted = self._first_source_index(ol)
@@ -212,18 +225,22 @@ class DataWorkspace(Workspace):
 
     def _tick(self) -> None:
         changed = False
+        # слот + архив ·h* / очередь ·q* для этого источника
         for s in SOURCES:
-            job = JOBS.get(s.key)
-            if not job or job.running or id(job) in self.finished:
-                continue
-            self.finished.add(id(job))
-            changed = True
-            sev = {"done": "information", "failed": "error"}.get(job.status, "warning")
-            self.app.notify(f"{job.title}: {job.message}", severity=sev, timeout=8)
-            self.check_related(s)
-            if job.status == "done" or s.can_fetch:
-                self.app.source_changed(s.key)
-        if changed or JOBS.running():
+            related = [j for j in JOBS.items.values()
+                       if j.key == s.key or (j.slot or "") == s.key]
+            for job in related:
+                if job.active or job.status == "queued" or id(job) in self.finished:
+                    continue
+                self.finished.add(id(job))
+                changed = True
+                sev = {"done": "information", "failed": "error"}.get(job.status, "warning")
+                self.app.notify(f"{job.title}: {job.message}", severity=sev, timeout=8)
+                self.check_related(s)
+                if job.status == "done" or s.can_fetch:
+                    self.app.source_changed(s.key)
+        live = any(j.active or j.status == "queued" for j in JOBS.items.values())
+        if changed or live:
             self.refresh_all()
 
     def check_related(self, src: Source) -> None:
@@ -257,8 +274,13 @@ class DataWorkspace(Workspace):
         t.append(f"{icon} ", style=style)
         t.append(fit(s.title, PROMPT_W) + "\n", style="bold")
         job = JOBS.get(s.key)
-        if job and job.running:
-            t.append("  " + fit(f"{job_icon(job)} {job_line(job)}", PROMPT_W) + "\n", style="#D4AD72")
+        n_q = len(JOBS.queued_for(s.key))
+        if job and job.active:
+            mark = "Ⅱ " if job.status == "paused" else f"{job_icon(job)} "
+            extra = f" · +{n_q} queued" if n_q else ""
+            t.append("  " + fit(f"{mark}{job_line(job)}{extra}", PROMPT_W) + "\n", style="#D4AD72")
+        elif n_q:
+            t.append("  " + fit(f"○ {n_q} queued", PROMPT_W) + "\n", style="#D4AD72")
         else:
             t.append("  " + fit(st.summary if st else "checking…", PROMPT_W) + "\n", style=style)
         if s.kind == "secret":
@@ -279,6 +301,7 @@ class DataWorkspace(Workspace):
             if s:
                 ol.replace_option_prompt_at_index(i, self._prompt(s))
         self.refresh_details()
+        self.refresh_actions()
         self.update_status()
 
     def refresh_details(self) -> None:
@@ -341,13 +364,16 @@ class DataWorkspace(Workspace):
                 t.append("\n")
 
         job = JOBS.get(s.key)
-        if job:
+        queued = JOBS.queued_for(s.key)
+        if job or queued:
             t.append("\nTASK\n", style="bold #D4AD72")
-            t.append(f"  {job.status.upper()}", style=f"bold {JOB_STYLE[job.status]}")
+        if job:
+            style = JOB_STYLE.get(job.status, "#AEA5B8")
+            t.append(f"  {job.status.upper()}", style=f"bold {style}")
             started = time.strftime("%H:%M:%S", time.localtime(job.started))
             took = duration((job.finished or time.time()) - job.started)
             t.append(f"  started {started} · {took}\n", style="#8A8294")
-            if job.running:
+            if job.active:
                 t.append(f"  {job.stage}\n")
                 if job.fraction is not None:
                     t.append("  " + bar(job.fraction, 40).ljust(40), style="#D4AD72")
@@ -355,13 +381,24 @@ class DataWorkspace(Workspace):
                 size = amount(job, job.done) + (f" of {amount(job, job.total)}" if job.total else "")
                 t.append(f"  {size} · {job_line(job)}\n", style="#AEA5B8")
             else:
-                t.append(f"  {job.message}\n", style=JOB_STYLE[job.status])
+                t.append(f"  {job.message}\n", style=style)
+        for qj in queued:
+            t.append(f"  QUEUED  {qj.title}\n", style="#8A8294")
+        self.query_one("#details", Static).update(t)
 
-        t.append("\nACTIONS  (click or press the key)\n", style="bold #D4AD72")
+    def refresh_actions(self) -> None:
+        """Правая панель: только действия текущего источника."""
+        s = self.source
+        st = self.status.get(s.key)
+        path = self.store.path(s.key)
+        job = JOBS.get(s.key)
+        t = Text()
+        t.append(f"{s.title}\n", style="bold #FBF6F0")
+        t.append("Click a line or press the key.\n\n", style="#8A8294")
 
         def action(key: str, text: str, name: str) -> None:
-            t.append(f"  [{key}] ", style=click(f"screen.{name}", "bold #D4AD72"))
-            t.append(text + "\n", style=click(f"screen.{name}"))
+            t.append(f"[{key}] ", style=click(f"screen.{name}", "bold #D4AD72"))
+            t.append(text + "\n\n", style=click(f"screen.{name}"))
 
         if s.kind == "secret":
             action("P", "paste the API key", "set_path")
@@ -369,50 +406,85 @@ class DataWorkspace(Workspace):
             action("P", f"point to an existing {s.kind}", "set_path")
         cov = st.coverage if st else None
         if s.can_fetch and cov:
+            plan = fetch_plan(self.store)
             if not self.genome:
-                t.append("  D   no active genome in F1 — open a genotype file there first\n", style="#8A8294")
-            elif not cov.found:
-                t.append(f"  D   no Y markers of {self.genome.name} are linked to the haplotree\n",
+                t.append("[1–4]  no active genome in F1 — open a genotype file there first\n\n",
                          style="#8A8294")
-            elif cov.missing_mine:
-                action("D", f"fetch {len(cov.missing_mine):,} missing haplogroups for {self.genome.name} "
-                       f"and their ancestors ({fetch_cost(len(cov.missing_mine))})", "download")
+            elif isinstance(plan, str):
+                t.append(f"[1–5]  {plan}\n\n", style="#8A8294")
             else:
-                t.append(f"  D   everything linked to {self.genome.name} is downloaded\n", style="#8A8294")
-            action("A", f"fetch the whole haplotree: {cov.n_missing_all:,} missing "
-                   f"({fetch_cost(cov.n_missing_all)}; press A twice)", "fetch_all")
+                tip = plan.tip or "—"
+                t.append(f"Discover fetch stages · tip {tip}\n", style="bold #D4AD72")
+                t.append("Busy slot → queue (F7). Pause/cancel in F7.\n\n", style="#8A8294")
+                keys = ("1", "2", "3", "4", "5")
+                stages = ("our", "children", "genome", "all_genomes", "tree")
+                labels = {
+                    "our": "Our path (tip→root)",
+                    "children": "Children below Our",
+                    "genome": f"This genome · {plan.genome_label}",
+                    "all_genomes": f"All F1 genomes · {plan.n_genomes} file(s)",
+                    "tree": "Whole haplotree",
+                }
+                for key, stage in zip(keys, stages):
+                    n = plan.count(stage)
+                    label = labels[stage]
+                    if n:
+                        note = f"fetch {n:,} · {fetch_cost(n)}"
+                        if stage == "tree":
+                            note += " · press 5/A twice"
+                        action(key, f"{label}: {note}", f"fetch_stage('{stage}')")
+                    else:
+                        t.append(f"[{key}]  {label}: done\n\n", style="#8A8294")
+                t.append("[D]  same as [1] Our path\n\n", style="#8A8294")
         elif s.can_download:
-            action("D", "download (asks where; existing complete files are skipped)", "download")
+            if getattr(s, "needs_genome", False) and not self.genome:
+                t.append("[D]  needs an active genome in F1 (coverage uses your SNPs)\n\n",
+                         style="#8A8294")
+            elif s.key == "pgs_models":
+                action("D", "build/update catalog (API + weights + coverage vs F1)", "download")
+            else:
+                action("D", "download (asks where; existing complete files are skipped)", "download")
         else:
-            t.append(f"  D   {s.download_note}\n", style="#8A8294")
+            t.append(f"[D]  {s.download_note}\n\n", style="#8A8294")
         if s.can_verify:
             action("V", "verify MD5 checksums of the files", "verify")
         action("R", "recheck", "recheck")
-        if job and job.running:
-            action("C", "cancel the running task", "cancel_job")
+        if job and job.active:
+            action("C", "cancel the running/paused task", "cancel_job")
+        elif JOBS.queued_for(s.key):
+            action("C", "cancel active slot task (queued stay — manage in F7)", "cancel_job")
         if s.kind == "secret" and self.store.secret(s.key):
             action("Del", "forget the API key", "clear_path")
         elif path:
             action("Del", "forget the path (files are untouched)", "clear_path")
-        self.query_one("#details", Static).update(t)
+        self.query_one("#actions", Static).update(t)
 
     def update_status(self) -> None:
-        running = JOBS.running()
+        live = [j for j in JOBS.items.values() if j.active]
+        n_q = sum(1 for j in JOBS.items.values() if j.status == "queued")
         ready = sum(1 for s in SOURCES if self.status.get(s.key) and self.status[s.key].state == "ok")
         gname, _ = self._genome_label()
         genome = f"    GENOME: {gname if self.genome else '— (F1)'}"
-        jobs = "    " + "    ".join(f"{job_icon(j)} {j.title}: {job_line(j)}" for j in running) if running else ""
+        bits = []
+        for j in live:
+            mark = "Ⅱ" if j.status == "paused" else job_icon(j)
+            bits.append(f"{mark} {j.title}: {job_line(j)}")
+        if n_q:
+            bits.append(f"○ {n_q} queued")
+        jobs = ("    " + "    ".join(bits)) if bits else ""
         self.query_one("#status", Static).update(
             f"READY: {ready}/{len(SOURCES)} sources{genome}{jobs}")
 
     @on(OptionList.OptionHighlighted, "#sources")
     def _highlighted(self) -> None:
         self.refresh_details()
+        self.refresh_actions()
         self.query_one("#det-scroll").scroll_home(animate=False)
+        self.query_one("#act-scroll").scroll_home(animate=False)
 
     @on(OptionList.OptionSelected, "#sources")
     def _selected(self) -> None:
-        self.query_one("#det-scroll").focus()
+        self.query_one("#act-scroll").focus()
 
     # — действия —
     def _apply_path(self, s: Source, path: Path) -> None:
@@ -447,69 +519,81 @@ class DataWorkspace(Workspace):
         path = self.store.path(s.key)
         if not path:
             return
-        JOBS.start(s.key, f"Fetch {what}", lambda j: s.fetch(path, names, j))
+        job = JOBS.enqueue(s.key, f"Fetch {what}", lambda j: s.fetch(path, names, j))
+        if job.status == "queued":
+            self.app.notify(f"Queued: {job.title}", severity="information")
         self.refresh_all()
 
     def action_download(self) -> None:
         s = self.source
-        st = self.status.get(s.key)
         if s.can_fetch:
-            job = JOBS.get(s.key)
-            if job and job.running:
-                self.app.notify(f"{s.title}: a task is already running", severity="warning")
-            elif not st or not st.coverage:
-                self.app.notify("Set the Discover folder and the haplotree path first", severity="warning")
-            elif not self.genome:
-                self.app.notify("Load a genotype file in F1 first", severity="warning")
-            elif not st.coverage.found:
-                self.app.notify(f"No Y markers of {self.genome.name} are linked to the haplotree",
-                                severity="warning")
-            elif not st.coverage.missing_mine:
-                self.app.notify(f"Everything linked to {self.genome.name} is already downloaded")
-            else:
-                self._fetch(s, st.coverage.missing_mine,
-                            f"haplogroups for {self.genome.name}")
+            self.action_fetch_stage("our")
             return
         if not s.can_download:
             self.app.notify(s.download_note, severity="warning", timeout=8)
             return
+        if getattr(s, "needs_genome", False) and not self.genome:
+            self.app.notify("Load a genotype file in F1 first — catalog coverage uses it",
+                            severity="warning")
+            return
         job = JOBS.get(s.key)
-        if job and job.running:
-            self.app.notify(f"{s.title}: a task is already running", severity="warning")
+        if job and job.active:
+            self.app.notify(f"{s.title}: a task is already running (pause/cancel in F7)",
+                            severity="warning")
             return
 
         def done(path: Path | None) -> None:
             if not path:
                 return
             self.store.set_path(s.key, path)
-            JOBS.start(s.key, f"Download {s.title}", lambda j: s.download(path, j))
+            title = f"Build {s.title}" if s.key == "pgs_models" else f"Download {s.title}"
+            JOBS.start(s.key, title, lambda j: s.download(path, j))
             self.check(s)
             self.refresh_all()
-        self.app.push_screen(PathScreen(f"[b]Download {s.title}[/b] ({s.size_hint}) · save to this {s.kind}:",
-                                        s.suggest(self.store), s.kind, must_exist=False), done)
+        prompt = (f"[b]Build {s.title}[/b] ({s.size_hint}) · work folder:"
+                  if s.key == "pgs_models" else
+                  f"[b]Download {s.title}[/b] ({s.size_hint}) · save to this {s.kind}:")
+        self.app.push_screen(PathScreen(prompt, s.suggest(self.store), s.kind, must_exist=False), done)
 
-    def action_fetch_all(self) -> None:
+    def action_fetch_stage(self, stage: str = "our") -> None:
+        """Этапы 1–5 Discover: Our → Children → This genome → All genomes → Tree.
+        Если слот занят — задача встаёт в очередь (F7)."""
         s = self.source
-        st = self.status.get(s.key)
-        if not s.can_fetch or not st or not st.coverage:
+        if not s.can_fetch:
             return
-        if (job := JOBS.get(s.key)) and job.running:
-            self.app.notify(f"{s.title}: a task is already running", severity="warning")
+        labels = dict(FETCH_STAGES)
+        title = labels.get(stage, stage)
+        if stage in ("our", "children", "genome") and not self.genome:
+            self.app.notify("Load a genotype file in F1 first", severity="warning")
             return
-        from ...core.ylink import missing_all_names
-        n = st.coverage.n_missing_all
-        if time.monotonic() - self.armed > 5:
-            self.armed = time.monotonic()
-            self.app.notify(f"Press A again within 5 s to fetch {n:,} haplogroups "
-                            f"({fetch_cost(n)}). It can be cancelled and resumed any time.",
-                            severity="warning", timeout=5)
-            return
-        self.armed = 0.0
-        names = missing_all_names(self.store)
+        if stage == "tree":
+            plan = fetch_plan(self.store)
+            n = plan.count("tree") if not isinstance(plan, str) else 0
+            if n <= 0:
+                self.app.notify("Whole tree: nothing to fetch")
+                return
+            if time.monotonic() - self.armed > 5:
+                self.armed = time.monotonic()
+                self.app.notify(
+                    f"Press 5 or A again within 5 s to fetch {n:,} haplogroups "
+                    f"({fetch_cost(n)}). Cancel anytime from F2/F7.",
+                    severity="warning", timeout=5,
+                )
+                return
+            self.armed = 0.0
+        names = stage_fetch_names(self.store, stage)
         if not names:
-            self.app.notify("Nothing to fetch", severity="warning")
+            self.app.notify(f"{title}: nothing to fetch")
             return
-        self._fetch(s, names, "the whole haplotree")
+        tip = ""
+        plan = fetch_plan(self.store)
+        if not isinstance(plan, str) and plan.tip:
+            tip = f" · tip {plan.tip}"
+        self._fetch(s, names, f"{title} · {len(names):,}{tip}")
+        # план устарел после старта — сброс кэша на следующем check
+        from ...core import ylink as _ylink
+        _ylink._plan_cache = None
+        _ylink._cov_cache = None
 
     def action_verify(self) -> None:
         s = self.source
@@ -518,7 +602,7 @@ class DataWorkspace(Workspace):
             self.app.notify("No published checksums for this source", severity="warning")
         elif not path:
             self.app.notify("Set the path first (P)", severity="warning")
-        elif (job := JOBS.get(s.key)) and job.running:
+        elif (job := JOBS.get(s.key)) and job.active:
             self.app.notify(f"{s.title}: a task is already running", severity="warning")
         else:
             JOBS.start(s.key, f"Verify {s.title}", lambda j: s.verify(path, j))
@@ -526,7 +610,7 @@ class DataWorkspace(Workspace):
 
     def action_cancel_job(self) -> None:
         job = JOBS.get(self.source.key)
-        if job and job.running:
+        if job and job.active:
             job.cancel()
             self.app.notify(f"Cancelling: {job.title}")
         else:

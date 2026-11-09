@@ -1,6 +1,8 @@
 """Фоновые задачи с прогрессом (скачивание, распаковка, проверка) и HTTP-загрузка с докачкой.
 
 Задача живёт в daemon-потоке и не зависит от UI: экран просто опрашивает JOBS.
+Пауза: check() ждёт, пока не resume/cancel. Очередь: enqueue на занятый key →
+после done/failed/cancelled стартует следующий.
 При выходе из приложения недокачанный файл остаётся как *.part и продолжается при следующем запуске."""
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -29,7 +32,7 @@ class Cancelled(Exception):
 class Job:
     key: str
     title: str
-    status: str = "running"          # running · done · failed · cancelled
+    status: str = "running"          # running · paused · queued · done · failed · cancelled
     stage: str = "starting"
     done: int = 0
     total: int | None = None
@@ -38,13 +41,21 @@ class Job:
     draft: str = ""                   # partial stream text (chat etc.)
     started: float = field(default_factory=time.time)
     finished: float | None = None
+    slot: str | None = None           # ключ слота очереди (обычно = key у running)
     _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
+    _paused: threading.Event = field(default_factory=threading.Event, repr=False)
     _mark: tuple[float, int] = (0.0, 0)
     rate: float = 0.0
+    _fn: Callable[["Job"], str | None] | None = field(default=None, repr=False)
 
     @property
     def running(self) -> bool:
         return self.status == "running"
+
+    @property
+    def active(self) -> bool:
+        """Занимает слот: выполняется или на паузе (не queued/finished)."""
+        return self.status in ("running", "paused")
 
     def set_stage(self, stage: str, total: int | None = None, done: int = 0) -> None:
         self.stage, self.total, self.done = stage, total, done
@@ -65,21 +76,63 @@ class Job:
 
     @property
     def eta(self) -> float | None:
-        if not self.total or self.rate <= 0:
+        if not self.total or self.rate <= 0 or self.status == "paused":
             return None
         return max(0.0, (self.total - self.done) / self.rate)
 
+    def pause(self) -> bool:
+        """Поставить на паузу (check() будет ждать). False если не running."""
+        if self.status != "running":
+            return False
+        self._paused.set()
+        self.status = "paused"
+        self.rate = 0.0
+        if not (self.stage or "").startswith("paused"):
+            self.stage = f"paused · {self.stage}"
+        return True
+
+    def resume(self) -> bool:
+        """Снять паузу. False если не paused."""
+        if self.status != "paused":
+            return False
+        if self.stage.startswith("paused · "):
+            self.stage = self.stage[len("paused · "):]
+        self.status = "running"
+        self._mark = (time.time(), self.done)
+        self._paused.clear()
+        return True
+
     def cancel(self) -> None:
         self._cancel.set()
+        self._paused.clear()  # разбудить check()
+        if self.status == "queued":
+            self.status = "cancelled"
+            self.message = "cancelled"
+            self.finished = time.time()
 
     def check(self) -> None:
-        if self._cancel.is_set():
-            raise Cancelled()
+        """Отмена → Cancelled; пауза → ждать resume/cancel."""
+        while True:
+            if self._cancel.is_set():
+                raise Cancelled()
+            if not self._paused.is_set():
+                return
+            time.sleep(0.1)
+
+
+@dataclass
+class _Queued:
+    title: str
+    fn: Callable[[Job], str | None]
+    ui_key: str
 
 
 class Jobs:
     def __init__(self) -> None:
         self.items: dict[str, Job] = {}
+        self._queues: dict[str, deque[_Queued]] = {}
+        self._qseq = 0
+        self._lock = threading.Lock()
 
     def get(self, key: str) -> Job | None:
         return self.items.get(key)
@@ -87,26 +140,113 @@ class Jobs:
     def running(self) -> list[Job]:
         return [j for j in self.items.values() if j.running]
 
+    def active_for(self, key: str) -> Job | None:
+        j = self.items.get(key)
+        if j and j.active:
+            return j
+        return None
+
+    def queued_for(self, key: str) -> list[Job]:
+        """UI-джобы со status=queued для слота key."""
+        return [j for j in self.items.values()
+                if j.status == "queued" and (j.slot or j.key) == key]
+
+    def list_visible(self) -> list[Job]:
+        return list(self.items.values())
+
     def start(self, key: str, title: str, fn: Callable[[Job], str | None]) -> Job:
-        """fn(job) выполняется в потоке; её строковый результат становится job.message."""
-        old = self.items.get(key)
-        if old and old.running:
-            raise RuntimeError(f"{title}: already running")
-        job = Job(key, title)
-        self.items[key] = job
+        """fn(job) в потоке; строковый результат → job.message. Слот key должен быть свободен."""
+        with self._lock:
+            old = self.items.get(key)
+            if old and old.active:
+                raise RuntimeError(f"{title}: already running")
+            # убрать старый finished с тем же key
+            job = Job(key, title, slot=key, _fn=fn)
+            self.items[key] = job
+        self._spawn(job, fn)
+        return job
+
+    def enqueue(self, key: str, title: str, fn: Callable[[Job], str | None]) -> Job:
+        """Если слот свободен — start; иначе в очередь (status=queued в списке F7)."""
+        with self._lock:
+            cur = self.items.get(key)
+            if cur and cur.active:
+                self._qseq += 1
+                ui_key = f"{key}·q{self._qseq}"
+                qjob = Job(ui_key, title, status="queued", stage="waiting", slot=key, _fn=fn)
+                self.items[ui_key] = qjob
+                self._queues.setdefault(key, deque()).append(_Queued(title, fn, ui_key))
+                return qjob
+            job = Job(key, title, slot=key, _fn=fn)
+            self.items[key] = job
+        self._spawn(job, fn)
+        return job
+
+    def cancel_queued(self, ui_key: str) -> bool:
+        """Убрать элемент очереди по ui_key. True если был queued."""
+        with self._lock:
+            job = self.items.get(ui_key)
+            if not job or job.status != "queued":
+                return False
+            slot = job.slot or job.key
+            q = self._queues.get(slot)
+            if q:
+                self._queues[slot] = deque(x for x in q if x.ui_key != ui_key)
+            job.cancel()
+            return True
+
+    def _spawn(self, job: Job, fn: Callable[[Job], str | None]) -> None:
+        key = job.key
 
         def run() -> None:
             try:
                 job.message = fn(job) or "done"
-                job.status = "done"
+                if job._cancel.is_set():
+                    job.status, job.message = "cancelled", "cancelled"
+                else:
+                    job.status = "done"
             except Cancelled:
                 job.status, job.message = "cancelled", "cancelled"
             except Exception as exc:  # noqa: BLE001
                 job.status, job.message = "failed", str(exc) or type(exc).__name__
             job.finished = time.time()
+            self._pump(key)
 
         threading.Thread(target=run, name=f"job-{key}", daemon=True).start()
-        return job
+
+    def _pump(self, key: str) -> None:
+        """После завершения слота — взять следующий из очереди."""
+        with self._lock:
+            if self.active_for(key):
+                return
+            q = self._queues.get(key)
+            if not q:
+                return
+            nxt = q.popleft()
+            self.items.pop(nxt.ui_key, None)
+            old = self.items.get(key)
+            if old is not None and old.status in ("done", "failed", "cancelled"):
+                # архив, чтобы F2/F7 успели показать результат до старта следующего
+                self._qseq += 1
+                hist = Job(
+                    key=f"{key}·h{self._qseq}",
+                    title=old.title,
+                    status=old.status,
+                    stage=old.stage,
+                    done=old.done,
+                    total=old.total,
+                    unit=old.unit,
+                    message=old.message,
+                    draft=old.draft,
+                    started=old.started,
+                    finished=old.finished,
+                    slot=key,
+                )
+                self.items[hist.key] = hist
+            job = Job(key, nxt.title, slot=key, _fn=nxt.fn)
+            self.items[key] = job
+            fn = nxt.fn
+        self._spawn(job, fn)
 
 
 JOBS = Jobs()

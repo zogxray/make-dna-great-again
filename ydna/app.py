@@ -1,4 +1,4 @@
-"""Оболочка: переключение режимов (F1–F7) и выход. Вся работа — в ydna.workspaces."""
+"""Оболочка: переключение режимов (F1–F8) и выход. Вся работа — в ydna.workspaces."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from .core.sources import FtdnaDiscover, FtdnaHaplotree
 from .core.store import APP_TITLE, Store, data_dir
 from .theme import YDNA_DARK, YDNA_LIGHT
 from .workspaces import (ChatWorkspace, DataWorkspace, GenomeWorkspace,
-                         HelpWorkspace, PgsWorkspace, ReferenceWorkspace,
-                         TreeWorkspace)
+                         HelpWorkspace, JobsWorkspace, PgsWorkspace,
+                         ReferenceWorkspace, TreeWorkspace)
 from .workspaces.base import CLICK_META, MODE_LABELS, ConfirmScreen, alt_keys
 
 DEFAULT_DISCOVER = data_dir() / "ftdna" / "discover"
@@ -49,6 +49,7 @@ class YDnaApp(App):
             "pgs": lambda: PgsWorkspace(self.store),
             "reference": lambda: ReferenceWorkspace(self.store),
             "chat": lambda: ChatWorkspace(self.store),
+            "jobs": lambda: JobsWorkspace(),
             "help": lambda: HelpWorkspace(),
         }
         for key, _ in MODE_LABELS:

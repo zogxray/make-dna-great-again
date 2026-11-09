@@ -1,12 +1,15 @@
 """Геном пользователя: чтение сырых файлов генотипирования и сводки по ним. Без зависимостей от UI.
 
 Поддержано: 23andMe, Argenética, MyHeritage, FTDNA (4 колонки, TSV или CSV, кавычки допустимы),
-AncestryDNA (5 колонок: allele1 + allele2). Файл может лежать внутри .zip или .gz.
+AncestryDNA (5 колонок: allele1 + allele2), VCF (GT→буквы), FTDNA Big Y CSV
+(Type/Position/SNPName/Genotype; Known SNP без позиции — позиция из haplotree при ingest).
+Архивы: .zip / .gz / .bz2.
 
-TODO: VCF/BAM, индекс в SQLite, lookup(rsid | chrom:pos)."""
+TODO: BAM, lookup(rsid | chrom:pos)."""
 
 from __future__ import annotations
 
+import bz2
 import gzip
 import io
 import re
@@ -192,14 +195,73 @@ def detect_build(header: list[str]) -> str | None:
 
 KNOWN_FORMATS = (("23andme", "23andMe"), ("ancestrydna", "AncestryDNA"), ("myheritage", "MyHeritage"),
                  ("familytreedna", "FamilyTreeDNA"), ("argen", "Argenética"), ("livingdna", "LivingDNA"))
+_CHIP_EXTS = (".txt", ".csv", ".tsv", ".vcf")
+_BIGY_COLS = frozenset({"type", "position", "snpname", "genotype"})
 
 
-def detect_format(header: list[str], columns: str | None, ncols: int) -> str:
+def _header_cols(columns: str | None) -> list[str]:
+    if not columns:
+        return []
+    sep = "," if "," in columns else ("\t" if "\t" in columns else None)
+    parts = columns.split(sep) if sep else columns.split()
+    return [p.strip().strip('"').lower() for p in parts]
+
+
+def is_bigy_columns(columns: str | None) -> bool:
+    cols = set(_header_cols(columns))
+    return _BIGY_COLS.issubset(cols)
+
+
+def _bigy_colmap(columns: str) -> dict[str, int]:
+    return {name: i for i, name in enumerate(_header_cols(columns))}
+
+
+def _parse_bigy_row(parts: list[str], col: dict[str, int]) -> tuple[str, str, str, str] | None:
+    """FTDNA BigY_Data CSV → (id, Y, pos, genotype). Known без Position → pos='0'."""
+    need = ("type", "genotype")
+    if any(k not in col or col[k] >= len(parts) for k in need):
+        return None
+    typ = parts[col["type"]].strip()
+    gt = parts[col["genotype"]].strip().upper()
+    if not gt or gt in ("?", ".", "-"):
+        gt = "-"
+    elif len(gt) != 1 or gt not in BASES:
+        return None
+    if typ == "Known SNP":
+        if "snpname" not in col or col["snpname"] >= len(parts):
+            return None
+        name = parts[col["snpname"]].strip()
+        if not name:
+            return None
+        pos = ""
+        if "position" in col and col["position"] < len(parts):
+            pos = parts[col["position"]].strip()
+        if not pos.isdigit():
+            pos = "0"  # доберём из haplotree / TheYtree при ingest
+        return name, "Y", pos, gt
+    if typ == "Novel Variant":
+        if "position" not in col or col["position"] >= len(parts):
+            return None
+        pos = parts[col["position"]].strip()
+        if not pos.isdigit():
+            return None
+        return f"Y:{pos}", "Y", pos, gt
+    return None
+
+
+def detect_format(header: list[str], columns: str | None, ncols: int, *, is_vcf: bool = False) -> str:
     text = "\n".join(header)
+    low = text.lower()
+    if is_vcf:
+        for key, label in KNOWN_FORMATS:
+            if key in low:
+                return f"{label} VCF"
+        return "VCF"
+    if is_bigy_columns(columns):
+        return "FTDNA Big Y CSV"
     m = re.search(r"format\s*=\s*(\S+)", text)
     if m:
         return m.group(1)
-    low = text.lower()
     for key, label in KNOWN_FORMATS:
         if key in low:
             return label
@@ -210,20 +272,81 @@ def detect_format(header: list[str], columns: str | None, ncols: int) -> str:
     return "unknown"
 
 
+def _is_vcf_header(header: list[str]) -> bool:
+    return any(h.startswith("##fileformat=VCF") or h.startswith("#CHROM") for h in header)
+
+
+def _vcf_gt_letters(gt: str, alleles: list[str]) -> str | None:
+    """GT (0/1, 1|0, 0, ./.) → буквенный генотип (AA/AG/A/--). None — не SNP / битый."""
+    if not gt or gt in (".", "./.", ".|."):
+        return "--"
+    sep = "|" if "|" in gt else "/"
+    parts = gt.split(sep) if sep in gt else [gt]
+    out: list[str] = []
+    for p in parts:
+        if p == ".":
+            out.append("-")
+            continue
+        try:
+            i = int(p)
+        except ValueError:
+            return None
+        if i < 0 or i >= len(alleles):
+            return None
+        a = alleles[i]
+        if len(a) != 1 or a not in BASES:
+            return None  # индел / symbolic ALT
+        out.append(a)
+    return "".join(out) if out else None
+
+
+def _parse_vcf_row(parts: list[str], gt_idx: int) -> tuple[str, str, str, str] | None:
+    """→ (rsid, chrom, pos, genotype) или None."""
+    if len(parts) <= max(4, 9 + gt_idx):
+        return None
+    chrom, pos, rid, ref, alt = parts[0], parts[1], parts[2], parts[3], parts[4]
+    if not pos.isdigit():
+        return None
+    fmt = parts[8]
+    sample = parts[9 + gt_idx]
+    keys = fmt.split(":")
+    vals = sample.split(":")
+    try:
+        gi = keys.index("GT")
+    except ValueError:
+        return None
+    if gi >= len(vals):
+        return None
+    alleles = [ref]
+    if alt and alt != ".":
+        alleles.extend(alt.split(","))
+    gt = _vcf_gt_letters(vals[gi], alleles)
+    if gt is None:
+        return None
+    if not rid or rid == ".":
+        rid = f"{chrom}:{pos}"
+    return rid, chrom, pos, gt
+
+
 @contextmanager
 def open_text(path: Path) -> Iterator[tuple[TextIO, str | None, int | None]]:
     """(поток, имя файла в архиве, размер распакованных данных или None)."""
+    suf = path.suffix.lower()
+    # file.vcf.gz / file.txt.gz → suffix .gz; file.vcf.bz2 → .bz2
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
             files = [i for i in z.infolist() if not i.is_dir()]
             if not files:
                 raise ValueError("zip archive is empty")
-            info = max(files, key=lambda i: (i.filename.lower().endswith((".txt", ".csv", ".tsv")),
+            info = max(files, key=lambda i: (i.filename.lower().endswith(_CHIP_EXTS),
                                              i.file_size))
             with io.TextIOWrapper(z.open(info), encoding="utf-8-sig", errors="replace") as fh:
                 yield fh, info.filename, info.file_size
-    elif path.suffix.lower() == ".gz":
+    elif suf == ".gz":
         with gzip.open(path, "rt", encoding="utf-8-sig", errors="replace") as fh:
+            yield fh, None, None
+    elif suf == ".bz2":
+        with bz2.open(path, "rt", encoding="utf-8-sig", errors="replace") as fh:
             yield fh, None, None
     else:
         with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
@@ -241,6 +364,10 @@ def load(path: Path, progress: Progress | None = None) -> Genome:
     delim: str | None = ""
     ncols = 0
     lines = chars = 0
+    is_vcf = False
+    is_bigy = False
+    bigy_col: dict[str, int] | None = None
+    vcf_gt_idx = 0  # какой SAMPLE-столбец (после FORMAT)
 
     with open_text(path) as (fh, member, total_chars):
         for raw in fh:
@@ -249,38 +376,75 @@ def load(path: Path, progress: Progress | None = None) -> Genome:
             if progress and lines % 65536 == 0:
                 progress(min(1.0, chars / total_chars) if total_chars else None, lines)
             if raw.startswith("#"):
-                header.append(raw.rstrip("\r\n"))
+                h = raw.rstrip("\r\n")
+                header.append(h)
+                if h.startswith("#CHROM"):
+                    columns = h
+                    is_vcf = True
+                elif h.startswith("##fileformat=VCF"):
+                    is_vcf = True
                 continue
             line = raw.strip()
             if not line:
                 continue
             if delim == "":
-                if any(h.startswith("##fileformat=VCF") for h in header):
-                    raise ValueError("VCF is not supported yet")
-                delim = "\t" if "\t" in line else ("," if "," in line else None)
+                is_vcf = is_vcf or _is_vcf_header(header)
+                delim = "\t" if (is_vcf or "\t" in line) else ("," if "," in line else None)
+
             parts = line.split(delim)
-            if '"' in line:
+            if '"' in line and not is_vcf:
                 parts = [p.strip().strip('"') for p in parts]
-            n = len(parts)
-            if n == 4:
-                rid, ch, p, gt = parts
-            elif n == 5:
-                rid, ch, p, a, b = parts
-                gt = a + b
-            else:
-                malformed += 1
-                if len(bad_sample) < 20:
-                    bad_sample.append(line)
-                continue
-            if not p.isdigit():
-                if columns is None and not store:
-                    columns = line
+
+            if is_vcf:
+                parsed = _parse_vcf_row(parts, vcf_gt_idx)
+                if parsed is None:
+                    malformed += 1
+                    if len(bad_sample) < 20:
+                        bad_sample.append(line[:200])
                     continue
-                malformed += 1
-                if len(bad_sample) < 20:
-                    bad_sample.append(line)
-                continue
-            ncols = n
+                rid, ch, p, gt = parsed
+                ncols = len(parts)
+            else:
+                # Заголовок Big Y / chip: первая строка без цифровой позиции.
+                if columns is None and not store:
+                    maybe = delim.join(parts) if delim is not None else line
+                    if is_bigy_columns(maybe) or not (len(parts) >= 3 and parts[2].isdigit()):
+                        columns = maybe
+                        if is_bigy_columns(columns):
+                            is_bigy = True
+                            bigy_col = _bigy_colmap(columns)
+                        continue
+                if is_bigy and bigy_col is not None:
+                    parsed = _parse_bigy_row(parts, bigy_col)
+                    if parsed is None:
+                        malformed += 1
+                        if len(bad_sample) < 20:
+                            bad_sample.append(line[:200])
+                        continue
+                    rid, ch, p, gt = parsed
+                    ncols = len(parts)
+                else:
+                    n = len(parts)
+                    if n == 4:
+                        rid, ch, p, gt = parts
+                    elif n == 5:
+                        rid, ch, p, a, b = parts
+                        gt = a + b
+                    else:
+                        malformed += 1
+                        if len(bad_sample) < 20:
+                            bad_sample.append(line)
+                        continue
+                    if not p.isdigit():
+                        if columns is None and not store:
+                            columns = line
+                            continue
+                        malformed += 1
+                        if len(bad_sample) < 20:
+                            bad_sample.append(line)
+                        continue
+                    ncols = n
+
             name = chrom_cache.get(ch)
             if name is None:
                 c = ch.strip().upper()
@@ -308,9 +472,18 @@ def load(path: Path, progress: Progress | None = None) -> Genome:
         c.finalize()
         chroms[name] = c
 
-    sep = {"\t": "TSV", ",": "CSV", None: "whitespace"}.get(delim, "?")
+    if is_vcf:
+        layout = f"VCF · GT→alleles · {ncols} columns"
+    elif is_bigy:
+        layout = f"Big Y CSV · Known SNP + Novel · {ncols} columns"
+    else:
+        sep = {"\t": "TSV", ",": "CSV", None: "whitespace"}.get(delim, "?")
+        layout = f"{sep}, {ncols} columns"
+    build = detect_build(header)
+    if is_bigy and not build:
+        build = "38"  # FTDNA Big Y export — hg38
     return Genome(
         path=path, member=member, size=path.stat().st_size, header=header, columns=columns,
-        layout=f"{sep}, {ncols} columns", fmt=detect_format(header, columns, ncols),
-        build=detect_build(header), chroms=chroms, malformed=malformed, malformed_sample=bad_sample,
+        layout=layout, fmt=detect_format(header, columns, ncols, is_vcf=is_vcf),
+        build=build, chroms=chroms, malformed=malformed, malformed_sample=bad_sample,
     )

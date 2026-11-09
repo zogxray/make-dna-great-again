@@ -1,4 +1,4 @@
-"""Режим Help (F7): флоу и UX по экранам."""
+"""Режим Help (F8): флоу и UX по экранам."""
 
 from __future__ import annotations
 
@@ -36,14 +36,14 @@ class HelpWorkspace(Workspace):
             with VerticalScroll(id="help-scroll"):
                 yield SelectableRichStatic(id="help-body")
         yield KeyBar([("↑↓", "Scroll", None), ("PgUp/Dn", "Page", None),
-                      ("F1–F7", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
         self.query_one("#help-box").border_title = "HELP · flow & screens"
         self.query_one("#help-body", SelectableRichStatic).update(help_view())
         self.query_one("#status", Static).update(
-            "Advanced-amateur guide · not an R/admixture2 manual · F1–F7 switch modes")
+            "Advanced-amateur guide · not an R/admixture2 manual · F1–F8 switch modes")
         self.query_one("#help-scroll").focus()
 
     def action_scroll(self, delta: int) -> None:
