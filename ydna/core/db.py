@@ -11,9 +11,9 @@ from pathlib import Path
 
 from .store import config_dir
 
-SCHEMA_VERSION = 4
-GENOME_SCHEMA_VERSION = 2  # drop idx_files_active (DuckDB ART bug on UPDATE active)
-DATA_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 6  # chat.threads.messages_json (avoid ART fatal on chat.messages)
+GENOME_SCHEMA_VERSION = 3  # + genome.y_links (F1 YLink cache)
+DATA_SCHEMA_VERSION = 2  # + data.openhumans_files (OH catalog / samples)
 PGS_SCHEMA_VERSION = 1
 REF_SCHEMA_VERSION = 4  # + ref.y_badges (F5 Y hits without haplotree)
 TREE_SCHEMA_VERSION = 2  # + tree.index_blobs (haplotree / discover caches)
@@ -56,14 +56,11 @@ def _ensure_chat_schema(con) -> None:
             PRIMARY KEY (thread_id, seq)
         )
     """)
-    con.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chat_threads_updated "
-        "ON chat.threads (updated DESC)"
-    )
-    con.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chat_messages_role "
-        "ON chat.messages (thread_id, role)"
-    )
+    # Secondary ART indexes on chat.* caused FatalException on UPDATE/DELETE
+    # («Failed to delete all rows from index») — do not recreate them.
+    con.execute("DROP INDEX IF EXISTS chat.idx_chat_messages_role")
+    con.execute("DROP INDEX IF EXISTS chat.idx_chat_threads_updated")
+    _ensure_chat_messages_json(con)
     row = con.execute(
         "SELECT value FROM chat.meta WHERE key = 'schema_version'"
     ).fetchone()
@@ -77,6 +74,54 @@ def _ensure_chat_schema(con) -> None:
             "UPDATE chat.meta SET value = ? WHERE key = 'schema_version'",
             [str(SCHEMA_VERSION)],
         )
+
+
+def _chat_threads_columns(con) -> set[str]:
+    rows = con.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'chat' AND table_name = 'threads'
+    """).fetchall()
+    return {str(r[0]).lower() for r in rows}
+
+
+def _ensure_chat_messages_json(con) -> None:
+    """Persist messages on the thread row — mutating chat.messages trips DuckDB ART."""
+    cols = _chat_threads_columns(con)
+    if "messages_json" not in cols:
+        con.execute("ALTER TABLE chat.threads ADD COLUMN messages_json JSON")
+    if "user_turns" not in cols:
+        con.execute(
+            "ALTER TABLE chat.threads ADD COLUMN user_turns INTEGER DEFAULT 0"
+        )
+    # One-shot migrate from legacy chat.messages into messages_json.
+    pending = con.execute("""
+        SELECT id FROM chat.threads
+        WHERE messages_json IS NULL
+    """).fetchall()
+    if not pending:
+        return
+    import json
+    for (tid,) in pending:
+        try:
+            msgs = con.execute("""
+                SELECT role, text, created_at, interaction_id
+                FROM chat.messages WHERE thread_id = ? ORDER BY seq
+            """, [tid]).fetchall()
+        except Exception:  # noqa: BLE001 — corrupted ART on legacy messages
+            msgs = []
+        payload = [
+            {
+                "role": r, "text": t, "at": a or "",
+                "interaction_id": iid,
+            }
+            for r, t, a, iid in msgs
+        ]
+        n_user = sum(1 for m in payload if m["role"] == "user")
+        con.execute("""
+            UPDATE chat.threads
+            SET messages_json = ?::JSON, user_turns = ?
+            WHERE id = ?
+        """, [json.dumps(payload, ensure_ascii=False), n_user, tid])
 
 
 def _ensure_genome_schema(con) -> None:
@@ -144,6 +189,17 @@ def _ensure_genome_schema(con) -> None:
         "CREATE INDEX IF NOT EXISTS idx_calls_rsid "
         "ON genome.calls (file_id, rsid)"
     )
+    # F1 Linking Y cache: marks + fingerprints (genome / haplotree / Discover).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS genome.y_links (
+            genome_path       VARCHAR PRIMARY KEY,
+            payload           JSON NOT NULL,
+            genome_mtime_ns   VARCHAR NOT NULL,
+            tree_fp           VARCHAR NOT NULL,
+            discover_fp       VARCHAR NOT NULL,
+            updated_at        TIMESTAMP
+        )
+    """)
     # Не индексируем genome.files(active): DuckDB 2.x ART падает fatal на
     # UPDATE … SET active=FALSE WHERE active (Failed to delete all rows from index).
     # Файлов мало — seq scan дешёвый.
@@ -223,6 +279,44 @@ def _ensure_data_schema(con) -> None:
     )
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_sources_group ON data.sources (group_name)"
+    )
+    # Open Humans public catalog + local/genome ingest status (F2).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS data.openhumans_files (
+            id              BIGINT PRIMARY KEY,
+            basename        VARCHAR,
+            download_url    VARCHAR,
+            source          VARCHAR,
+            user_id         VARCHAR,
+            username        VARCHAR,
+            user_name       VARCHAR,
+            tags_join       VARCHAR,
+            description     VARCHAR,
+            ext             VARCHAR,
+            y_hint          BOOLEAN,
+            vendor          VARCHAR,
+            compat          VARCHAR,
+            kind            VARCHAR,
+            local_path      VARCHAR,
+            local_size      BIGINT,
+            local_mtime     DOUBLE,
+            db_status       VARCHAR NOT NULL DEFAULT 'catalog',
+            genome_file_id  INTEGER,
+            snps            INTEGER,
+            error           VARCHAR,
+            downloaded_at   TIMESTAMP,
+            ingested_at     TIMESTAMP,
+            updated_at      TIMESTAMP
+        )
+    """)
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oh_compat ON data.openhumans_files (compat)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oh_db_status ON data.openhumans_files (db_status)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_oh_vendor ON data.openhumans_files (vendor)"
     )
     row = con.execute(
         "SELECT value FROM data.meta WHERE key = 'schema_version'"

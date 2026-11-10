@@ -15,7 +15,7 @@ from textual.widgets.option_list import Option
 from ...core.genome import Genome
 from ...core import genome_db
 from ...core.store import Store, data_dir
-from ...core.ylink import YLink, link_genome
+from ...core.ylink import YLink, link_genome, load_cached_ylink
 from ..base import (ConfirmScreen, KeyBar, ModeBar, Workspace, alt_keys,
                     busy_progress, fit, hide_busy, short_path, show_busy)
 from .screens import OpenFileScreen
@@ -194,7 +194,7 @@ class GenomeWorkspace(Workspace):
                       ("Z", "Collapse all", "screen.collapse_all"),
                       ("N", "Next derived Y", "screen.next_derived"), ("Esc", "Clear filter", None),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -256,17 +256,26 @@ class GenomeWorkspace(Workspace):
             }
             self._show(g)
             return
-        # Панели не очищаем. Модал сразу: DuckDB full Genome тоже секунды, не только RAW.
+        # Fresh in DuckDB: meta shells (+ process cache) — SUMMARY/HEAD without
+        # dumping all ~800k calls. ChromView loads a chrom when expanded.
         if genome_db.is_fresh(path):
-            self.load_path = path
-            self.phase = "loading"
-            self._set_panel_titles(path)
-            self.refresh_files()
-            self.update_status()
-            show_busy(self.app, "Loading genome", path.name)
-            busy_progress(self.app, "Reading SNPs from DuckDB…", frac=0.0)
-            self.run_worker(lambda: self._load_db(path, mtime), thread=True,
-                            exclusive=True, group="genome")
+            try:
+                g = genome_db.ensure_meta(path, set_active_flag=True)
+            except Exception as exc:  # noqa: BLE001
+                self._failed(path, exc)
+                return
+            self.cache[str(path)] = (mtime, g)
+            while len(self.cache) > CACHE_SIZE:
+                self.cache.pop(next(iter(self.cache)))
+            self.info[str(path)] = {
+                "format": g.fmt, "snps": g.total,
+                "build": g.build_detected or g.build,
+                "build_label": g.build_label(),
+            }
+            self.load_path = None
+            self.phase = None
+            self._write_config()
+            self._show(g)
             return
         self.load_path = path
         self.phase = "reading"
@@ -275,14 +284,6 @@ class GenomeWorkspace(Workspace):
         self.update_status()
         show_busy(self.app, "Reading file", path.name)
         self.run_worker(lambda: self._load(path, mtime), thread=True, exclusive=True, group="genome")
-
-    def _load_db(self, path: Path, mtime: int) -> None:
-        try:
-            g = genome_db.ensure(path, store=self.store, set_active_flag=True)
-        except Exception as exc:  # noqa: BLE001
-            self.app.call_from_thread(self._failed, path, exc)
-            return
-        self.app.call_from_thread(self._loaded, path, mtime, g)
 
     def _load(self, path: Path, mtime: int) -> None:
         def prog(frac: float | None, lines: int) -> None:
@@ -337,19 +338,46 @@ class GenomeWorkspace(Workspace):
     def _show(self, g: Genome) -> None:
         self.genome = g
         self.link = None
-        self.phase = "linking"
         self._sync_filter_input("")
         self.query_one(ChromView).set_genome(g)
-        self.show_summary(linking_summary(g))
         self._set_panel_titles(g.path)
         self.refresh_files()
+        # DuckDB hit → skip Linking Y modal entirely.
+        try:
+            cached = load_cached_ylink(g.path, self.store)
+        except Exception:  # noqa: BLE001
+            cached = None
+        if cached is not None:
+            # Derived Y clicks need Y call arrays; load only that chrom.
+            if "Y" in g.chroms and not g.chroms["Y"].calls_loaded:
+                try:
+                    genome_db.ensure_chrom(g, "Y")
+                except Exception:  # noqa: BLE001
+                    pass
+            self.phase = None
+            self.update_status()
+            self._linked(g, cached)
+            return
+        self.phase = "linking"
+        self.show_summary(linking_summary(g))
         self.update_status()
         self.relink()
 
     def relink(self) -> None:
-        """Сопоставляет именованные Y-маркеры с Haplotree и Discover (в фоне)."""
+        """Сопоставляет именованные Y-маркеры с Haplotree и Discover.
+
+        Fresh genome.y_links → instant. Miss → BusyModal + background link + cache write.
+        """
         g = self.genome
         if not g:
+            return
+        try:
+            cached = load_cached_ylink(g.path, self.store)
+        except Exception:  # noqa: BLE001
+            cached = None
+        if cached is not None:
+            self.phase = None
+            self._linked(g, cached)
             return
         self.phase = "linking"
         self._set_panel_titles(g.path)
@@ -360,6 +388,8 @@ class GenomeWorkspace(Workspace):
 
         def work() -> None:
             try:
+                if "Y" in g.chroms and not g.chroms["Y"].calls_loaded:
+                    genome_db.ensure_chrom(g, "Y")
                 res: YLink | str = link_genome(g, self.store)
             except Exception as exc:  # noqa: BLE001
                 res = f"could not link with the haplotree: {exc}"

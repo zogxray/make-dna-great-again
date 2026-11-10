@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -125,10 +126,18 @@ class Ctx:
         self.ours: set[str] = set()
         self.tip: str | None = None
         self.raw_full = False
+        # LORE tab toggles / caches
+        self.lore_geo = False
+        self.lore_seshat = False
+        self.lore_raw = False
+        self.lore_briefs: dict[str, Any] = {}
+        self.lore_cache: dict[str, Any] = {}  # name → {text, meta} last weave
         # Активный fetch Discover: {title, stage, done, total, fraction} или None.
         self.fetch: dict[str, Any] | None = None
         # YFull / TheYtree overlay: None = ещё не грузили, False = нет данных.
         self._overlays: Any = None
+        # Discover-on-disk index (scandir once). Avoids Path.is_file per node.
+        self._discover_stems: set[str] | None = None
 
     def overlays(self):
         """Ленивый индекс YFull+TheYtree (ages / SNP / crosswalk)."""
@@ -171,8 +180,62 @@ class Ctx:
         from ....core.ylink import safe_stem
         return self.folder / f"{safe_stem(name)}.json"
 
+    def invalidate_discover_index(self) -> None:
+        """Call after fetch / ingest writes or deletes Discover JSON files."""
+        self._discover_stems = None
+
+    def _ensure_discover_stems(self) -> set[str]:
+        if self._discover_stems is not None:
+            return self._discover_stems
+        stems: set[str] = set()
+        folder = self.folder
+        if folder and Path(folder).is_dir():
+            with os.scandir(folder) as it:
+                for e in it:
+                    nm = e.name
+                    if nm.endswith(".json") and e.is_file(follow_symlinks=False):
+                        stems.add(nm[:-5])
+        self._discover_stems = stems
+        return stems
+
+    def _discover_on_disk(self, name: str) -> bool:
+        """Whether Discover JSON for ``name`` is present (stem set, no per-node stat)."""
+        from ....core.ylink import safe_stem
+        return safe_stem(name) in self._ensure_discover_stems()
+
+    def has_discover_file(self, name: str) -> bool:
+        """True if ``safe_stem(name).json`` exists under the Discover folder."""
+        return self._discover_on_disk(name)
+
+    def discover_subtree_stats(self, name: str) -> tuple[int, int, bool, bool]:
+        """One subtree walk: (n_missing, n_local, self_missing, self_local)."""
+        self._ensure_discover_stems()
+        n_miss = n_local = 0
+        self_miss = self_local = False
+        stack = [name]
+        seen: set[str] = set()
+        while stack:
+            n = stack.pop()
+            if n in seen or n not in self.nodes:
+                continue
+            seen.add(n)
+            node = self.nodes[n]
+            if node.get("placeholder") and node.get("haplotree"):
+                if self._discover_on_disk(n):
+                    n_local += 1
+                    if n == name:
+                        self_local = True
+                else:
+                    n_miss += 1
+                    if n == name:
+                        self_miss = True
+            for k in reversed(self.children.get(n, [])):
+                stack.append(k)
+        return n_miss, n_local, self_miss, self_local
+
     def missing_discover(self, name: str) -> list[str]:
         """Узел и потомки: haplotree-скелет БЕЗ файла Discover на диске (нужен сетевой fetch)."""
+        self._ensure_discover_stems()
         out: list[str] = []
         stack = [name]
         seen: set[str] = set()
@@ -183,7 +246,7 @@ class Ctx:
             seen.add(n)
             node = self.nodes[n]
             if (node.get("placeholder") and node.get("haplotree")
-                    and not self._discover_json(n).is_file()):
+                    and not self._discover_on_disk(n)):
                 out.append(n)
             for k in reversed(self.children.get(n, [])):
                 stack.append(k)
@@ -191,6 +254,7 @@ class Ctx:
 
     def local_discover(self, name: str) -> list[str]:
         """Скелеты, у которых JSON уже на диске, но ещё не влит в дерево."""
+        self._ensure_discover_stems()
         out: list[str] = []
         stack = [name]
         seen: set[str] = set()
@@ -201,7 +265,7 @@ class Ctx:
             seen.add(n)
             node = self.nodes[n]
             if (node.get("placeholder") and node.get("haplotree")
-                    and self._discover_json(n).is_file()):
+                    and self._discover_on_disk(n)):
                 out.append(n)
             for k in reversed(self.children.get(n, [])):
                 stack.append(k)
@@ -212,8 +276,7 @@ class Ctx:
         from ....core.ylink import fetch_cost
 
         node = self.nodes.get(name) or {}
-        missing = self.missing_discover(name)
-        local = self.local_discover(name)
+        n_miss, _, self_miss, self_local = self.discover_subtree_stats(name)
         doc.title("DISCOVER")
         fetch = self.fetch
         if fetch:
@@ -248,7 +311,7 @@ class Ctx:
             return
 
         shown = False
-        if name in local:
+        if self_local:
             doc.t.append("  ")
             doc.t.append(
                 " Apply local JSON ",
@@ -257,7 +320,7 @@ class Ctx:
             doc.t.append("\n")
             doc.line("File is already on disk; load it into this card.", "#8A8294", 1)
             shown = True
-        if name in missing:
+        if self_miss:
             doc.t.append("  ")
             doc.t.append(
                 " Fetch this node ",
@@ -269,10 +332,8 @@ class Ctx:
             doc.line("Downloads dates, countries, ancient DNA and the rest of the card.", "#8A8294", 1)
             shown = True
         # Ветка: есть что качать, и это не единственная кнопка «Fetch this node».
-        only_self = node.get("placeholder") and missing == [name]
-        if missing and not only_self:
-            n = len(missing)
-            label = f" Fetch branch ↓ · {n:,} missing · {fetch_cost(n)} "
+        if n_miss and not (self_miss and n_miss == 1):
+            label = f" Fetch branch ↓ · {n_miss:,} missing · {fetch_cost(n_miss)} "
             doc.t.append("  ")
             doc.t.append(label, style=click("screen.fetch_branch", "bold reverse #53A94B"))
             doc.t.append("  ")
@@ -417,6 +478,7 @@ class Ctx:
 
 
 from . import node as _node_tabs  # noqa: E402,F401  (регистрирует вкладки узла)
+from . import lore as _lore_tab  # noqa: E402,F401  (LORE)
 
 # Порядок для пользователя: кто узел → путь вверх → мутации → где люди/древние
 # → матчи → маршруты → лор → сырьё. Блоки внутри вкладок не трогаем.
@@ -430,6 +492,7 @@ _TAB_ORDER = (
     "Migration Map",
     "Famous",
     "Projects",
+    "LORE",
     "Raw JSON",
 )
 _by_title = {t.title: t for t in TABS}

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from rich.console import Group, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
@@ -21,6 +21,16 @@ LIST_W = 22
 ROLE_STYLE = {"user": HI_REV, "model": OK_BOLD, "error": BAD_BOLD}
 ROLE_LABEL = {"user": "YOU", "model": "GEMINI", "error": "ERROR"}
 BODY_STYLE = {"user": HI, "model": "", "error": BAD}
+
+# Live Markdown is re-measured/re-rendered on every Textual layout pass (F6 mount).
+# Bake model bodies to Text once per (text, width) — same look, cheap Static height.
+_MD_CACHE: dict[tuple[int, int], Text] = {}
+_MD_CACHE_MAX = 48
+_MD_WIDTH = 88
+
+
+def clear_md_cache() -> None:
+    _MD_CACHE.clear()
 
 
 def chat_prompt(t: Thread) -> Text:
@@ -54,13 +64,34 @@ def _plain(body: str, style: str = "") -> Text:
     return d
 
 
-def _md(body: str) -> RenderableType:
+def _md(body: str, *, width: int = _MD_WIDTH) -> Text:
+    """Parse Markdown once → styled Text (cached)."""
     text = body.rstrip() or " "
-    return Padding(Markdown(text), (0, 0, 0, 2))
+    key = (hash(text), width)
+    cached = _MD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    console = Console(
+        width=max(40, width),
+        force_terminal=True,
+        color_system="truecolor",
+        highlight=False,
+        legacy_windows=False,
+    )
+    with console.capture() as cap:
+        console.print(Padding(Markdown(text), (0, 0, 0, 2)), end="")
+    out = Text.from_ansi(cap.get())
+    if len(_MD_CACHE) >= _MD_CACHE_MAX:
+        # Drop an arbitrary old entry (order not meaningful for correctness).
+        _MD_CACHE.pop(next(iter(_MD_CACHE)), None)
+    _MD_CACHE[key] = out
+    return out
 
 
-def thread_view(t: Thread | None, waiting: bool, draft: str = "") -> RenderableType:
-    """Markdown-вид для просмотра."""
+def thread_view(t: Thread | None, waiting: bool, draft: str = "",
+                *, width: int | None = None) -> RenderableType:
+    """Markdown-вид для просмотра (model bodies baked to Text)."""
+    w = width or _MD_WIDTH
     parts: list[RenderableType] = []
     if t is None:
         d = Text()
@@ -76,7 +107,7 @@ def thread_view(t: Thread | None, waiting: bool, draft: str = "") -> RenderableT
         edit = i if m.role == "user" and not waiting else None
         parts.append(_header_rich(m.role, m.at, edit))
         if m.role == "model":
-            parts.append(_md(m.text))
+            parts.append(_md(m.text, width=w))
         else:
             parts.append(_plain(m.text, BODY_STYLE.get(m.role, "")))
     if waiting:
@@ -85,7 +116,7 @@ def thread_view(t: Thread | None, waiting: bool, draft: str = "") -> RenderableT
         if draft.strip():
             head.append(" streaming\n", style=WARN)
             parts.append(head)
-            parts.append(_md(draft))
+            parts.append(_md(draft, width=w))
         else:
             head.append(" …\n", style=WARN)
             parts.append(head)

@@ -150,7 +150,7 @@ class PgsWorkspace(Workspace):
                       ("L", "List", "screen.toggle_list"), ("/", "Search", "screen.focus_search"),
                       ("C", "Cancel", "screen.cancel"), ("V", "Compare", "screen.toggle_tab"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -197,9 +197,26 @@ class PgsWorkspace(Workspace):
             self.query_one("#models-box").border_subtitle = f"{count} {which} · no genome"
 
     def reload(self) -> None:
-        """Каталог + results в фоне; прогресс — общий BusyModal."""
+        """Каталог + results. Warm DuckDB path is sync (no BusyModal); cold sync uses modal."""
         self._load_gen = getattr(self, "_load_gen", 0) + 1
         gen = self._load_gen
+        folder = self.store.path("pgs_models")
+        warm = bool(folder and pgs_db.catalog_fresh(folder) and pgs_db.menus_seeded())
+        if warm:
+            # SELECT-only — keep UI thread, skip spinner (was ~1s of needless seed rewrite).
+            self.refreshing = True
+            self._set_panel_subs()
+            self.update_status()
+            try:
+                data = self._reload_data(folder, progress=False)
+            except Exception as exc:  # noqa: BLE001
+                self.refreshing = False
+                self.catalog_problem = str(exc)
+                self.fill_list()
+                self.refresh_all()
+                return
+            self._reload_done(gen, data)
+            return
         self.refreshing = True
         self._set_panel_subs()
         self.update_status()
@@ -210,12 +227,12 @@ class PgsWorkspace(Workspace):
         self.run_worker(lambda: self._reload_work(gen), thread=True,
                         exclusive=True, group="pgs-load")
 
-    def _reload_work(self, gen: int) -> None:
-        folder = self.store.path("pgs_models")
+    def _reload_data(self, folder: Path | None, *, progress: bool) -> dict:
         catalog_problem = ""
         menus: list = []
         models_by_menu: dict = {}
-        self.app.call_from_thread(busy_progress, self.app, "Loading models…", frac=0.35)
+        if progress:
+            self.app.call_from_thread(busy_progress, self.app, "Loading models…", frac=0.35)
         if not folder:
             catalog_problem = (
                 "PGS catalog is not set.\n\n"
@@ -229,10 +246,11 @@ class PgsWorkspace(Workspace):
             try:
                 # TSV→DB только если каталог пуст / устарел; иначе SELECT из DuckDB.
                 if not pgs_db.catalog_fresh(folder):
-                    self.app.call_from_thread(
-                        busy_progress, self.app, "Syncing catalog.tsv…", frac=0.45)
+                    if progress:
+                        self.app.call_from_thread(
+                            busy_progress, self.app, "Syncing catalog.tsv…", frac=0.45)
                     pgs_db.ensure_catalog(folder)
-                pgs_db.seed_menus()  # системные вкладки (в т.ч. DISEASES) без полного sync
+                pgs_db.seed_menus()  # no-op when menus_seed meta matches
                 menus = pgs_db.list_menus()
                 for menu in menus:
                     models_by_menu[menu["id"]] = self._models_for_menu(menu, folder_ok=True)
@@ -244,16 +262,22 @@ class PgsWorkspace(Workspace):
                     catalog_problem = (
                         f"Catalog folder is empty or has no usable models:\n{folder}")
         genome = self._active()
-        self.app.call_from_thread(busy_progress, self.app, "Loading results…", frac=0.75)
+        if progress:
+            self.app.call_from_thread(busy_progress, self.app, "Loading results…", frac=0.75)
         results, stamp = {}, None
         if genome:
             stamp = self._stamp(genome)
             results = pgs.load_results(genome)
-        self.app.call_from_thread(self._reload_done, gen, {
+        return {
             "folder": folder, "catalog_problem": catalog_problem,
             "menus": menus, "models_by_menu": models_by_menu,
             "genome": genome, "results": results, "stamp": stamp,
-        })
+        }
+
+    def _reload_work(self, gen: int) -> None:
+        folder = self.store.path("pgs_models")
+        data = self._reload_data(folder, progress=True)
+        self.app.call_from_thread(self._reload_done, gen, data)
 
     def _reload_done(self, gen: int, data: dict) -> None:
         if gen != getattr(self, "_load_gen", 0):
@@ -269,7 +293,7 @@ class PgsWorkspace(Workspace):
         self.stamp = data["stamp"]
         self.pick_other()
         self.refreshing = False
-        hide_busy(self.app)
+        hide_busy(self.app)  # no-op if warm path skipped BusyModal
         self.fill_list()
         self.refresh_all()
 

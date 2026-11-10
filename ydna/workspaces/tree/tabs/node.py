@@ -23,6 +23,7 @@ from typing import Any
 from rich.cells import cell_len
 from rich.text import Text  # noqa: F401  (doc.t — rich.Text)
 
+from ...base import click
 from ..data import _dict, country_code, find_steps, load_resource, pick, year_label
 from . import Doc, dump, tab
 
@@ -76,9 +77,15 @@ def _cut(text: str, room: int) -> tuple[str, str]:
 
 
 def _fit_cells(text: str, width: int) -> str:
-    """Обрезать / дополнить пробелами до width ячеек (эмодзи — две ячейки)."""
-    head, _ = _cut(text, width)
+    """Обрезать / дополнить пробелами справа до width ячеек (эмодзи — две ячейки)."""
+    head, _ = _cut(str(text), width)
     return head + " " * (width - cell_len(head))
+
+
+def _rcells(text: str, width: int) -> str:
+    """Обрезать / дополнить пробелами слева до width ячеек (числа в колонке)."""
+    head, _ = _cut(str(text), width)
+    return " " * (width - cell_len(head)) + head
 
 
 def _wrap_segs(segs: list[tuple[str, str]], avail: int) -> list[list[tuple[str, str]]]:
@@ -137,6 +144,24 @@ def put(doc: Doc, *parts: Any, indent: int = 1) -> None:
         doc.t.append("\n")
 
 
+def put_row(doc: Doc, *parts: Any, indent: int = 1) -> None:
+    """Как put, но без переноса — для таблиц с фиксированными колонками."""
+    rail = _RAIL[0]
+    if rail and indent >= 1:
+        doc.t.append("  ")
+        doc.t.append("│ ", rail)
+        if indent > 1:
+            doc.t.append("  " * (indent - 1))
+    else:
+        doc.t.append("  " * indent)
+    for p in parts:
+        if isinstance(p, tuple):
+            doc.t.append(p[0], p[1])
+        else:
+            doc.t.append(str(p))
+    doc.t.append("\n")
+
+
 @contextmanager
 def card(doc: Doc, *head: Any, rail: str = "#5A5361"):
     """Карточка сущности: ╭─ заголовок / │ тело / ╰──── + ровно одна пустая строка.
@@ -159,26 +184,29 @@ def card(doc: Doc, *head: Any, rail: str = "#5A5361"):
         doc.t.append("\n")  # воздух до следующей секции / карточки
 
 
-def _tag_flag(tag: str) -> str:
-    """Флаг субъекта (Англия, Шотландия, Уэльс) через tag-последовательность Unicode."""
-    return "\U0001F3F4" + "".join(chr(0xE0000 + ord(c)) for c in tag) + "\U000E007F"
-
-
-_SUBDIV = {"ENG": "gbeng", "SCT": "gbsct", "WLS": "gbwls"}
+# Subdivision → short badge (emoji tag-flags / regional indicators break on Linux TUIs).
+_SUBDIV_BADGE = {"ENG": "EN", "SCT": "SC", "WLS": "WA", "NIR": "NI"}
 
 
 def flag(code: str | None) -> str:
-    """ISO-2 → флаг. Понимает SCT/ENG/WLS и региональные коды вида RU-KB, IT-82, ES-VC."""
+    """ISO-2 → текстовый бейдж ``[GB]``.
+
+    Regional-indicator emoji flags не склеиваются в большинстве Linux-терминалов
+    (даже с Noto Color Emoji) — показываются как буквы в пунктирных квадратах.
+    Без системных пакетов надёжный вариант: ASCII/ISO-бейдж фиксированной ширины.
+    """
     code = (code or "").strip().upper()
     if not code:
-        return "🏳"
+        return "[··]"
     for part in (code, code.split("-")[-1]):
-        if part in _SUBDIV:
-            return _tag_flag(_SUBDIV[part])
+        if part in _SUBDIV_BADGE:
+            return f"[{_SUBDIV_BADGE[part]}]"
     head = code.split("-")[0]
     if len(head) == 2 and head.isalpha():
-        return "".join(chr(0x1F1E6 + ord(c) - 65) for c in head)
-    return "🏳"
+        return f"[{head}]"
+    if 2 <= len(head) <= 3 and head.isalpha():
+        return f"[{head}]"
+    return "[··]"
 
 
 def bar(frac: float, width: int = 20) -> tuple[str, str]:
@@ -227,6 +255,14 @@ def banner(doc: Doc, name: str, subtitle: str = "") -> None:
     doc.t.append("\n")
     doc.t.append(f"  {line}\n", "#433F47")
     doc.t.append("\n")  # одна пустая до первой секции
+
+
+def ask_cta(doc: Doc) -> None:
+    """Клик / A → F6 с компактным промптом по активной вкладке."""
+    put(doc,
+        ("Ask GPT  ", "#8A8294"),
+        ("A", click("screen.ask_gpt", "bold reverse #D4AD72")),
+        ("  · short prompt for this tab → F6 Chat", "#71697A"))
 
 
 def norm_tmrca(d: dict) -> tuple[dict, bool]:
@@ -304,7 +340,7 @@ def date_block(doc: Doc, title: str, data: Any) -> None:
 def country_label(item: dict[str, Any]) -> str:
     name = item.get("name") or "Unknown"
     code = str(item.get("code") or "").upper()
-    label = f"{flag(code)} {name} ({code})" if code else str(name)
+    label = f"{flag(code)} {name}" if code else str(name)
     c, t = item.get("count"), item.get("total")
     try:
         if c is not None and t:
@@ -439,7 +475,7 @@ def person_line(doc: Doc, p: dict[str, Any]) -> None:
     with card(doc, *head, rail="#5A5361"):
         if who or cc:
             put(doc, (str(who[0]) if who else "", "#49AE6B"),
-                (f"  {flag(cc)} {cc}" if cc else "", "#AEA5B8"), indent=1)
+                (f"  {flag(cc)}" if cc else "", "#AEA5B8"), indent=1)
         put(doc, (" · ".join(gen), "#8A8294"), indent=1)
         if ctx_bits:
             put(doc, (" · ".join(ctx_bits), "#8A8294"), indent=1)
@@ -494,27 +530,38 @@ def tmrca_timeline(doc: Doc, anc: list[dict], node_name: str, width: int = 46) -
         cells[pos(y)], cells[pos(o)] = "├", "┤"
         cells[pos(tm["mean"])] = "◆"
         me = a.get("name") == node_name
-        name = str(a.get("name") or "?").ljust(12)[:12] + " "
-        put(doc, (name, "bold #D4AD72" if me else "#FBF6F0"),
-            *[(c, style.get(c, "")) for c in cells],
-            (f"  {dv(tm['mean'])}", "#B04A4A"), (f"  {span(o, y)}", "#8A8294"))
+        name = _fit_cells(str(a.get("name") or "?"), 12) + " "
+        # put_row: иначе "2,700 BCE" переносится по пробелу и ломает ось.
+        put_row(doc, (name, "bold #D4AD72" if me else "#FBF6F0"),
+                *[(c, style.get(c, "")) for c in cells],
+                (f"  {dv(tm['mean'])}", "#B04A4A"),
+                (f"  {span(o, y)}", "#8A8294"))
 
 
 def geo_funnel(doc: Doc, anc: list[dict], top_n: int = 4) -> None:
     rows = [a for a in anc if isinstance(a.get("geochart_countries"), dict) and a["geochart_countries"]]
     if not rows:
-        doc.line("— no geochart_countries on ancestors (check that data.py keeps them)", "#8A8294", 1)
+        doc.line("— no country breakdown on ancestors for this card", "#8A8294", 1)
         return
     rows = rows[::-1]  # от узла (новый) к корню (древний)
-    totals = [sum(a["geochart_countries"].values()) for a in rows]
-    base = math.log10(max(totals) + 1) or 1
-    for a, total in zip(rows, totals):
+    name_w = 14
+    for a in rows:
         g = a["geochart_countries"]
-        put_bar(doc, str(a.get("name") or "?"), math.log10(total + 1) / base,
-                f"{_num(total)} · {len(g)} countries", width=24, style="#53A94B")
+        total = sum(g.values()) or 1
         top = sorted(g.items(), key=lambda kv: (-kv[1], str(kv[0])))[:top_n]
-        tops = "   ".join(f"{flag(country_code(c))} {c} {100 * v / total:.0f}%" for c, v in top)
-        put(doc, (tops, "#AEA5B8"), indent=3)
+        bits = []
+        for c, v in top:
+            cc = country_code(c)
+            lab = flag(cc) if cc else _fit_cells(str(c), 8)
+            bits.append(f"{lab} {100 * v / total:.0f}%")
+        put_row(doc,
+                (_fit_cells(str(a.get("name") or "?"), name_w), "#FBF6F0"),
+                ("  ", ""),
+                ("   ".join(bits), "#AEA5B8"))
+    if rows:
+        n_last = len(rows[-1]["geochart_countries"])
+        if n_last >= 40:
+            put(doc, (f"… root row spans {n_last} countries (near global)", "#8A8294"))
 
 
 def ascii_map(doc: Doc, mm: Any, width: int = 84, height: int = 22) -> None:
@@ -895,6 +942,7 @@ def overview(ctx, doc: Doc, node: dict) -> None:
     fit(ctx)
     parent = node.get("parent")
     banner(doc, node["name"], f"← {parent}" if parent else "root")
+    ask_cta(doc)
     _sources_status_block(ctx, doc, node)
 
     pnode = ctx.nodes.get(parent) if parent else None
@@ -942,7 +990,7 @@ def overview(ctx, doc: Doc, node: dict) -> None:
     labels = []
     for n in node["countries"]:
         cc = country_code(n)
-        labels.append(f"{flag(cc)} {n} ({cc})" if cc else n)
+        labels.append(f"{flag(cc)} {n}" if cc else n)
     doc.line(" · ".join(labels) if labels else "—", "", 1)
 
     ctx.branch_block(doc, node)
@@ -1630,55 +1678,96 @@ def famous(ctx, doc: Doc, node: dict) -> None:
                 person_line(doc, p_)
 
 
+def _anc_int(value: Any) -> int | None:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 @tab("Ancestors", keys={"g": toggle_geo})
 def ancestors(ctx, doc: Doc, node: dict) -> None:
+    """Father-line tip→root: ровные колонки (без лесенки), TMRCA, geo funnel."""
     fit(ctx)
     geo_all = getattr(ctx, "geo_all", False)
     anc = [a for a in node["ancestors"] if isinstance(a, dict)]
-    doc.title(f"LINEAGE · {len(anc)} · node to root")
-    mods = [pick(a, "modern", "modern_count") or 0 for a in anc]
-    peak = math.log10(max(max(mods, default=1), 1) + 1) or 1
-    # лестница: самый новый (сам узел) сверху, корень снизу; отступ — глубина в дереве
-    for depth, (a, modern) in reversed(list(enumerate(zip(anc, mods)))):
-        tm = pick(a, "tmrca")
-        if isinstance(tm, dict):
-            tm = tm.get("mean")
-        tm_s = dv(tm) if tm not in (None, False) else "—"
-        ancient_n = pick(a, "ancient", "ancient_count")
-        short = pick(a, "short_name", "shortName", "short") or "—"
-        is_me = a.get("name") == node["name"]
-        glyph = "◉ " if is_me else ("● " if depth == 0 else "┌─")
-        branch = "  " * min(depth, 14) + glyph
-        f, e = bar(math.log10(modern + 1) / peak, 10)
-        put(doc, (branch, "#8A8294"),
-            (f"{a.get('name') or '?'}", "bold #D4AD72" if is_me else "#FBF6F0"),
-            (f" · {short}", "#49AE6B"), (f"  {tm_s}", "#B04A4A"), "  ",
-            (f, "#53A94B"), (e, "#433F47"),
-            (f" {modern:,}", "#AEA5B8"), (f" / 🦴{ancient_n if ancient_n is not None else '—'}", "#8A8294"))
-        bits = []
-        if a.get("id") is not None:
-            bits.append(f"id {a['id']}")
-        if a.get("note") and a.get("note") != short:
-            bits.append(str(a["note"]))
-        if a.get("children") is not None:
-            bits.append(f"children {a['children']}")
-        if a.get("placements"):
-            bits.append(f"placements {a['placements']}")
-        raw_tm = a.get("tmrca")
-        if isinstance(raw_tm, dict) and "known" in raw_tm:
-            bits.append(f"tmrca known={raw_tm['known']}")
-        if a.get("citation"):
-            bits.append(f"📚 {a['citation']}")
-        if bits:
-            put(doc, ("  " * min(depth, 14) + "  ", ""), (" · ".join(bits), "#8A8294"), indent=3)
-    if not anc:
-        doc.line("—", "", 1)
+    # Discover обычно отдаёт root→…→parent; показываем tip→root.
+    ordered = list(reversed(anc))
 
-    doc.title("TMRCA TIMELINE · node to root · log scale, newest left · ├─┤ 99%  ━ 68%  ◆ mean")
+    doc.title("WHAT YOU'RE LOOKING AT")
+    put(doc, ("Father-line from this clade up to the Y-tree root.", "#AEA5B8"))
+    put(doc, ("Down = older. Same columns every row (no staircase).", "#AEA5B8"))
+    ask_cta(doc)
+
+    doc.title(f"YOUR LINE · tip → root · {len(ordered)} steps")
+    if not ordered:
+        doc.line("— no ancestors on this card", "#8A8294", 1)
+    else:
+        mods = [_anc_int(pick(a, "modern", "modern_count")) or 0 for a in ordered]
+        peak = math.log10(max(max(mods), 1) + 1) or 1
+        # Колонки: уже при узкой панели; put_row — без переноса, иначе колонки плывут.
+        w = _WIDTH[0]
+        if w < 52:
+            clade_w, age_w, live_w, adna_w, bar_w = 14, 11, 7, 5, 8
+        elif w < 68:
+            clade_w, age_w, live_w, adna_w, bar_w = 16, 12, 8, 6, 10
+        else:
+            clade_w, age_w, live_w, adna_w, bar_w = 20, 14, 9, 7, 10
+        put_row(doc,
+                ("  ", "#8A8294"),
+                (_fit_cells("clade", clade_w), "#8A8294"),
+                (" ", ""),
+                (_fit_cells("age", age_w), "#8A8294"),
+                (_rcells("living", live_w), "#8A8294"),
+                (_rcells("aDNA", adna_w), "#8A8294"),
+                (" ", ""),
+                (_fit_cells("kits", bar_w), "#8A8294"))
+        put_row(doc, ("─" * min(72, max(36, clade_w + age_w + live_w + adna_w + bar_w + 8)),
+                      "#433F47"))
+
+        n = len(ordered)
+        for i, (a, modern) in enumerate(zip(ordered, mods)):
+            tm = pick(a, "tmrca")
+            if isinstance(tm, dict):
+                tm = tm.get("mean")
+            tm_s = dv(tm) if tm not in (None, False) else "—"
+            ancient_n = _anc_int(pick(a, "ancient", "ancient_count"))
+            anc_s = f"{ancient_n:,}" if ancient_n is not None else "—"
+            short = pick(a, "short_name", "shortName", "short") or ""
+            name = str(a.get("name") or "?")
+            clade = f"{name} · {short}" if short else name
+            is_me = a.get("name") == node["name"]
+            is_root = i == n - 1
+            if is_me:
+                rail, tag = "●", " ← you"
+            elif is_root:
+                rail, tag = "└", " ← root"
+            else:
+                rail, tag = "│", ""
+            f, e = bar(math.log10(modern + 1) / peak, bar_w)
+            put_row(doc,
+                    (f"{rail} ", "#8A8294"),
+                    (_fit_cells(clade, clade_w), "bold #D4AD72" if is_me else "#FBF6F0"),
+                    (" ", ""),
+                    (_fit_cells(tm_s, age_w), "#B04A4A"),
+                    (_rcells(f"{modern:,}", live_w), "#AEA5B8"),
+                    (_rcells(anc_s, adna_w), "#8A8294"),
+                    (" ", ""),
+                    (f, "#53A94B"), (e, "#433F47"),
+                    (tag, "#D4AD72"))
+        put(doc, ("living = FTDNA kits under this node", "#71697A"))
+        put(doc, ("aDNA   = published ancient samples in/under this node", "#71697A"))
+        put(doc, ("bar    = living vs the largest row (log scale)", "#71697A"))
+
+    doc.title("WHEN DID THIS ANCESTOR LIVE? · TMRCA")
+    put(doc, ("Shared father of everyone in the clade.", "#AEA5B8"))
+    put(doc, ("Left = newer · right = older (log).", "#AEA5B8"))
     tmrca_timeline(doc, anc, node["name"])
+    put(doc, ("├─┤ 99%    ━ 68%    ◆ mean", "#71697A"))
 
-    doc.title("GEOGRAPHIC FUNNEL · node to root — how geography widens"
-              + (" · top-10 · G — top-4" if geo_all else " · top-4 · G — top-10"))
+    tip = "top-10 · G — top-4" if geo_all else "top-4 · G — top-10"
+    doc.title(f"WHERE DID THE LINE SPREAD? · geographic funnel · {tip}")
+    put(doc, ("Older ancestors → geography usually widens.", "#AEA5B8"))
     geo_funnel(doc, anc, top_n=10 if geo_all else 4)
 
 

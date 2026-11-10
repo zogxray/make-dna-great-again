@@ -453,6 +453,75 @@ def ingest(
     return g
 
 
+def _file_row(con, path: Path):
+    row = con.execute("""
+        SELECT id, size, member, header, layout, fmt, build_header, build_majority,
+               malformed, status
+        FROM genome.files WHERE path = ?
+    """, [str(path)]).fetchone()
+    if not row:
+        raise FileNotFoundError(f"not in genome.files: {path}")
+    if row[9] != "ready":
+        raise RuntimeError(f"genome file status={row[9]}")
+    return row
+
+
+def _chrom_from_stats(name: str, s, *, ids=None, pos=None, gts=None) -> Chrom:
+    ids = ids if ids is not None else []
+    pos = pos if pos is not None else array("l")
+    gts = gts if gts is not None else []
+    c = Chrom(name, ids, pos, gts)
+    c.n = int(s[1])
+    c.rs = int(s[2])
+    c.classes = Counter({
+        "nocall": int(s[3]), "het": int(s[4]), "hom": int(s[5]),
+        "hemi": int(s[6]), "other": int(s[7]),
+    })
+    c.pos_min = s[8]
+    c.pos_max = s[9]
+    c.sorted_input = True
+    if gts:
+        c.genotypes = Counter(gts)
+        c.lengths = Counter(len(gt) for gt in gts)
+    else:
+        # Meta shell: length/genotype breakdown unknown until ensure_chrom.
+        c.genotypes = Counter()
+        c.lengths = Counter()
+    c.prefixes = Counter()
+    return c
+
+
+def _is_meta_genome(g: Genome) -> bool:
+    return any(not c.calls_loaded for c in g.chroms.values())
+
+
+def genome_meta_from_db(path: Path) -> Genome:
+    """Genome shells from chrom_stats only — no call rows. Fast F1 first paint."""
+    path = Path(path).expanduser().resolve()
+    with db.locked():
+        con = db.connect()
+        row = _file_row(con, path)
+        file_id, size, member, header, layout, fmt, build_header, build_majority, malformed, _status = row
+        stats = con.execute("""
+            SELECT chrom, n, n_rs, n_nocall, n_het, n_hom, n_hemi, n_other,
+                   pos_min, pos_max, build
+            FROM genome.chrom_stats WHERE file_id = ?
+        """, [file_id]).fetchall()
+        chroms = {
+            r[0]: _chrom_from_stats(r[0], r)
+            for r in sorted(stats, key=lambda r: chrom_key(r[0]))
+        }
+        header_lines = header.split("\n") if header else []
+        g = Genome(
+            path=path, member=member, size=int(size or path.stat().st_size),
+            header=header_lines, columns=None, layout=layout or "",
+            fmt=fmt or "unknown", build=build_header,
+            chroms=chroms, malformed=int(malformed or 0), malformed_sample=[],
+        )
+        _attach_builds(con, int(file_id), g, build_majority)
+        return g
+
+
 def genome_from_db(path: Path, *, only: frozenset[str] | set[str] | None = None) -> Genome:
     """Собрать Genome из DuckDB (без повторного парса RAW).
 
@@ -461,16 +530,8 @@ def genome_from_db(path: Path, *, only: frozenset[str] | set[str] | None = None)
     path = Path(path).expanduser().resolve()
     with db.locked():
         con = db.connect()
-        row = con.execute("""
-            SELECT id, size, member, header, layout, fmt, build_header, build_majority,
-                   malformed, status
-            FROM genome.files WHERE path = ?
-        """, [str(path)]).fetchone()
-        if not row:
-            raise FileNotFoundError(f"not in genome.files: {path}")
-        file_id, size, member, header, layout, fmt, build_header, build_majority, malformed, status = row
-        if status != "ready":
-            raise RuntimeError(f"genome file status={status}")
+        row = _file_row(con, path)
+        file_id, size, member, header, layout, fmt, build_header, build_majority, malformed, _status = row
 
         stats = con.execute("""
             SELECT chrom, n, n_rs, n_nocall, n_het, n_hom, n_hemi, n_other,
@@ -494,21 +555,8 @@ def genome_from_db(path: Path, *, only: frozenset[str] | set[str] | None = None)
             ids = [r[0] for r in rows]
             pos = array("l", (int(r[1]) for r in rows))
             gts = [r[2] for r in rows]
-            c = Chrom(chrom_name, ids, pos, gts)
-            s = stats_by[chrom_name]
-            c.n = int(s[1])
-            c.rs = int(s[2])
-            c.classes = Counter({
-                "nocall": int(s[3]), "het": int(s[4]), "hom": int(s[5]),
-                "hemi": int(s[6]), "other": int(s[7]),
-            })
-            c.pos_min = s[8]
-            c.pos_max = s[9]
-            c.sorted_input = True
-            c.genotypes = Counter(gts)
-            c.lengths = Counter(len(gt) for gt in gts)
-            c.prefixes = Counter()
-            chroms[chrom_name] = c
+            chroms[chrom_name] = _chrom_from_stats(
+                chrom_name, stats_by[chrom_name], ids=ids, pos=pos, gts=gts)
 
         header_lines = header.split("\n") if header else []
         g = Genome(
@@ -521,6 +569,84 @@ def genome_from_db(path: Path, *, only: frozenset[str] | set[str] | None = None)
         return g
 
 
+def ensure_chrom(g: Genome, chrom: str) -> Chrom:
+    """Load call arrays for one chromosome into ``g`` in place (no-op if already loaded)."""
+    c = g.chroms.get(chrom)
+    if c is None:
+        raise KeyError(chrom)
+    if c.calls_loaded:
+        return c
+    path = Path(g.path).expanduser().resolve()
+    with db.locked():
+        con = db.connect()
+        row = con.execute(
+            "SELECT id FROM genome.files WHERE path = ? AND status = 'ready'",
+            [str(path)],
+        ).fetchone()
+        if not row:
+            raise FileNotFoundError(f"not in genome.files: {path}")
+        file_id = int(row[0])
+        rows = con.execute("""
+            SELECT rsid, pos, gt FROM genome.calls
+            WHERE file_id = ? AND chrom = ?
+            ORDER BY pos
+        """, [file_id, chrom]).fetchall()
+    ids = [r[0] for r in rows]
+    pos = array("l", (int(r[1]) for r in rows))
+    gts = [r[2] for r in rows]
+    c.ids = ids
+    c.pos = pos
+    c.gts = gts
+    c.genotypes = Counter(gts)
+    c.lengths = Counter(len(gt) for gt in gts)
+    c.prefixes = Counter()
+    if c.n == 0:
+        c.n = len(ids)
+    _cache_put(g)
+    return c
+
+
+def chroms_matching_query(path: Path, query: str) -> list[str]:
+    """Chromosomes with at least one call matching rsid/pos/gt substring (for F1 filter)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    path = Path(path).expanduser().resolve()
+    like = f"%{q}%"
+    rows = db.fetchall("""
+        SELECT DISTINCT c.chrom
+        FROM genome.calls c
+        JOIN genome.files f ON f.id = c.file_id
+        WHERE f.path = ?
+          AND (
+            c.rsid ILIKE ? OR CAST(c.pos AS VARCHAR) LIKE ? OR c.gt ILIKE ?
+          )
+        ORDER BY c.chrom
+    """, [str(path), like, like, like])
+    return [str(r[0]) for r in rows]
+
+
+def ensure_meta(
+    path: Path,
+    *,
+    set_active_flag: bool = True,
+) -> Genome:
+    """Fast F1 open: RAM cache or chrom_stats shells (no call dump)."""
+    path = Path(path).expanduser().resolve()
+    hit = _cache_get(path)
+    if hit is not None:
+        if set_active_flag:
+            set_active(path)
+        return hit
+    if not is_fresh(path):
+        return ensure(path, set_active_flag=set_active_flag)
+    g = genome_meta_from_db(path)
+    _cache_put(g)
+    if set_active_flag:
+        set_active(path)
+    return g
+
+
 def ensure(
     path: Path,
     progress: Progress | None = None,
@@ -528,10 +654,14 @@ def ensure(
     *,
     set_active_flag: bool = True,
 ) -> Genome:
-    """Свежий → RAM-кэш / DB; иначе ingest. По умолчанию помечает файл active."""
+    """Свежий → RAM-кэш / DB; иначе ingest. По умолчанию помечает файл active.
+
+    If the cache holds a meta-only Genome (F1 fast path), upgrade to full calls
+    for callers that need every chromosome (PGS / fstats / …).
+    """
     path = Path(path).expanduser().resolve()
     hit = _cache_get(path)
-    if hit is not None:
+    if hit is not None and not _is_meta_genome(hit):
         if set_active_flag:
             set_active(path)
         return hit
@@ -580,10 +710,13 @@ def get_y(
     Y-only результат в полный кэш не пишется.
     """
     path = Path(path).expanduser().resolve()
-    if same_path(genome, path) and genome is not None and "Y" in genome.chroms:
+    if (same_path(genome, path) and genome is not None and "Y" in genome.chroms
+            and genome.chroms["Y"].calls_loaded):
         return genome
     hit = _cache_get(path)
     if hit is not None and "Y" in hit.chroms:
+        if not hit.chroms["Y"].calls_loaded:
+            ensure_chrom(hit, "Y")
         return hit
     yhit = _y_cache_get(path)
     if yhit is not None:

@@ -2,20 +2,35 @@
 
 from __future__ import annotations
 
+import math
+import re
+
 from rich.text import Text
 
 from ...core.aadr import (EPOCH_LABEL, F3, Catalog, Group, Hit, ON_BRANCH, Sample,
-                         date_range, hapconx_label, place_of)
+                         date_range, hapconx_label)
+from ...core.lore_codex import extract_culture
 from ..base import click, fit
 from ..tree.tabs.worldmap import scatter_map
+
+# Tokens that are country / dating / QC suffixes — not culture names on the map.
+_MAP_EPOCH_TOK = frozenset({
+    "n", "c", "ba", "eba", "mba", "lba", "mlba", "ia", "eia", "mia", "lia",
+    "en", "mn", "ln", "ca", "hg", "msh", "up", "mp", "lp", "mesolithic",
+    "neolithic", "chalcolithic", "eneolithic", "bronze", "iron", "medieval",
+    "historic", "modern", "imperial", "republic", "period", "age", "early",
+    "late", "middle", "old", "young",
+})
+_MAP_SKIP_TOK = frozenset({
+    "o", "lc", "contam", "rel", "mother", "father", "son", "daughter",
+    "family", "duplicate", "published",
+})
 
 GRADIENT = [27, 33, 39, 45, 49, 48, 41, 77, 113, 149, 185, 220, 214, 208, 202, 196]
 LIST_W = 52
 REL_MARK = {"same": "●", "ancestor": "▲", "downstream": "▼", "other": "○"}
 REL_STYLE = {"same": "bold #53A94B", "ancestor": "#D4AD72",
              "downstream": "#B04A4A", "other": "#C3BCCC"}
-
-
 class _Doc:
     def __init__(self) -> None:
         self.t = Text()
@@ -32,6 +47,11 @@ def pct_style(p: float) -> str:
     return f"color({GRADIENT[min(int(p / 100 * len(GRADIENT)), len(GRADIENT) - 1)]})"
 
 
+def fmt_lo(lo: float) -> str:
+    """lo with enough digits that near-ties do not look identical (.4f did)."""
+    return f"{lo:.6f}"
+
+
 def f3_pct(r: F3 | None, ranks: dict[str, float]) -> float | None:
     if r is None or not r.ok:
         return None
@@ -39,11 +59,27 @@ def f3_pct(r: F3 | None, ranks: dict[str, float]) -> float | None:
 
 
 def ranks_of(results: dict[str, F3], field: str = "cluster") -> dict[str, float]:
-    """Цвет шкалы по lo = est − 2·se (тот же ключ, что сортировка списка)."""
+    """Colour scale 0…100 for list + map (best → 100 hot, worse → 0 cool).
+
+    Real AADR lo is skewed: almost everyone sits in a tight band near the max,
+    with a few outgroup outliers far below — so a log on raw lo collapses the
+    map to one colour. We bend by *rank place* instead (same order as the list:
+    higher lo first), so the top stretches into hot shades and the bottom stays
+    cool without the outliers owning the scale.
+    """
     del field
-    ok = sorted((r for r in results.values() if r.ok), key=lambda r: r.est - 2 * r.se)
-    n = max(1, len(ok) - 1)
-    return {r.name: 100.0 * i / n for i, r in enumerate(ok)}
+    ok = [r for r in results.values() if r.ok]
+    if not ok:
+        return {}
+    # Same direction as sort_tuple / _row_key: higher lo = better.
+    ordered = sorted(ok, key=lambda r: r.est - 2 * r.se, reverse=True)
+    n = max(1, len(ordered) - 1)
+    c = 9.0
+    denom = math.log1p(c)
+    return {
+        r.name: 100.0 * (1.0 - math.log1p(c * i / n) / denom)
+        for i, r in enumerate(ordered)
+    }
 
 
 def epoch_bar(epoch: str, present: list[str], playing: bool,
@@ -99,6 +135,287 @@ def tab_bar(tab: str) -> Text:
 
 def _snp(n: int) -> str:
     return f"{n / 1000:.0f}k" if n >= 10_000 else f"{n:,}"
+
+
+_FILTER_BAR_W = 12
+_FILTER_COL_W = 40
+_FILTER_VALUE_W = 12  # fixed "≥0.074032×" / "(off)" — no row jump
+
+
+def _filter_axis_bar(
+    t: Text, *,
+    lo: float, hi: float,
+    keep_lo: float, keep_hi: float,
+    action: str,
+    active: bool,
+    width: int = _FILTER_BAR_W,
+) -> None:
+    """Clickable ░/█ band — value interpolated by cell."""
+    if hi <= lo:
+        hi = lo + 1e-9
+    width = max(6, width)
+    for i in range(width):
+        x0 = lo + (hi - lo) * i / width
+        x1 = lo + (hi - lo) * (i + 1) / width
+        mid = 0.5 * (x0 + x1)
+        filled = active and keep_lo - 1e-15 <= mid <= keep_hi + 1e-15
+        ch = "█" if filled else "░"
+        sty = "bold #D4AD72" if filled else "#8A8294"
+        t.append(ch, style=click(f"screen.score_set({action!r},{mid!r})", sty))
+
+
+def _filter_value_slot(
+    t: Text, *,
+    value: float | None,
+    fmt,
+    mode: str,
+    axis: str,
+    width: int = _FILTER_VALUE_W,
+) -> None:
+    """Fixed-width value/clear slot so enabling an axis does not shift neighbors."""
+    start = len(t.plain)
+    if value is None:
+        t.append("(off)", style="#5A5361")
+    else:
+        op = "≤" if mode == "ceil" else "≥"
+        body = f"{op}{fmt(value)}"
+        # keep × visible; trim numeric body if the column is tight
+        room = max(2, width - 2)
+        if len(body) > room:
+            body = body[:room]
+        t.append(body, style="bold #D4AD72")
+        t.append(" ")
+        t.append("×", style=click(f"screen.score_clear({axis!r})", "bold #B04A4A"))
+    pad = width - (len(t.plain) - start)
+    if pad > 0:
+        t.append(" " * pad)
+
+
+def _filter_band_row(
+    *,
+    label: str,
+    axis: str,
+    vmin: float,
+    vmax: float,
+    value: float | None,
+    fmt,
+    weak: str,
+    strong: str,
+    mode: str = "floor",
+    col_width: int = _FILTER_COL_W,
+) -> Text:
+    """One axis row sized to col_width so two columns never wrap under the map.
+
+    mode=floor → keep ≥ value; mode=ceil → keep ≤ value.
+    « » jump to bar ends; ‹ › log-aware steps (dense end = finer).
+    Hints (far/close) drop first when the column is narrow.
+    """
+    t = Text(no_wrap=True)
+    value_w = _FILTER_VALUE_W
+    # Fixed chrome: "lo  «‹›» " + value_slot
+    # label4 + controls5 + gap1 + value12 = 22
+    fixed = 4 + 5 + 1 + value_w
+    hint_w = 4  # "far " or " clo"
+    # Prefer: label «‹›» weak ░░ strong value — else drop strong — else drop both hints.
+    if col_width >= fixed + 2 * hint_w + 6:
+        show_weak = show_strong = True
+        bar_w = col_width - fixed - 2 * hint_w
+    elif col_width >= fixed + hint_w + 6:
+        show_weak, show_strong = True, False
+        bar_w = col_width - fixed - hint_w
+    else:
+        show_weak = show_strong = False
+        bar_w = max(6, col_width - fixed)
+
+    t.append(f"{label:<4}", style="#AEA5B8")
+    t.append("«", style=click(f"screen.score_edge({axis!r},'lo')", "bold #AEA5B8"))
+    t.append("‹", style=click(f"screen.score_step({axis!r},'lo')", "bold #D4AD72"))
+    t.append("›", style=click(f"screen.score_step({axis!r},'hi')", "bold #D4AD72"))
+    t.append("»", style=click(f"screen.score_edge({axis!r},'hi')", "bold #AEA5B8"))
+    t.append(" ")
+    if show_weak:
+        t.append(f"{weak[:3]:<3} ", style="#5A5361")
+    if mode == "ceil":
+        keep_lo, keep_hi = vmin, (value if value is not None else vmax)
+    else:
+        keep_lo, keep_hi = (value if value is not None else vmin), vmax
+    _filter_axis_bar(t, lo=vmin, hi=vmax, keep_lo=keep_lo, keep_hi=keep_hi,
+                     action=axis, active=value is not None, width=bar_w)
+    if show_strong:
+        t.append(f" {strong[:3]:<3}", style="#5A5361")
+    t.append(" ")
+    _filter_value_slot(t, value=value, fmt=fmt, mode=mode, axis=axis, width=value_w)
+    # Fit column without stripping click meta (plain rebuild used to kill all hits).
+    return _pad_col(t, col_width)
+
+
+def _filter_chip_row(label: str, chips: list[tuple[str, str, bool, str]],
+                     col_width: int = _FILTER_COL_W) -> Text:
+    """label + clickable chips. chips: (key, lab, on, action)."""
+    t = Text(no_wrap=True)
+    t.append(f"{label:<4}", style="#AEA5B8")
+    for _key, lab, on, action in chips:
+        if len(t.plain) + len(lab) + 3 > col_width:
+            break
+        sty = "bold reverse #D4AD72" if on else "#AEA5B8"
+        t.append(f" {lab} ", style=click(action, sty))
+        t.append(" ")
+    return _pad_col(t, col_width)
+
+
+def _pad_col(row: Text, width: int) -> Text:
+    """Pad or truncate to width, preserving Rich span meta (clicks)."""
+    out = Text(no_wrap=True)
+    plain = row.plain
+    if len(plain) > width:
+        out.append_text(row[:width])
+        return out
+    out.append_text(row)
+    if width > len(plain):
+        out.append(" " * (width - len(plain)))
+    return out
+
+
+FILTER_TABS = ("floors", "tips")
+
+
+def _filter_tab_bar(tab: str) -> Text:
+    t = Text(no_wrap=True)
+    for key, lab in (("floors", "FLOORS"), ("tips", "TIPS")):
+        style = "bold reverse #D4AD72" if tab == key else "#AEA5B8"
+        t.append(f" {lab} ", style=click(f"screen.filter_tab({key!r})", style))
+        t.append(" ")
+    return t
+
+
+def _filter_tips_panel(col_width: int) -> Text:
+    """Compact how-to · exactly 5 body lines (panel height 6 with header)."""
+    t = Text(no_wrap=True)
+    cw = max(24, col_width)
+    rows = [
+        (Text("floors", style="bold #8A8294"), Text("context", style="bold #8A8294")),
+        (Text("lo  ≥ closer shared drift", style="#C3BCCC"),
+         Text("SE  ≤ tighter estimate", style="#C3BCCC")),
+        (Text("Z   ≥ sharper · SNP denser", style="#C3BCCC"),
+         Text("Y   on-line = Our Y branch", style="#C3BCCC")),
+        (Text("n   ≥ larger group", style="#C3BCCC"),
+         Text("map xy · age ≤ younger BP", style="#C3BCCC")),
+        (Text("«» ends · ‹› log step · × off", style="#8A8294"),
+         Text("X / reset clears all", style="#8A8294")),
+    ]
+    for L, R in rows:
+        t.append_text(_pad_col(L, cw))
+        t.append("│ ", style="#5A5361")
+        t.append_text(_pad_col(R, cw))
+        t.append("\n")
+    return t
+
+
+def score_filter_panel(
+    scores: dict[str, F3],
+    *,
+    lo_min: float | None,
+    z_min: float | None,
+    snp_min: int | None,
+    n_min: int | None,
+    se_max: float | None,
+    y_mode: str,
+    coords_only: bool,
+    bp_max: float | None,
+    bp_values: list[float],
+    shown: int,
+    total: int,
+    bar_width: int = _FILTER_BAR_W,
+    col_width: int = _FILTER_COL_W,
+    tab: str = "floors",
+) -> Text:
+    """Two columns under the map: score floors | context (SE / Y / coords / age).
+
+    Height budget: 1 header + 5 body rows (CSS #score-filter height: 6).
+    Tab TIPS swaps body for a compact how-to — same 5 lines, no wrap.
+    """
+    t = Text(no_wrap=True)
+    ok = [r for r in scores.values() if r.ok]
+    active = (lo_min is not None or z_min is not None or snp_min is not None
+              or n_min is not None or se_max is not None or y_mode != "all"
+              or coords_only or bp_max is not None)
+    tab = tab if tab in FILTER_TABS else "floors"
+    t.append("FILTER", style="bold #D4AD72")
+    t.append(f"  {shown} / {total}  ", style="#AEA5B8")
+    t.append_text(_filter_tab_bar(tab))
+    if active:
+        t.append(" ")
+        t.append(" reset ", style=click("screen.score_clear()", "bold reverse #B04A4A"))
+    t.append("\n")
+
+    cw = max(24, col_width)
+    if tab == "tips":
+        t.append_text(_filter_tips_panel(cw))
+        return t
+
+    if not ok:
+        t.append("  no scored groups yet — run F / Scan f3\n", style="#8A8294")
+        return t
+
+    # bar_width kept for call-site compat; band sizes itself from col_width.
+    _ = bar_width
+    los = [r.est - 2 * r.se for r in ok]
+    zs = [r.z for r in ok]
+    snps = [float(r.snps) for r in ok]
+    ns = [float(max(1, r.n)) for r in ok]
+    ses = [r.se for r in ok if r.se > 0]
+
+    left = [
+        Text("floors", style="bold #8A8294"),
+        _filter_band_row(label="lo", axis="lo", vmin=min(los), vmax=max(los),
+                         value=lo_min, fmt=fmt_lo, weak="far", strong="close",
+                         mode="floor", col_width=cw),
+        _filter_band_row(label="Z", axis="z", vmin=min(zs), vmax=max(zs),
+                         value=z_min, fmt=lambda v: f"{v:.1f}",
+                         weak="weak", strong="sharp", mode="floor", col_width=cw),
+        _filter_band_row(label="SNP", axis="snp", vmin=min(snps), vmax=max(snps),
+                         value=float(snp_min) if snp_min is not None else None,
+                         fmt=lambda v: _snp(int(v)),
+                         weak="thin", strong="dense", mode="floor", col_width=cw),
+        _filter_band_row(label="n", axis="n", vmin=min(ns), vmax=max(ns),
+                         value=float(n_min) if n_min is not None else None,
+                         fmt=lambda v: f"{int(round(v))}",
+                         weak="small", strong="large", mode="floor", col_width=cw),
+    ]
+
+    right: list[Text] = [Text("context", style="bold #8A8294")]
+    if ses:
+        right.append(_filter_band_row(
+            label="SE", axis="se", vmin=min(ses), vmax=max(ses),
+            value=se_max, fmt=lambda v: f"{v:.4f}",
+            weak="tight", strong="noisy", mode="ceil", col_width=cw))
+    else:
+        right.append(Text("SE   (n/a)", style="#5A5361"))
+    right.append(_filter_chip_row("Y", [
+        ("all", "all", y_mode == "all", "screen.score_y('all')"),
+        ("line", "on-line", y_mode == "line", "screen.score_y('line')"),
+        ("same", "same", y_mode == "same", "screen.score_y('same')"),
+    ], col_width=cw))
+    right.append(_filter_chip_row("map", [
+        ("any", "any", not coords_only, "screen.score_coords(False)"),
+        ("xy", "xy", coords_only, "screen.score_coords(True)"),
+    ], col_width=cw))
+    if bp_values:
+        right.append(_filter_band_row(
+            label="age", axis="age", vmin=0.0, vmax=max(bp_values),
+            value=bp_max, fmt=lambda v: f"{int(round(v))}BP",
+            weak="now", strong="old", mode="ceil", col_width=cw))
+    else:
+        right.append(Text("age  (n/a)", style="#5A5361"))
+
+    for i in range(max(len(left), len(right))):
+        L = left[i] if i < len(left) else Text()
+        R = right[i] if i < len(right) else Text()
+        t.append_text(_pad_col(L, cw))
+        t.append("│ ", style="#5A5361")
+        t.append_text(_pad_col(R, cw))
+        t.append("\n")
+    return t
 
 
 CARD_W = 52
@@ -204,13 +521,14 @@ def group_prompt(g: Group, r: F3 | None, hit: Hit | None, rank: float | None,
         bar, bsty = _bar(rank)
         num = f"{place}" if place is not None else "·"
         name = fit(g.name, 22)
+        lo_s = fmt_lo(lo)
         t.append(f"{num:>2} ", style=MUTED)
         t.append(f"{mark} ", style=msty)
         t.append(f"{name:<22} ", style="bold")
         if decide == "lo":
-            t.append(f"⟦lo {lo:.4f}⟧ ", style=ACCENT)
+            t.append(f"⟦lo {lo_s}⟧ ", style=ACCENT)
         else:
-            t.append(f"lo {lo:.4f} ", style=MUTED)
+            t.append(f"lo {lo_s} ", style=MUTED)
         if decide == "Z":
             t.append(f"⟦Z {r.z:.1f}⟧ ", style=ACCENT)
         if decide == "SNP":
@@ -292,19 +610,31 @@ def _paint_bits(name: str, paint: dict | None) -> str:
     return " · ".join(bits)
 
 
+CARD_TABS = ("our", "catalog", "summary")
+
+
+def card_tab_bar(tab: str) -> Text:
+    t = Text(no_wrap=True)
+    for key, lab in (("our", "OUR"), ("catalog", "CATALOG"), ("summary", "SUMMARY")):
+        style = "bold reverse #D4AD72" if tab == key else "#AEA5B8"
+        t.append(f" {lab} ", style=click(f"screen.card_tab({key!r})", style))
+        t.append(" ")
+    return t
+
+
 def _our_block(d: Text, r: F3 | None, hit: Hit | None, tip: str | None,
                name: str, n: int, qpadm: list | None, paint: dict | None,
                *, place: int | None, ok_total: int, decide: str,
                rank: float | None) -> None:
-    _sec(d, "OUR")
     if r and r.ok:
         lo = r.est - 2 * r.se
         where = f"#{place} of {ok_total} · decided by {decide}" if place else f"decided by {decide}"
         _row(d, "rank", where)
         bar, _ = _bar(rank)
-        _row(d, "lo", f"{lo:.4f} = {r.est:.4f} − 2×{r.se:.4f}   {bar}".rstrip(),
+        _row(d, "lo",
+             f"{fmt_lo(lo)} = {r.est:.6f} − 2×{r.se:.6f}   {bar}".rstrip(),
              accent=(decide == "lo"))
-        _row(d, "f3", f"{r.est:.4f} ± {r.se:.4f}")
+        _row(d, "f3", f"{r.est:.6f} ± {r.se:.6f}")
         zline = f"{r.z:.1f}"
         if r.f4_z:
             zline = f"{r.z:.1f}            f4    {r.f4_z:.1f}"
@@ -335,54 +665,222 @@ def _our_block(d: Text, r: F3 | None, hit: Hit | None, tip: str | None,
         _row(d, "paint", pt)
 
 
-def _card_group(d: Text, g: Group, keep: list[Sample],
-                r: F3 | None, hit: Hit | None, tip: str | None,
-                qpadm: list | None, paint: dict | None,
-                place: int | None, ok_total: int, decide: str,
-                rank: float | None) -> None:
-    n = g.n if g.n else len(keep)
-    _our_block(d, r, hit, tip, g.name, n, qpadm, paint,
-               place=place, ok_total=ok_total, decide=decide, rank=rank)
+def _doi_row(d: Text, doi: str) -> None:
+    if not doi:
+        return
+    d.append(f" {'doi':<8} ", style=MUTED)
+    d.append(fit(doi, CARD_W - 18), style=BODY)
+    d.append("  ")
+    d.append("[open]", style=click(f"screen.open_doi({doi!r})", "bold #D4AD72"))
     d.append("\n")
-    place_s = place_of(g.locality, g.country)
-    span = date_range(keep, g.bp)
-    ep = EPOCH_LABEL.get(g.epoch, g.epoch)
-    if place_s or g.lat is not None or (span and span != "?") or ep:
-        _sec(d, "WHERE · WHEN")
-        _row(d, "place", place_s)
+
+
+def _catalog_pubs(d: Text, keep: list[Sample], *, sample: Sample | None = None) -> None:
+    if sample is not None:
+        pubs = _filled(_anno_get(sample, "pub") or sample.pub)
+        firsts = _filled(_anno_get(sample, "pub_first"))
+        dois = [_doi(_anno_get(sample, "doi"))] if _anno_get(sample, "doi") else []
+        repos = _filled(_anno_get(sample, "repo"))
+        ids = " · ".join(x for x in (
+            _anno_get(sample, "pid") and f"pid {_anno_get(sample, 'pid')}",
+            _anno_get(sample, "iid") and f"iid {_anno_get(sample, 'iid')}",
+        ) if x)
+    else:
+        pubs = _uniq([_anno_get(s, "pub") or s.pub for s in keep], 4)
+        firsts = _uniq([_anno_get(s, "pub_first") for s in keep], 3)
+        dois = []
+        for s in keep:
+            doi = _doi(_anno_get(s, "doi"))
+            if doi and doi not in dois:
+                dois.append(doi)
+            if len(dois) >= 4:
+                break
+        repos = _uniq([_anno_get(s, "repo") for s in keep], 2)
+        ids = ""
+    if not (pubs or firsts or dois or repos or ids):
+        return
+    _sec(d, "PUBLICATIONS", major=False)
+    if pubs:
+        _row(d, "pub", pubs, style=MUTED)
+    if firsts and firsts != pubs:
+        _row(d, "first", firsts, style=MUTED)
+    for doi in dois:
+        _doi_row(d, doi)
+    if repos:
+        _row(d, "repo", repos, style=MUTED)
+    if ids:
+        _row(d, "ids", ids, style=MUTED)
+
+
+def _catalog_qc_sample(d: Text, s: Sample) -> None:
+    hx = hapconx_label(s.hapconx) or _anno_get(s, "hapconx")
+    assess = _anno_get(s, "assess")
+    qc_keys = (
+        ("roh", "ROH"), ("damage", "damage"), ("sex_ratio", "sex ratio"),
+        ("angsd", "ANGSD"), ("family", "family"), ("libraries", "libraries"),
+        ("endogenous", "endogenous"), ("assess_warn", "warn"),
+    )
+    has = hx or assess or any(_anno_get(s, k) for k, _ in qc_keys)
+    if not has:
+        return
+    _sec(d, "QC", major=False)
+    if hx or assess:
+        _row(d, "hapConX", "  ".join(x for x in (hx, assess) if x), style=MUTED)
+    for key, lab in qc_keys:
+        v = _anno_get(s, key)
+        if v:
+            _row(d, lab, v, style=MUTED)
+
+
+def _catalog_qc_group(d: Text, keep: list[Sample]) -> None:
+    if not keep:
+        return
+    bits: list[str] = []
+    for s in keep[:6]:
+        hx = hapconx_label(s.hapconx) or _anno_get(s, "hapconx")
+        assess = _anno_get(s, "assess")
+        damage = _anno_get(s, "damage")
+        roh = _anno_get(s, "roh")
+        piece = " · ".join(x for x in (assess, hx and f"hapConX {hx}",
+                                       damage and f"dmg {damage}",
+                                       roh and f"ROH {roh}") if x)
+        if piece:
+            bits.append(f"{fit(s.gid, 10)}  {piece}")
+    if not bits:
+        return
+    _sec(d, "QC", major=False)
+    for line in bits[:6]:
+        d.append(" " + fit(line, CARD_W - 1) + "\n", style=MUTED)
+
+
+def _y_on_our(hit: Hit | None) -> bool:
+    return bool(hit and hit.relation in ON_BRANCH)
+
+
+def _catalog_people_row(d: Text, s: Sample, hit: Hit | None) -> None:
+    """One PEOPLE line; Our Y branch (same/ancestor/downstream) is highlighted."""
+    y = _anno_get(s, "y_term") or s.y or "—"
+    mt = _anno_get(s, "mt") or s.mt or "—"
+    cov = f"{s.coverage:.2f}×" if s.coverage else ""
+    assess = _anno_get(s, "assess")
+    on = _y_on_our(hit)
+    mark = REL_MARK.get(hit.relation, "·") if on and hit else " "
+    y_sty = REL_STYLE.get(hit.relation, BODY) if on and hit else BODY
+    line_sty = y_sty if on else BODY
+    d.append(" ")
+    d.append(f"{mark} ", style=y_sty if on else MUTED)
+    # gid · sex stay readable; Y carries the Our-branch accent
+    d.append(f"{fit(s.gid, 11)} ", style=line_sty)
+    if s.sex:
+        d.append(f"{s.sex} ", style=MUTED if not on else line_sty)
+    d.append(fit(y, 14), style=y_sty)
+    rest = "  ".join(x for x in (mt, cov, assess) if x)
+    if rest:
+        d.append("  " + fit(rest, max(8, CARD_W - 32)), style=MUTED if not on else line_sty)
+    d.append("\n")
+
+
+def _catalog_y_row(d: Text, keep: list[Sample], y_hits: dict[str, Hit] | None,
+                   group_ys: list[str] | None = None) -> None:
+    """GENETICS · Y — each haplogroup, Our-branch hits marked ●/▲/▼."""
+    # Prefer sample order; fall back to group.y labels.
+    entries: list[tuple[str, Hit | None]] = []
+    seen: set[str] = set()
+    for s in keep:
+        y = _filled(_anno_get(s, "y_term") or s.y)
+        if not y or y in seen:
+            continue
+        seen.add(y)
+        entries.append((y, (y_hits or {}).get(s.gid)))
+    if not entries and group_ys:
+        for y in group_ys:
+            y = _filled(y)
+            if y and y not in seen:
+                seen.add(y)
+                entries.append((y, None))
+    if not entries:
+        return
+    d.append(f" {'Y':<8} ", style=MUTED)
+    room = CARD_W - 10
+    used = 0
+    for i, (y, hit) in enumerate(entries[:8]):
+        on = _y_on_our(hit)
+        mark = REL_MARK.get(hit.relation, "") if on and hit else ""
+        piece = f"{mark}{y}" if mark else y
+        sep = ", " if i else ""
+        need = len(sep) + len(piece)
+        if used and used + need > room:
+            d.append("…", style=MUTED)
+            break
+        if sep:
+            d.append(sep, style=BODY)
+            used += len(sep)
+        sty = REL_STYLE.get(hit.relation, BODY) if on and hit else BODY
+        d.append(piece, style=sty)
+        used += len(piece)
+    d.append("\n")
+
+
+def _catalog_group(d: Text, g: Group, keep: list[Sample],
+                   *, y_hits: dict[str, Hit] | None = None) -> None:
+    # 1 PLACE
+    country = _filled(g.country)
+    site = _filled(g.locality)
+    if country or site or g.lat is not None:
+        _sec(d, "PLACE")
+        _row(d, "country", country)
+        _row(d, "site", site)
         if g.lat is not None and g.lon is not None:
             _row(d, "coord", f"{g.lat:.2f} N  {g.lon:.2f} E")
-        if span and span != "?":
-            _row(d, "date", span)
-        if ep:
-            _row(d, "era", ep)
         d.append("\n")
-    ys = _uniq([_anno_get(s, "y_term") or s.y for s in keep] or g.y)
-    isos = _uniq([_anno_get(s, "y_isogg") or s.y_isogg for s in keep])
-    mts = _uniq([_anno_get(s, "mt") or s.mt for s in keep] or g.mt)
-    if ys or mts:
-        _sec(d, "GENETICS")
-        if ys:
-            yline = ys
-            if isos and isos != ys:
-                yline += f" / {isos}"
-            _row(d, "Y", yline)
-        if mts:
-            _row(d, "mt", mts)
+    # 2 TIME
+    span = date_range(keep, g.bp)
+    ep = EPOCH_LABEL.get(g.epoch, g.epoch)
+    ages = _uniq([_anno_get(s, "age") for s in keep], 4)
+    methods = _uniq([_anno_get(s, "date_method") for s in keep], 2)
+    date_bits = []
+    for s in keep:
+        bp = _anno_get(s, "date")
+        if not bp:
+            continue
+        sd = _anno_get(s, "date_sd")
+        date_bits.append(f"{bp}" + (f" ± {sd}" if sd else "") + " BP")
+        if len(date_bits) >= 2:
+            break
+    if (span and span != "?") or ep or ages or methods or date_bits:
+        _sec(d, "TIME")
+        when = " · ".join(x for x in (span if span and span != "?" else "", ep) if x)
+        _row(d, "when", when)
+        _row(d, "age", ages)
+        if methods or date_bits:
+            _row(d, "date", " · ".join(x for x in (methods, " · ".join(date_bits)) if x))
         d.append("\n")
+    # 3 PEOPLE — Our Y branch highlighted
     if keep:
-        _sec(d, f"PEOPLE · {len(keep)}")
+        on_n = sum(1 for s in keep if _y_on_our((y_hits or {}).get(s.gid)))
+        title = f"PEOPLE · {len(keep)}"
+        if on_n:
+            title += f" · {on_n} on Our Y"
+        _sec(d, title)
         for s in keep[:8]:
-            y = _anno_get(s, "y_term") or s.y or "—"
-            mt = _anno_get(s, "mt") or s.mt or "—"
-            cov = f"{s.coverage:.2f}×" if s.coverage else ""
-            assess = _anno_get(s, "assess")
-            bits = [fit(s.gid, 12), s.sex or "", y, mt, cov, assess]
-            d.append(" " + fit("  ".join(x for x in bits if x), CARD_W - 1) + "\n",
-                     style=BODY)
+            _catalog_people_row(d, s, (y_hits or {}).get(s.gid))
         if len(keep) > 8:
             _row(d, "…", f"{len(keep) - 8} more", style=MUTED)
         d.append("\n")
+    # 4 GENETICS
+    isos = _uniq([_anno_get(s, "y_isogg") or s.y_isogg for s in keep])
+    mts = _uniq([_anno_get(s, "mt") or s.mt for s in keep] or g.mt)
+    has_y = any(_filled(_anno_get(s, "y_term") or s.y) for s in keep) or bool(g.y)
+    if has_y or mts:
+        _sec(d, "GENETICS")
+        if has_y:
+            _catalog_y_row(d, keep, y_hits, group_ys=list(g.y or []))
+            if isos:
+                _row(d, "ISOGG", isos, style=MUTED)
+        if mts:
+            _row(d, "mt", mts)
+        d.append("\n")
+    # 5 DATA
     snps = [float(s.snps) for s in keep if s.snps]
     covs = [s.coverage for s in keep if s.coverage]
     types = _uniq([_anno_get(s, "data_type") for s in keep], 3)
@@ -408,74 +906,88 @@ def _card_group(d: Text, g: Group, keep: list[Sample],
         if counts:
             _row(d, "Pass", "  ".join(f"{k} {n}" for k, n in counts.items()), style=MUTED)
         d.append("\n")
-    pubs = _uniq([_anno_get(s, "pub") or s.pub for s in keep], 4)
-    dois = _uniq([_doi(_anno_get(s, "doi")) for s in keep], 2)
-    repos = _uniq([_anno_get(s, "repo") for s in keep], 2)
-    if pubs or dois or repos:
-        _sec(d, "SOURCE", major=False)
-        if pubs:
-            _row(d, "pub", pubs, style=MUTED)
-        if dois:
-            _row(d, "doi", dois, style=MUTED)
-        if repos:
-            _row(d, "repo", repos, style=MUTED)
+    # 6 QC
+    _catalog_qc_group(d, keep)
+    if keep:
+        d.append("\n")
+    # 7 PUBLICATIONS
+    _catalog_pubs(d, keep)
 
 
-def _card_person(d: Text, s: Sample, r: F3 | None, hit: Hit | None,
-                 tip: str | None, qpadm: list | None, paint: dict | None,
-                 place: int | None, ok_total: int, decide: str,
-                 rank: float | None) -> None:
-    _our_block(d, r, hit, tip, s.gid, 1, qpadm, paint,
-               place=place, ok_total=ok_total, decide=decide, rank=rank)
-    d.append("\n")
-    _sec(d, "WHO")
+def _catalog_person(d: Text, s: Sample, *, hit: Hit | None = None) -> None:
+    # 1 PLACE
+    country = _filled(s.country)
+    site = _filled(s.locality)
+    if country or site or s.lat is not None:
+        _sec(d, "PLACE")
+        _row(d, "country", country)
+        _row(d, "site", site)
+        if s.lat is not None and s.lon is not None:
+            _row(d, "coord", f"{s.lat} N  {s.lon} E")
+        d.append("\n")
+    # 2 TIME
+    span = _filled(s.date_span) or _anno_get(s, "date_full")
+    method = _anno_get(s, "date_method")
+    date_bp = _anno_get(s, "date")
+    date_sd = _anno_get(s, "date_sd")
+    age = _anno_get(s, "age")
+    if span or method or date_bp or age:
+        _sec(d, "TIME")
+        _row(d, "when", span)
+        _row(d, "age", age)
+        if date_bp:
+            _row(d, "date",
+                 f"{method + ' · ' if method else ''}{date_bp}"
+                 + (f" ± {date_sd} BP" if date_sd else " BP"))
+        elif method:
+            _row(d, "method", method)
+        d.append("\n")
+    # 3 WHO (person)
+    on = _y_on_our(hit)
+    who_title = "WHO · on Our Y" if on else "WHO"
+    _sec(d, who_title)
     grp = _anno_get(s, "group") or s.group
     _row(d, "group", grp)
     who = " · ".join(x for x in (_anno_get(s, "sex") or s.sex,
                                  _anno_get(s, "skel"),
                                  _anno_get(s, "skel_code")) if x)
     _row(d, "sex", who)
-    _row(d, "age", _anno_get(s, "age"))
-    y_bits = []
+    _row(d, "age", age)
+    d.append("\n")
+    # 4 GENETICS — Our Y highlighted
     term = _anno_get(s, "y_term") or s.y
     iso = _anno_get(s, "y_isogg") or s.y_isogg
     man = _anno_get(s, "y_manual")
-    if term:
-        y_bits.append(term)
-    if iso and iso != term:
-        y_bits.append(f"ISOGG {iso}")
-    if man and man not in (term, iso):
-        y_bits.append(f"manual {man}")
-    if y_bits:
-        _row(d, "Y", " · ".join(y_bits))
     mt = _anno_get(s, "mt") or s.mt
-    if mt:
-        mt_line = mt
-        if _anno_get(s, "mt_cov"):
-            mt_line += f"  {_anno_get(s, 'mt_cov')}×"
-        if _anno_get(s, "mt_match"):
-            mt_line += f"  match {_anno_get(s, 'mt_match')}"
-        _row(d, "mt", mt_line)
-    d.append("\n")
-    place_s = place_of(s.locality, s.country)
-    span = _filled(s.date_span) or _anno_get(s, "date_full")
-    method = _anno_get(s, "date_method")
-    date_bp = _anno_get(s, "date")
-    date_sd = _anno_get(s, "date_sd")
-    if place_s or span or method or date_bp:
-        _sec(d, "WHERE · WHEN")
-        _row(d, "place", place_s)
-        if s.lat is not None and s.lon is not None:
-            _row(d, "coord", f"{s.lat} N  {s.lon} E")
-        if span:
-            _row(d, "date", span)
-        if date_bp:
-            _row(d, "direct",
-                 f"{method + ' · ' if method else ''}{date_bp}"
-                 + (f" ± {date_sd} BP" if date_sd else " BP"))
-        elif method:
-            _row(d, "method", method)
+    if term or iso or man or mt:
+        _sec(d, "GENETICS")
+        if term or iso or man:
+            d.append(f" {'Y':<8} ", style=MUTED)
+            if term:
+                if on and hit:
+                    mark = REL_MARK.get(hit.relation, "·")
+                    d.append(f"{mark} {term}", style=REL_STYLE.get(hit.relation, ACCENT))
+                    if hit.node and hit.node != term:
+                        d.append(f" · {hit.node}", style=MUTED)
+                else:
+                    d.append(term, style=BODY)
+            bits = []
+            if iso and iso != term:
+                bits.append(f"ISOGG {iso}")
+            if man and man not in (term, iso):
+                bits.append(f"manual {man}")
+            if bits:
+                d.append(" · " + " · ".join(bits), style=MUTED)
+            d.append("\n")
+        if mt:
+            mt_line = mt
+            if _anno_get(s, "mt_cov"):
+                mt_line += f"  {_anno_get(s, 'mt_cov')}×"
+            if _anno_get(s, "mt_match"):
+                mt_line += f"  match {_anno_get(s, 'mt_match')}"
+            _row(d, "mt", mt_line)
         d.append("\n")
+    # 5 DATA
     _sec(d, "DATA", major=False)
     if s.snps or s.coverage:
         bits = []
@@ -508,43 +1020,140 @@ def _card_person(d: Text, s: Sample, r: F3 | None, hit: Hit | None,
     if pull:
         _row(d, "pulldown", pull, style=MUTED)
     d.append("\n")
-    hx = hapconx_label(s.hapconx) or _anno_get(s, "hapconx")
-    assess = _anno_get(s, "assess")
-    qc_keys = (
-        ("roh", "ROH"), ("damage", "damage"), ("sex_ratio", "sex ratio"),
-        ("angsd", "ANGSD"), ("family", "family"), ("libraries", "libraries"),
-        ("endogenous", "endogenous"), ("assess_warn", "warn"),
-    )
-    has_qc = hx or assess or any(_anno_get(s, k) for k, _ in qc_keys)
-    if has_qc:
-        _sec(d, "QC", major=False)
-        if hx or assess:
-            _row(d, "hapConX", "  ".join(x for x in (hx, assess) if x), style=MUTED)
-        for key, lab in qc_keys:
-            v = _anno_get(s, key)
-            if v:
-                _row(d, lab, v, style=MUTED)
-        d.append("\n")
-    pub = _anno_get(s, "pub") or s.pub
-    first = _anno_get(s, "pub_first")
-    doi = _doi(_anno_get(s, "doi"))
-    repo = _anno_get(s, "repo")
-    ids = " · ".join(x for x in (
-        _anno_get(s, "pid") and f"pid {_anno_get(s, 'pid')}",
-        _anno_get(s, "iid") and f"iid {_anno_get(s, 'iid')}",
-    ) if x)
-    if pub or first or doi or repo or ids:
-        _sec(d, "SOURCE", major=False)
+    # 6 QC
+    _catalog_qc_sample(d, s)
+    d.append("\n")
+    # 7 PUBLICATIONS
+    _catalog_pubs(d, [], sample=s)
+
+
+def summary_prompt(g: Group, keep: list[Sample], *, sample: Sample | None = None) -> str:
+    """Scientific Ask prompt for SUMMARY — ANNO facts only as grounding."""
+    subject = sample.gid if sample is not None else g.name
+    lines = [
+        "Write a scientific brief on this Allen Ancient DNA Resource (AADR) assemblage.",
+        "Use an academic tone. Structure the answer as:",
+        "1) What this assemblage is (place, date, archaeological context).",
+        "2) Key published studies that report or analyse these genomes — with specifics.",
+        "3) What is new, contested, or still open — with details.",
+        "Do not invent sample IDs, DOIs, or dates beyond the facts below.",
+        "",
+        f"Subject: {subject}",
+    ]
+    if sample is not None:
+        lines.append(f"Group ID: {_anno_get(sample, 'group') or sample.group or g.name}")
+        lines.append(f"Country: {_filled(sample.country) or '—'}")
+        lines.append(f"Locality: {_filled(sample.locality) or '—'}")
+        if sample.lat is not None and sample.lon is not None:
+            lines.append(f"Coordinates: {sample.lat}, {sample.lon}")
+        span = _filled(sample.date_span) or _anno_get(sample, "date_full")
+        if span:
+            lines.append(f"Date: {span}")
+        bp = _anno_get(sample, "date")
+        sd = _anno_get(sample, "date_sd")
+        method = _anno_get(sample, "date_method")
+        if bp:
+            lines.append(f"Date BP: {bp}" + (f" ± {sd}" if sd else "")
+                         + (f" ({method})" if method else ""))
+        age = _anno_get(sample, "age")
+        if age:
+            lines.append(f"Age at death: {age}")
+        y = _anno_get(sample, "y_term") or sample.y
+        iso = _anno_get(sample, "y_isogg") or sample.y_isogg
+        mt = _anno_get(sample, "mt") or sample.mt
+        if y or iso:
+            lines.append(f"Y: {y or '—'}" + (f" / ISOGG {iso}" if iso and iso != y else ""))
+        if mt:
+            lines.append(f"mt: {mt}")
+        pub = _anno_get(sample, "pub") or sample.pub
+        first = _anno_get(sample, "pub_first")
+        doi = _doi(_anno_get(sample, "doi"))
+        repo = _anno_get(sample, "repo")
         if pub:
-            _row(d, "pub", pub, style=MUTED)
+            lines.append(f"Publication: {pub}")
         if first and first != pub:
-            _row(d, "first", first, style=MUTED)
+            lines.append(f"First publication: {first}")
         if doi:
-            _row(d, "doi", doi, style=MUTED)
+            lines.append(f"DOI: {doi}")
         if repo:
-            _row(d, "repo", repo, style=MUTED)
-        if ids:
-            _row(d, "ids", ids, style=MUTED)
+            lines.append(f"Repository: {repo}")
+    else:
+        lines.append(f"Country: {_filled(g.country) or '—'}")
+        lines.append(f"Locality: {_filled(g.locality) or '—'}")
+        if g.lat is not None and g.lon is not None:
+            lines.append(f"Coordinates: {g.lat:.4f}, {g.lon:.4f}")
+        span = date_range(keep, g.bp)
+        ep = EPOCH_LABEL.get(g.epoch, g.epoch)
+        if span and span != "?":
+            lines.append(f"Date span: {span}")
+        if ep:
+            lines.append(f"Epoch: {ep}")
+        ys = _uniq([_anno_get(s, "y_term") or s.y for s in keep] or g.y)
+        mts = _uniq([_anno_get(s, "mt") or s.mt for s in keep] or g.mt)
+        if ys:
+            lines.append(f"Y haplogroups: {ys}")
+        if mts:
+            lines.append(f"mt haplogroups: {mts}")
+        lines.append(f"Individuals (kept): {len(keep)}")
+        for s in keep[:12]:
+            bits = [s.gid, s.sex or "", _anno_get(s, "y_term") or s.y or "",
+                    _anno_get(s, "mt") or s.mt or "",
+                    f"{s.coverage:.2f}×" if s.coverage else "",
+                    _anno_get(s, "pub") or s.pub or ""]
+            lines.append("- " + " · ".join(x for x in bits if x))
+        pubs = _uniq([_anno_get(s, "pub") or s.pub for s in keep], 6)
+        firsts = _uniq([_anno_get(s, "pub_first") for s in keep], 4)
+        dois = []
+        for s in keep:
+            doi = _doi(_anno_get(s, "doi"))
+            if doi and doi not in dois:
+                dois.append(doi)
+        repos = _uniq([_anno_get(s, "repo") for s in keep], 3)
+        if pubs:
+            lines.append(f"Publications: {pubs}")
+        if firsts:
+            lines.append(f"First publications: {firsts}")
+        if dois:
+            lines.append("DOIs: " + "; ".join(dois[:6]))
+        if repos:
+            lines.append(f"Repositories: {repos}")
+    return "\n".join(lines)
+
+
+def _summary_tab(d: Text, *,
+                 cache: dict | None,
+                 busy: bool,
+                 draft: str = "",
+                 model_hint: str = "") -> None:
+    if busy:
+        d.append(" Generating summary…\n", style=ACCENT)
+        if model_hint:
+            d.append(f" {model_hint}\n", style=MUTED)
+        if draft:
+            d.append("\n")
+            for line in draft.splitlines()[:40]:
+                d.append(f" {line}\n", style=BODY)
+        return
+    if cache and (cache.get("text") or "").strip():
+        model = cache.get("model") or "model"
+        ts = (cache.get("ts") or "")[:10]
+        head = " · ".join(x for x in (model, ts, "from ANNO") if x)
+        d.append(f" {head}\n", style=MUTED)
+        d.append(" ")
+        d.append(" Refresh ", style=click("screen.ask_summary(True)", "bold reverse #D4AD72"))
+        d.append("\n\n", style=MUTED)
+        for line in str(cache.get("text") or "").splitlines():
+            d.append(f" {line}\n", style=BODY)
+        return
+    d.append(" No summary yet.\n\n", style=MUTED)
+    d.append(" ")
+    d.append(" Ask summary ", style=click("screen.ask_summary()", "bold reverse #D4AD72"))
+    d.append("  uses Chat model · scientific brief\n\n", style=MUTED)
+    d.append(" Prompt sketch (what we send):\n", style="#8A8294")
+    d.append("  · group + place/date/Y/mt from ANNO\n", style="#71697A")
+    d.append("  · pubs + DOIs\n", style="#71697A")
+    d.append("  · ask: what this assemblage is; key studies;\n", style="#71697A")
+    d.append("    what is new / contested — with details\n", style="#71697A")
 
 
 def card(g: Group | None, *, sample: Sample | None = None,
@@ -553,21 +1162,39 @@ def card(g: Group | None, *, sample: Sample | None = None,
          qpadm: list | None = None, paint: dict | None = None,
          result: F3 | None = None, place: int | None = None,
          ok_total: int = 0, decide: str = "lo",
-         rank: float | None = None) -> Text:
+         rank: float | None = None,
+         tab: str = "our",
+         summary: dict | None = None,
+         summary_busy: bool = False,
+         summary_draft: str = "",
+         summary_model: str = "",
+         y_hits: dict[str, Hit] | None = None) -> Text:
     d = Text()
     if g is None:
         d.append(" No selection.\n", style="#AEA5B8")
         return d
+    tab = tab if tab in CARD_TABS else "our"
+    # Tab bar lives outside the scroll (#card-tabs).
     keep: list[Sample] = []
     if cat:
         keep = [s for s in (cat.samples[i] for i in g.samples)
                 if s.keep or (questionable and s.questionable)]
-    if sample is not None:
-        _card_person(d, sample, result, hit, branch, qpadm, paint,
-                     place, ok_total, decide, rank)
-    else:
-        _card_group(d, g, keep, result, hit, branch, qpadm, paint,
-                    place, ok_total, decide, rank)
+    if tab == "summary":
+        _summary_tab(d, cache=summary, busy=summary_busy,
+                     draft=summary_draft, model_hint=summary_model)
+        return d
+    if tab == "catalog":
+        if sample is not None:
+            person_hit = hit or (y_hits or {}).get(sample.gid)
+            _catalog_person(d, sample, hit=person_hit)
+        else:
+            _catalog_group(d, g, keep, y_hits=y_hits)
+        return d
+    # OUR
+    name = sample.gid if sample is not None else g.name
+    n = 1 if sample is not None else (g.n if g.n else len(keep))
+    _our_block(d, result, hit, branch, name, n, qpadm, paint,
+               place=place, ok_total=ok_total, decide=decide, rank=rank)
     return d
 
 
@@ -575,9 +1202,47 @@ def _rank_color(p: float) -> str:
     return f"color({GRADIENT[min(int(p / 100 * len(GRADIENT)), len(GRADIENT) - 1)]})"
 
 
+def culture_map_label(group_name: str) -> str:
+    """Short culture name for map labels: Srubnaya, Yamnaya — not Russia_…_MLBA."""
+    raw = (group_name or "").strip()
+    if not raw:
+        return ""
+    named = extract_culture(raw)
+    # lore_codex hits look like "Srubnaya (Bronze Age)"
+    if " (" in named and not named.startswith(("Archaeological",)):
+        short = named.split(" (", 1)[0].strip()
+        if short and " · " not in short:
+            return fit(short, 14)
+    base = raw.split(".", 1)[0]
+    parts = [p for p in re.split(r"[_\s]+", base) if p]
+    if len(parts) <= 1:
+        return ""
+    # Drop country (first token), epoch/QC tokens; keep culture-ish remainder.
+    body = []
+    for p in parts[1:]:
+        low = p.lower()
+        if low in _MAP_EPOCH_TOK or low in _MAP_SKIP_TOK:
+            continue
+        if re.fullmatch(r"\d+(\.\d+)?", p):
+            continue
+        body.append(p)
+    if not body:
+        return ""
+    # Prefer a multi-word culture if two tokens look cultural (CordedWare already one).
+    label = body[0]
+    if len(body) >= 2 and body[1][0:1].isupper() and body[1].lower() not in _MAP_EPOCH_TOK:
+        # e.g. Central_Steppe → keep first meaningful only to avoid clutter
+        pass
+    # CamelCase / glued: CordedWare → Corded Ware for readability? Keep compact.
+    label = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label)
+    return fit(label, 14)
+
+
 def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
              selected: str | None, title: str,
-             world: bool, cols: int, rows: int) -> Text:
+             world: bool, cols: int, rows: int,
+             *, culture_labels: bool = True,
+             seshat_anchors: list[dict] | None = None) -> Text:
     doc = _Doc()
     doc.t = Text(no_wrap=True, overflow="crop")
     points = []
@@ -594,10 +1259,54 @@ def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float
             color, glyph = "#5A7CB3", None
         else:
             continue
-        points.append({"id": g.name, "lon": g.lon, "lat": g.lat, "color": color,
-                       "glyph": glyph, "label": g.name.split("_")[0]})
-    scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows, selected=selected)
+        cult = culture_map_label(g.name)
+        points.append({
+            "id": g.name, "lon": g.lon, "lat": g.lat, "color": color,
+            "glyph": glyph,
+            "label": cult or g.name.split("_")[0],
+            "culture": cult,
+            "rank": float(p) if p is not None else -1.0,
+        })
+    scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows,
+                selected=selected, culture_labels=culture_labels,
+                anchors=seshat_anchors)
     return doc.t
+
+
+def seshat_layer_for_groups(groups: list[Group], *, epoch: str,
+                            store=None, limit: int = 8) -> list[dict]:
+    """Build Seshat map anchors from visible AADR groups + epoch year."""
+    if not groups or epoch in ("", "all"):
+        return []
+    try:
+        from ...core.seshat import load_index, map_anchors
+    except Exception:  # noqa: BLE001
+        return []
+    idx = load_index(store=store)
+    if idx is None:
+        return []
+    hints: list[str] = []
+    aadr_xy: list[tuple[float, float, str]] = []
+    for g in groups:
+        cult = culture_map_label(g.name)
+        blob = " ".join(x for x in (g.name, g.country, g.locality, cult) if x)
+        hints.append(g.name)
+        if g.country:
+            hints.append(g.country)
+        if cult:
+            hints.append(cult)
+        if g.lat is not None and g.lon is not None and not (g.lat == 0 and g.lon == 0):
+            aadr_xy.append((float(g.lon), float(g.lat), blob))
+    # Cap hint noise — match() tokenizes; unique keep order.
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for h in hints:
+        if h and h not in seen:
+            seen.add(h)
+            uniq.append(h)
+        if len(uniq) >= 40:
+            break
+    return map_anchors(idx, hints=uniq, epoch=epoch, aadr_xy=aadr_xy, limit=limit)
 
 
 def draw_y_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],

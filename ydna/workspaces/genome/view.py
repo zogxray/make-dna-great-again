@@ -108,9 +108,19 @@ class ChromView(ScrollView, can_focus=True):
                 return idx
         return min(self.cursor, max(0, len(self.rows) - 1))
 
+    def _ensure_calls(self, name: str):
+        """Load call arrays for one chrom when expanding / filtering."""
+        assert self.genome
+        c = self.genome.chroms[name]
+        if c.calls_loaded:
+            return c
+        from ...core import genome_db
+        return genome_db.ensure_chrom(self.genome, name)
+
     def goto_snp(self, chrom: str, i: int) -> None:
         if not self.genome or chrom not in self.genome.chroms:
             return
+        self._ensure_calls(chrom)
         if chrom not in self.expanded:
             self.expanded.add(chrom)
             self.rebuild()
@@ -147,18 +157,41 @@ class ChromView(ScrollView, can_focus=True):
         matches = 0
         q = self.filter.casefold()
         if self.genome:
+            # SNP text filter: ask DuckDB which chroms have hits so we don't load all.
+            filter_chroms: set[str] | None = None
+            if q:
+                from ...core import genome_db
+                try:
+                    filter_chroms = set(genome_db.chroms_matching_query(self.genome.path, q))
+                except Exception:  # noqa: BLE001
+                    filter_chroms = None
             for name, c in self.genome.chroms.items():
                 chrom_hit = bool(q) and q in name.casefold()
-                snps = self._snp_hits(c, q) if q else list(range(c.n))
-                if q and not chrom_hit and not snps:
-                    continue
-                if chrom_hit and not snps:
-                    snps = list(range(c.n))
+                open_ = name in self.expanded or (bool(q) and (chrom_hit or (
+                    filter_chroms is not None and name in filter_chroms)))
+                if open_ or (q and filter_chroms is None and not chrom_hit):
+                    # Need call arrays for SNP rows / in-memory scan fallback.
+                    try:
+                        c = self._ensure_calls(name)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if q and not chrom_hit:
+                    if filter_chroms is not None and name not in filter_chroms and not c.calls_loaded:
+                        continue
+                    snps = self._snp_hits(c, q) if c.calls_loaded else []
+                    if not snps:
+                        continue
+                elif q and chrom_hit:
+                    snps = self._snp_hits(c, q) if c.calls_loaded else list(range(c.n))
+                    if not snps:
+                        snps = list(range(c.n))
+                else:
+                    snps = list(range(c.n)) if open_ and c.calls_loaded else (
+                        list(range(c.n)) if open_ else [])
                 matches += len(snps) if q else 0
                 if name == keep:
                     target = len(rows)
                 rows.append((HEAD, name, 0))
-                open_ = name in self.expanded or bool(q)
                 if open_:
                     if name not in self.details:
                         b = self.genome.chrom_build(name)
@@ -166,7 +199,8 @@ class ChromView(ScrollView, can_focus=True):
                         self.details[name] = chrom_detail(
                             c, b, self.link, votes=votes)
                     rows.extend((INFO, name, i) for i in range(len(self.details[name])))
-                    rows.extend((SNP, name, i) for i in snps)
+                    if c.calls_loaded:
+                        rows.extend((SNP, name, i) for i in snps)
         self.filter_matches = matches
         self.rows = rows
         self.cursor = target if keep else min(self.cursor, max(0, len(rows) - 1))
@@ -289,6 +323,12 @@ class ChromView(ScrollView, can_focus=True):
     def _set(self, name: str, expand: bool) -> None:
         if (name in self.expanded) == expand:
             return
+        if expand:
+            try:
+                self._ensure_calls(name)
+            except Exception:  # noqa: BLE001
+                pass
+            self.details.pop(name, None)  # rebuild INFO with genotypes once loaded
         (self.expanded.add if expand else self.expanded.discard)(name)
         self.rebuild(keep=name)
         self.ensure_visible()

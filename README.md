@@ -7,9 +7,9 @@ factory. You keep the data, you choose what to run, screens stay inspectable.
 
 Intended reader: you already know haplogroups and PCA-ish ancestry talk, you are
 tired of black-box consumer sites, but you are not living in R/`admixture` yet.
-Same guide lives inside the app as **F8 Help** (flow & UX; light on internals).
+Same guide lives inside the app as **F9 Help** (flow & UX; light on internals).
 
-Modes: **F1 Genome → F2 Data → F3 Tree → F4 PGS → F5 Reference → F6 Chat → F7 Jobs → F8 Help**.
+Modes: **F1 Genome → F2 Data → F3 Tree → F4 PGS → F5 Reference → F6 Chat → F7 Jobs → F8 Samples → F9 Help**.
 
 ## Requirements
 
@@ -62,7 +62,7 @@ ydna --input /path/to/discover/haplogroups --genome ~/kit.txt
 - `--genome FILE` — preload into **F1** (repeatable)
 - `--input DIR` — Discover folder (else path from **F2**)
 
-Quit with **Q** (confirm). App state lives in
+Quit with **Q** (confirm → shutdown progress in the UI, then exit). App state lives in
 `~/.config/make-dna-great-again/ydna.duckdb`
 (legacy `~/.config/ydna-explorer` is renamed on first launch).
 
@@ -78,7 +78,8 @@ that window or `kill <pid>`. You do not need to touch database files.
 5. **F5 Reference** — f3 / ancients (or 1000G) against AADR.
 6. **F6 Chat** — Gemini (key in F2).
 7. **F7 Jobs** — watch long downloads / Discover / PGS / Gemini.
-8. **F8 Help** — this guide inside the TUI.
+8. **F8 Samples** — Open Humans public kits (filter / get missing / DuckDB).
+9. **F9 Help** — this guide inside the TUI.
 
 You can skip screens. Nothing forces a “full report”.
 
@@ -108,6 +109,8 @@ Point the app at reference datasets; download or verify in the background.
 | FTDNA Discover | **P** to a folder (optional seed from `ftdna_downloader.py`). Missing nodes: staged fetch **1–5** / **D** below, or **D** / Shift+D in F3. |
 | FTDNA Haplotree | **D** in F2, or **P** to an existing JSON. |
 | AADR / 1000 Genomes | **D** or **P**. Large downloads. |
+| Seshat · Polaris | **D** — polity / religion codes (~3 MB Excel, CC BY-NC). |
+| Open Humans | **F8** (or F2 **B**) is the catalog; **D on a row** downloads that genome (any compat) → DuckDB (+ READY → genome). **V**: API new + missing under filter. |
 | PGS models | **D** in F2 (needs F1 genome for coverage), or **P** to an existing catalog folder. |
 | Gemini | **P** (key in DuckDB) or `GEMINI_API_KEY`. |
 
@@ -126,9 +129,10 @@ Browse the FTDNA Y tree with **your** path marked.
 
 On enter: load tree (cached after first build), then **Our Y** (saved per genome;
 recalculated when inputs change). The loader waits for both so the tree does not
-flash without you.
+flash without you. Our Y tip is scored on the **haplotree** (named SNPs + hg38
+position); Discover cards are content, not the tip picker.
 
-- **O** — Our Y tip · `/` search · **F** filter · **S** sort · **B** rich branches  
+- **O** — Our Y tip (cycles tied / near-tie forks; `?` uncertain, `○` pruned) · `/` search · **F** filter · **S** sort · **B** rich branches  
 - Card tabs: overview, variants, ancient, map… Discover pages load on demand  
 - **D** / Shift+D — fetch missing Discover JSON (needs F2 path)  
 
@@ -180,7 +184,12 @@ Tasks still **start** from F2/F3/F4/F6; F7 watches them. **P** pause/resume,
 **A** pause all, **C** cancel (or drop a queued item), **X** clear finished.
 Discover stages 1–5 on F2 enqueue onto the same slot when one is already active.
 
-## F8 · Help
+## F8 · Samples
+
+Open Humans catalog is the mode itself (no landing / B). **D** on a row downloads
+that genome; ● READY / ○ NEED are labels — NEED is not blocked. **V** = API new + missing.
+
+## F9 · Help
 
 In-app copy of this flow guide. Scroll with ↑↓ / PgUp/Dn.
 
@@ -195,14 +204,15 @@ In-app copy of this flow guide. Scroll with ↑↓ / PgUp/Dn.
 | F5 | How do I sit among ancients / reference pops (f3 + Y tags)? |
 | F6 | Can I think out loud with a model, with notes beside? |
 | F7 | What is running in the background right now? |
-| F8 | What is the intended path through the app? |
+| F8 | Which public samples do I have / still need? |
+| F9 | What is the intended path through the app? |
 
 Everything important stays on your machine. Slow first opens are usually “build
 or unpack a cache once”; warm revisits should feel light.
 
 ## Keys (common)
 
-- **F1–F8** — switch mode  
+- **F1–F9** — switch mode  
 - **Tab** — next panel  
 - **Q** — quit  
 - Mode-specific hints sit on the bottom key bar of each screen  
@@ -214,5 +224,16 @@ source .venv/bin/activate
 pip install -e .
 python -m ydna --genome /path/to/kit.txt
 ```
+
+**Local mode-load profile** (uses your private `data/`; **close the TUI first**):
+
+```bash
+pip install -e '.[dev]'
+python -m ydna.bench.mode_load              # F1→F9 wall times + UI-thread cProfile
+python -m ydna.bench.mode_load --deep-only  # profile catalog/tree/AADR/PGS loaders only
+MDGA_LOCAL_BENCH=1 pytest tests/test_mode_load_profile.py -s
+```
+
+Reports → `~/.cache/make-dna-great-again/bench/` (not `data/`). Summaries avoid kit paths.
 
 Package layout: `ydna/` (app + workspaces + core). Entry: `ydna` → `ydna.__main__:main`.

@@ -10,8 +10,32 @@ from typing import Any
 from . import db
 
 
-def seed_menus(con=None) -> None:
-    """Системные вкладки: curated / catalog / diseases / low cov / too few."""
+_MENUS_SEED = "menus_seed_v1"  # bump when CURATED / system tabs change
+
+
+def _menus_seed_sig() -> str:
+    from .pgs import CURATED
+    return f"{_MENUS_SEED}:{len(CURATED)}"
+
+
+def menus_seeded(con=None) -> bool:
+    """True if system tabs + curated items already match current CURATED."""
+    sig = _menus_seed_sig()
+    if con is not None:
+        row = con.execute(
+            "SELECT value FROM pgs.meta WHERE key = 'menus_seed'"
+        ).fetchone()
+        return bool(row and row[0] == sig)
+    row = db.fetchone("SELECT value FROM pgs.meta WHERE key = 'menus_seed'")
+    return bool(row and row[0] == sig)
+
+
+def seed_menus(con=None, *, force: bool = False) -> None:
+    """Системные вкладки: curated / catalog / diseases / low cov / too few.
+
+    Idempotent: skips DELETE/INSERT when ``menus_seed`` meta already matches
+    current CURATED (F4 was rewriting ~100 curated rows on every open).
+    """
     from .pgs import CURATED
 
     # Короткие ярлыки: ряд вкладок должен влезать в узкую колонку MODELS (~46).
@@ -26,6 +50,7 @@ def seed_menus(con=None) -> None:
         (i, pid, label, theme)
         for i, (pid, theme, label) in enumerate(CURATED)
     ]
+    sig = _menus_seed_sig()
     sql_menus = """
         INSERT INTO pgs.menus (id, title, kind, sort_ord, active)
         VALUES (?, ?, ?, ?, ?)
@@ -35,22 +60,27 @@ def seed_menus(con=None) -> None:
             sort_ord = excluded.sort_ord,
             active = excluded.active
     """
-    if con is not None:
-        con.executemany(sql_menus, menus)
-        con.execute("DELETE FROM pgs.menu_items WHERE menu_id = 'curated'")
-        con.executemany("""
+    sql_meta = """
+        INSERT INTO pgs.meta (key, value) VALUES ('menus_seed', ?)
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value
+    """
+
+    def _write(c) -> None:
+        if not force and menus_seeded(c):
+            return
+        c.executemany(sql_menus, menus)
+        c.execute("DELETE FROM pgs.menu_items WHERE menu_id = 'curated'")
+        c.executemany("""
             INSERT INTO pgs.menu_items (menu_id, ord, pgs_id, label, theme)
             VALUES ('curated', ?, ?, ?, ?)
         """, items)
+        c.execute(sql_meta, [sig])
+
+    if con is not None:
+        _write(con)
     else:
         with db.locked():
-            c = db.connect()
-            c.executemany(sql_menus, menus)
-            c.execute("DELETE FROM pgs.menu_items WHERE menu_id = 'curated'")
-            c.executemany("""
-                INSERT INTO pgs.menu_items (menu_id, ord, pgs_id, label, theme)
-                VALUES ('curated', ?, ?, ?, ?)
-            """, items)
+            _write(db.connect())
 
 
 def model_count() -> int:

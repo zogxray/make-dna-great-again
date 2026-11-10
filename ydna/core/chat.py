@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -60,26 +61,75 @@ def _row_thread(row, *, messages: list[Message] | None = None,
     )
 
 
+def _pack_messages(messages: list[Message]) -> str:
+    return json.dumps(
+        [
+            {
+                "role": m.role,
+                "text": m.text,
+                "at": m.at or now(),
+                "interaction_id": m.interaction_id,
+            }
+            for m in messages
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _unpack_messages(raw) -> list[Message] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, list):
+        return None
+    out: list[Message] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        out.append(Message(
+            role=str(item.get("role") or "user"),
+            text=str(item.get("text") or ""),
+            at=str(item.get("at") or now()),
+            interaction_id=item.get("interaction_id") or None,
+        ))
+    return out
+
+
+def _legacy_messages(tid: str) -> list[Message]:
+    from . import db
+
+    try:
+        msgs_rows = db.fetchall(
+            "SELECT role, text, created_at, interaction_id FROM chat.messages "
+            "WHERE thread_id = ? ORDER BY seq",
+            [tid],
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    return [
+        Message(role=r, text=t, at=a or now(), interaction_id=iid or None)
+        for r, t, a, iid in msgs_rows
+    ]
+
+
 def load(tid: str) -> Thread | None:
     from . import db
 
     row = db.fetchone(
-        "SELECT id, title, created, updated, interaction_id, notes "
+        "SELECT id, title, created, updated, interaction_id, notes, messages_json "
         "FROM chat.threads WHERE id = ?",
         [tid],
     )
     if not row:
         return None
-    msgs_rows = db.fetchall(
-        "SELECT role, text, created_at, interaction_id FROM chat.messages "
-        "WHERE thread_id = ? ORDER BY seq",
-        [tid],
-    )
-    msgs = [
-        Message(role=r, text=t, at=a or now(), interaction_id=iid or None)
-        for r, t, a, iid in msgs_rows
-    ]
-    thread = _row_thread(row, messages=msgs)
+    msgs = _unpack_messages(row[6] if len(row) > 6 else None)
+    if msgs is None:
+        msgs = _legacy_messages(tid)
+    thread = _row_thread(row[:6], messages=msgs)
     if thread.interaction_id:
         for m in reversed(msgs):
             if m.role == "model" and not m.interaction_id:
@@ -89,37 +139,45 @@ def load(tid: str) -> Thread | None:
     return thread
 
 
+def _save_once(thread: Thread) -> None:
+    """Write thread + messages_json only — never mutate chat.messages (DuckDB ART)."""
+    from . import db
+
+    payload = _pack_messages(thread.messages)
+    n_user = int(thread.user_turns or 0)
+    with db.locked():
+        con = db.connect()
+        con.execute(
+            "INSERT INTO chat.threads "
+            "(id, title, created, updated, interaction_id, notes, "
+            " messages_json, user_turns) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?::JSON, ?) "
+            "ON CONFLICT (id) DO UPDATE SET "
+            "title = excluded.title, "
+            "updated = excluded.updated, "
+            "interaction_id = excluded.interaction_id, "
+            "notes = excluded.notes, "
+            "messages_json = excluded.messages_json, "
+            "user_turns = excluded.user_turns",
+            [
+                thread.id, thread.title, thread.created, thread.updated,
+                thread.interaction_id, thread.notes or "", payload, n_user,
+            ],
+        )
+
+
 def save(thread: Thread) -> None:
     from . import db
 
     thread.updated = now()
     thread.user_turns = sum(1 for m in thread.messages if m.role == "user")
-    with db.locked():
-        con = db.connect()
-        con.execute("BEGIN")
-        try:
-            con.execute(
-                "INSERT OR REPLACE INTO chat.threads "
-                "(id, title, created, updated, interaction_id, notes) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                [thread.id, thread.title, thread.created, thread.updated,
-                 thread.interaction_id, thread.notes or ""],
-            )
-            con.execute("DELETE FROM chat.messages WHERE thread_id = ?", [thread.id])
-            if thread.messages:
-                con.executemany(
-                    "INSERT INTO chat.messages "
-                    "(thread_id, seq, role, text, created_at, interaction_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    [
-                        [thread.id, i, m.role, m.text, m.at or now(), m.interaction_id]
-                        for i, m in enumerate(thread.messages)
-                    ],
-                )
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
+    try:
+        _save_once(thread)
+    except Exception as exc:
+        if not db._is_invalidated(exc):
             raise
+        db._reset()
+        _save_once(thread)
 
 
 def save_notes(thread: Thread) -> None:
@@ -138,16 +196,19 @@ def save_notes(thread: Thread) -> None:
 def delete(tid: str) -> None:
     from . import db
 
-    with db.locked():
-        con = db.connect()
-        con.execute("BEGIN")
-        try:
-            con.execute("DELETE FROM chat.messages WHERE thread_id = ?", [tid])
+    def _once() -> None:
+        with db.locked():
+            con = db.connect()
+            # Do not touch chat.messages — ART index there is corrupt-prone.
             con.execute("DELETE FROM chat.threads WHERE id = ?", [tid])
-            con.execute("COMMIT")
-        except Exception:
-            con.execute("ROLLBACK")
+
+    try:
+        _once()
+    except Exception as exc:
+        if not db._is_invalidated(exc):
             raise
+        db._reset()
+        _once()
 
 
 def new_thread() -> Thread:
@@ -201,11 +262,10 @@ def list_threads() -> list[Thread]:
     from . import db
 
     rows = db.fetchall(
-        "SELECT t.id, t.title, t.created, t.updated, t.interaction_id, t.notes, "
-        "  (SELECT COUNT(*) FROM chat.messages m "
-        "   WHERE m.thread_id = t.id AND m.role = 'user') AS user_turns "
-        "FROM chat.threads t "
-        "ORDER BY t.updated DESC"
+        "SELECT id, title, created, updated, interaction_id, notes, "
+        "COALESCE(user_turns, 0) "
+        "FROM chat.threads "
+        "ORDER BY updated DESC"
     )
     return [_row_thread(r[:6], user_turns=int(r[6] or 0)) for r in rows]
 

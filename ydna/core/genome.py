@@ -87,6 +87,13 @@ class Chrom:
     def called(self) -> int:
         return self.n - self.nocall
 
+    @property
+    def calls_loaded(self) -> bool:
+        """False for meta-only shells (stats from DuckDB, ids/pos/gts not fetched yet)."""
+        if self.n <= 0:
+            return True
+        return len(self.ids) == self.n
+
     def finalize(self) -> None:
         pos = self.pos
         if any(a > b for a, b in zip(pos, islice(pos, 1, None))):

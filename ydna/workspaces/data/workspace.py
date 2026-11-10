@@ -32,6 +32,41 @@ STATE_ICON = {k: (glyph, STATE_ICON_STYLE[k]) for k, glyph in
 STATE_LABEL = {"ok": "READY", "partial": "INCOMPLETE", "missing": "NOT FOUND", "unset": "PATH NOT SET"}
 LINKED = {"ftdna_discover", "ftdna_haplotree"}
 
+# Facts written only by Source.enrich (Discover ↔ Haplotree coverage / fetch plan).
+# Basic check(enrich=False) must not wipe these — otherwise F2 re-runs ~8s enrich every open.
+_ENRICH_FACT_KEYS = {
+    "Haplotree coverage",
+    "Not in haplotree",
+    "Fetch stages",
+    "Your Y markers",
+    "Not in Discover",
+    "Downloaded from Discover",
+}
+
+
+def _is_enrich_fact(key: str) -> bool:
+    return key in _ENRICH_FACT_KEYS or key.startswith("  ")
+
+
+def _has_enrich_facts(st: Status) -> bool:
+    return any(_is_enrich_fact(k) for k, _ in st.facts)
+
+
+def _preserve_enrich(prev: Status | None, st: Status) -> Status:
+    """Keep last coverage block when a light check replaces the Status."""
+    if prev is None or st.coverage is not None:
+        return st
+    if prev.coverage is None and not _has_enrich_facts(prev):
+        return st
+    st.coverage = prev.coverage
+    enrich = [(k, v) for k, v in prev.facts if _is_enrich_fact(k)]
+    basic = [(k, v) for k, v in st.facts if not _is_enrich_fact(k)]
+    insert_at = min(2, len(basic))
+    st.facts = basic[:insert_at] + enrich + basic[insert_at:]
+    # Enriched summary (percents / stages left) lives on prev until next real enrich.
+    st.summary = prev.summary
+    return st
+
 
 def _grouped_sources() -> list[Source]:
     """SOURCES в порядке групп F2 (на случай рассинхрона с плоским списком)."""
@@ -101,6 +136,7 @@ class DataWorkspace(Workspace):
     BINDINGS = [
         Binding(alt_keys("p"), "set_path", "Set path"),
         Binding(alt_keys("d"), "download", "Download / fetch stage 1"),
+        Binding(alt_keys("b"), "browse_openhumans", "Browse OH catalog", show=False),
         Binding("1", "fetch_stage('our')", "Fetch 1 Our", show=False),
         Binding("2", "fetch_stage('children')", "Fetch 2 Children", show=False),
         Binding("3", "fetch_stage('genome')", "Fetch 3 This genome", show=False),
@@ -121,6 +157,10 @@ class DataWorkspace(Workspace):
         self.finished: set[int] = {id(j) for j in JOBS.items.values() if not j.running}
         self.armed = 0.0
         self.genome = self._active()
+        self._refresh_gen = 0
+        self._enriching: set[str] = set()
+        # LINKED keys that must recompute coverage (genome/path change). Empty = reuse DB facts.
+        self._enrich_dirty: set[str] = set()
 
     def _active(self) -> Path | None:
         """Активный файл F1: из GenomeWorkspace, иначе genome.files."""
@@ -141,13 +181,28 @@ class DataWorkspace(Workspace):
             with Vertical(id="act-box"):
                 with VerticalScroll(id="act-scroll"):
                     yield Static(id="actions")
-        yield KeyBar([("↑↓", "Source", None), ("P", "Set path", "screen.set_path"),
-                      ("D/1–5", "Fetch stage", "screen.download"),
-                      ("V", "Verify MD5", "screen.verify"),
-                      ("R", "Recheck", "screen.recheck"), ("C", "Cancel task", "screen.cancel_job"),
-                      ("Del", "Forget path", "screen.clear_path"), ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+        yield KeyBar(self._key_items(), id="help")
         yield Static(id="status")
+
+    def _key_items(self) -> list[tuple[str, str, str | None]]:
+        s = None
+        try:
+            s = self.source
+        except Exception:
+            pass
+        if s and s.key == "openhumans":
+            return [("↑↓", "Source", None), ("P", "Samples folder", "screen.set_path"),
+                    ("B", "Open F8 catalog", "screen.browse_openhumans"),
+                    ("V", "Update new", "screen.verify"),
+                    ("R", "Recheck", "screen.recheck"), ("C", "Cancel task", "screen.cancel_job"),
+                    ("Del", "Forget path", "screen.clear_path"), ("Tab", "Panel", "app.focus_next"),
+                    ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")]
+        return [("↑↓", "Source", None), ("P", "Set path", "screen.set_path"),
+                ("D/1–5", "Fetch stage", "screen.download"),
+                ("V", "Verify MD5", "screen.verify"),
+                ("R", "Recheck", "screen.recheck"), ("C", "Cancel task", "screen.cancel_job"),
+                ("Del", "Forget path", "screen.clear_path"), ("Tab", "Panel", "app.focus_next"),
+                ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")]
 
     def _menu_options(self) -> list[Option]:
         """Опции левого меню: disabled-заголовки групп + источники."""
@@ -179,14 +234,20 @@ class DataWorkspace(Workspace):
         self.query_one("#det-box").border_title = "DETAILS"
         self.query_one("#act-box").border_title = "ACTIONS"
         self.query_one("#act-box").border_subtitle = "click or key"
+        # Instant paint from DuckDB; heavy disk checks run in the background.
+        try:
+            self.store.warm_paths()
+            self._hydrate_status_from_db()
+        except Exception:  # noqa: BLE001
+            pass
         ol = self.query_one("#sources", OptionList)
         ol.add_options(self._menu_options())
         ol.highlighted = self._first_source_index(ol)
         ol.focus()
-        for s in _grouped_sources():
-            self.check(s)
-        self.set_interval(0.5, self._tick)
         self.refresh_all()
+        for s in _grouped_sources():
+            self.check(s, enrich=False)
+        self.set_interval(0.5, self._tick)
 
     @property
     def source(self) -> Source:
@@ -202,18 +263,35 @@ class DataWorkspace(Workspace):
                 return BY_KEY[o.id]
         return SOURCES[0]
 
+    def _hydrate_status_from_db(self) -> None:
+        """Show last-known F2 rows immediately (no disk scan)."""
+        for row in sources_db.list_sources():
+            key = str(row["key"])
+            state = str(row.get("state") or "unset")
+            if state == "unset" and not row.get("path"):
+                continue
+            facts = list(row.get("facts") or [])
+            self.status[key] = Status(
+                state,  # type: ignore[arg-type]
+                str(row.get("summary") or state),
+                facts,
+            )
+
     # — проверка состояния —
-    def check(self, src: Source) -> None:
+    def check(self, src: Source, *, enrich: bool = False) -> None:
         self.checking.add(src.key)
         path = self.store.path(src.key)
 
         def work() -> None:
-            st = src.check(path, self.store)
+            st = src.check(path, self.store, enrich=enrich)
             self.app.call_from_thread(self._checked, src.key, st)
         self.run_worker(work, thread=True, group=f"check-{src.key}", exclusive=True)
 
     def _checked(self, key: str, st: Status) -> None:
         self.checking.discard(key)
+        # Light checks must not erase Discover/Haplotree coverage from hydrate / last enrich.
+        if key in LINKED:
+            st = _preserve_enrich(self.status.get(key), st)
         self.status[key] = st
         src = BY_KEY.get(key)
         if src:
@@ -221,6 +299,17 @@ class DataWorkspace(Workspace):
                 sources_db.upsert_status(src, st, self.store.path(key))
             except Exception:
                 pass
+        self._schedule_refresh()
+
+    def _schedule_refresh(self) -> None:
+        """Coalesce many check completions into one UI pass (keeps F2 responsive)."""
+        self._refresh_gen += 1
+        gen = self._refresh_gen
+        self.set_timer(0.12, lambda g=gen: self._refresh_if_current(g))
+
+    def _refresh_if_current(self, gen: int) -> None:
+        if gen != self._refresh_gen or not self.is_mounted:
+            return
         self.refresh_all()
 
     def _tick(self) -> None:
@@ -245,19 +334,60 @@ class DataWorkspace(Workspace):
 
     def check_related(self, src: Source) -> None:
         """Покрытие Discover зависит от Haplotree и наоборот."""
-        self.check(src)
+        self.check(src, enrich=False)
         if src.key in LINKED:
             for s in SOURCES:
                 if s.key in LINKED and s is not src:
-                    self.check(s)
+                    self.check(s, enrich=False)
 
     def on_screen_resume(self) -> None:
         genome = self._active()
         if genome != self.genome:
             self.genome = genome
-            self.check(BY_KEY["ftdna_discover"])
-            self.check(BY_KEY["ftdna_haplotree"])
+            # Coverage depends on active F1 genome — recompute when it changes.
+            self._enrich_dirty |= LINKED
+            self.check(BY_KEY["ftdna_discover"], enrich=False)
+            self.check(BY_KEY["ftdna_haplotree"], enrich=False)
         self.refresh_all()
+
+    def _ensure_enrich(self, src: Source) -> None:
+        """Coverage facts for Discover/Haplotree — only when the row is focused."""
+        if src.key not in LINKED or src.key in self._enriching:
+            return
+        st = self.status.get(src.key)
+        if not st or st.state != "ok":
+            return
+        if st.coverage is not None:
+            return
+        # Reuse last session / hydrate facts unless genome/path marked dirty (or R).
+        if _has_enrich_facts(st) and src.key not in self._enrich_dirty:
+            return
+        self._enriching.add(src.key)
+        path = self.store.path(src.key)
+
+        def work() -> None:
+            try:
+                fresh = src.check(path, self.store, enrich=True)
+            except Exception as exc:  # noqa: BLE001
+                self.app.call_from_thread(self._enrich_done, src.key, None, exc)
+                return
+            self.app.call_from_thread(self._enrich_done, src.key, fresh, None)
+
+        self.run_worker(work, thread=True, group=f"enrich-{src.key}", exclusive=True)
+
+    def _enrich_done(self, key: str, st: Status | None, exc: Exception | None) -> None:
+        self._enriching.discard(key)
+        self._enrich_dirty.discard(key)
+        if exc is not None or st is None:
+            return
+        self.status[key] = st
+        src = BY_KEY.get(key)
+        if src:
+            try:
+                sources_db.upsert_status(src, st, self.store.path(key))
+            except Exception:  # noqa: BLE001
+                pass
+        self._schedule_refresh()
 
     # — отрисовка —
     def _genome_label(self) -> tuple[str, str]:
@@ -300,12 +430,14 @@ class DataWorkspace(Workspace):
             s = BY_KEY.get(opt.id)
             if s:
                 ol.replace_option_prompt_at_index(i, self._prompt(s))
+        self.query_one("#help", KeyBar).set_items(self._key_items())
         self.refresh_details()
         self.refresh_actions()
         self.update_status()
 
     def refresh_details(self) -> None:
         s = self.source
+        self._ensure_enrich(s)
         st = self.status.get(s.key)
         path = self.store.path(s.key)
         t = Text()
@@ -314,6 +446,8 @@ class DataWorkspace(Workspace):
             icon, style = STATE_ICON[st.state]
             t.append(f"{icon} {STATE_LABEL[st.state]}", style=f"bold {style}")
             t.append(f"  {st.summary}\n", style=style)
+            if s.key in LINKED and s.key in self._enriching:
+                t.append("  computing Discover ↔ Haplotree coverage…\n", style="#AEA5B8")
         else:
             t.append("checking…\n", style="#AEA5B8")
         t.append(f"\n{s.about}\n", style="#C3BCCC")
@@ -436,6 +570,8 @@ class DataWorkspace(Workspace):
                     else:
                         t.append(f"[{key}]  {label}: done\n\n", style="#8A8294")
                 t.append("[D]  same as [1] Our path\n\n", style="#8A8294")
+        elif s.key == "openhumans":
+            action("B", "open F8 Samples catalog (D on a row downloads)", "browse_openhumans")
         elif s.can_download:
             if getattr(s, "needs_genome", False) and not self.genome:
                 t.append("[D]  needs an active genome in F1 (coverage uses your SNPs)\n\n",
@@ -447,7 +583,10 @@ class DataWorkspace(Workspace):
         else:
             t.append(f"[D]  {s.download_note}\n\n", style="#8A8294")
         if s.can_verify:
-            action("V", "verify MD5 checksums of the files", "verify")
+            if s.key == "openhumans":
+                action("V", "API new items → download missing → DuckDB", "verify")
+            else:
+                action("V", "verify MD5 checksums of the files", "verify")
         action("R", "recheck", "recheck")
         if job and job.active:
             action("C", "cancel the running/paused task", "cancel_job")
@@ -490,6 +629,8 @@ class DataWorkspace(Workspace):
     def _apply_path(self, s: Source, path: Path) -> None:
         self.store.set_path(s.key, path)
         self.status.pop(s.key, None)
+        if s.key in LINKED:
+            self._enrich_dirty |= LINKED
         self.check_related(s)
         self.refresh_all()
         self.app.source_changed(s.key)
@@ -524,8 +665,21 @@ class DataWorkspace(Workspace):
             self.app.notify(f"Queued: {job.title}", severity="information")
         self.refresh_all()
 
+    def action_browse_openhumans(self) -> None:
+        """Catalog lives in F8 — jump there (no modal / intermediate screen)."""
+        if "openhumans" not in BY_KEY:
+            return
+        if self.store.path("openhumans") is None:
+            folder = BY_KEY["openhumans"].suggest(self.store)
+            folder.mkdir(parents=True, exist_ok=True)
+            self.store.set_path("openhumans", folder)
+        self.app.action_mode("samples")
+
     def action_download(self) -> None:
         s = self.source
+        if s.key == "openhumans":
+            self.action_browse_openhumans()
+            return
         if s.can_fetch:
             self.action_fetch_stage("our")
             return
@@ -600,12 +754,18 @@ class DataWorkspace(Workspace):
         path = self.store.path(s.key)
         if not s.can_verify:
             self.app.notify("No published checksums for this source", severity="warning")
-        elif not path:
+            return
+        if not path and s.key == "openhumans":
+            path = s.suggest(self.store)
+            path.mkdir(parents=True, exist_ok=True)
+            self.store.set_path(s.key, path)
+        if not path:
             self.app.notify("Set the path first (P)", severity="warning")
         elif (job := JOBS.get(s.key)) and job.active:
             self.app.notify(f"{s.title}: a task is already running", severity="warning")
         else:
-            JOBS.start(s.key, f"Verify {s.title}", lambda j: s.verify(path, j))
+            title = f"Sync {s.title}" if s.key == "openhumans" else f"Verify {s.title}"
+            JOBS.start(s.key, title, lambda j: s.verify(path, j))
             self.refresh_all()
 
     def action_cancel_job(self) -> None:
@@ -619,7 +779,8 @@ class DataWorkspace(Workspace):
     def action_recheck(self) -> None:
         s = self.source
         self.status.pop(s.key, None)
-        self.check(s)
+        # Explicit R: include expensive coverage for Discover / Haplotree.
+        self.check(s, enrich=s.key in LINKED)
         self.refresh_all()
 
     def action_clear_path(self) -> None:

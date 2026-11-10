@@ -38,7 +38,20 @@ def main(argv: list[str] | None = None) -> int:
             print(db_busy_message(), file=sys.stderr)
             return 1
         raise
-    app.run()
+    try:
+        app.run()
+    finally:
+        # На случай выхода без Q (сигнал / crash path): DB + lock не должны висеть.
+        try:
+            from .core import db
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from .core.single import release
+            release()
+        except Exception:  # noqa: BLE001
+            pass
     return app.return_code or 0
 
 

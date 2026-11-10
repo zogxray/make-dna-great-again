@@ -8,7 +8,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import ContentSwitcher, Input, OptionList, Static
+from textual.widgets import Button, ContentSwitcher, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core import chat
@@ -22,6 +22,24 @@ from .screens import ConfirmScreen, EditScreen, ModelScreen
 from .view import chat_prompt, thread_text, thread_view
 
 JOB = "chat"
+
+# Ctrl+Enter в большинстве TTY неотличим от Enter — шлём через Ctrl+S / Alt+Enter + кнопку.
+_SEND_KEYS = "ctrl+s,alt+enter,meta+enter,ctrl+enter"
+
+
+class PromptArea(ClipTextArea):
+    """Многострочный ввод: Enter = новая строка; Send = Ctrl+S / Alt+Enter / кнопка."""
+
+    BINDINGS = [
+        *ClipTextArea.BINDINGS,
+        Binding(_SEND_KEYS, "chat_send", "Send", show=False, priority=True),
+    ]
+
+    def action_chat_send(self) -> None:
+        screen = self.screen
+        send = getattr(screen, "action_send_prompt", None)
+        if callable(send):
+            send()
 
 
 class ChatWorkspace(Workspace):
@@ -39,9 +57,19 @@ class ChatWorkspace(Workspace):
     #thread-sel {
         height: 1fr; border: none; background: transparent; padding: 0 1;
     }
-    #prompt { height: 3; border: round $primary; margin: 0 1 1 1; }
+    #prompt-row {
+        height: 8; max-height: 8; margin: 0 1 1 1;
+    }
+    #prompt {
+        width: 1fr; height: 1fr; border: round $primary;
+    }
+    #send-col {
+        width: 12; height: 1fr; align: center middle; padding: 0 0 0 1;
+    }
+    #send-btn { width: 100%; }
     #notes { height: 1fr; border: none; }
-    #thread-sel .text-area--selection, #notes .text-area--selection {
+    #thread-sel .text-area--selection, #notes .text-area--selection,
+    #prompt .text-area--selection {
         background: $accent 45%;
         color: $text;
     }
@@ -56,6 +84,7 @@ class ChatWorkspace(Workspace):
         Binding(alt_keys("s"), "toggle_select", "Select mode"),
         Binding(alt_keys("m"), "pick_model", "Model"),
         Binding(alt_keys("c"), "cancel", "Cancel"),
+        Binding(_SEND_KEYS, "send_prompt", "Send", show=False),
     ]
 
     def __init__(self, store: Store) -> None:
@@ -73,16 +102,24 @@ class ChatWorkspace(Workspace):
             with Vertical(id="chats-box"):
                 yield OptionList(id="chats")
             with Vertical(id="thread-box"):
+                # Select-mode TextArea is mounted lazily on first S — cold F6 stays lighter.
                 with ContentSwitcher(initial="thread-scroll", id="thread-switch"):
                     with VerticalScroll(id="thread-scroll"):
                         yield SelectableRichStatic(id="thread-md")
-                    yield ReadOnlyClipTextArea("", id="thread-sel", highlight_cursor_line=False)
-                yield Input(placeholder="message · Enter to send", id="prompt")
+                with Horizontal(id="prompt-row"):
+                    yield PromptArea(
+                        "",
+                        id="prompt",
+                        show_line_numbers=False,
+                        placeholder="message · Ctrl+S / Alt+Enter / Send · Enter = new line",
+                    )
+                    with Vertical(id="send-col"):
+                        yield Button("Send", id="send-btn", variant="primary")
             with Vertical(id="notes-box"):
                 yield ClipTextArea("", id="notes", show_line_numbers=False,
                                   placeholder="drag or Shift+arrows to select · Ctrl+C copy · Ctrl+V paste")
         yield KeyBar([("A", "New chat", "screen.new_chat"),
-                      ("Enter", "Send", None),
+                      ("Ctrl+S", "Send", "screen.send_prompt"),
                       ("M", "Model", "screen.pick_model"),
                       ("N", "Last → notes", "screen.clip_last"),
                       ("E", "Edit last you", "screen.edit_last"),
@@ -90,7 +127,7 @@ class ChatWorkspace(Workspace):
                       ("Del", "Delete chat", "screen.delete_chat"),
                       ("C", "Cancel", "screen.cancel"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def _active(self) -> Path | None:
@@ -99,16 +136,79 @@ class ChatWorkspace(Workspace):
             return ws.active
         return active_genome()
 
+    def _focus_prompt(self) -> None:
+        self.query_one("#prompt", PromptArea).focus()
+
     def on_mount(self) -> None:
         self.query_one("#chats-box").border_title = "CHATS"
         self.query_one("#thread-box").border_title = "CHAT"
         self.query_one("#notes-box").border_title = "NOTES"
         self.reload()
-        self.query_one("#prompt", Input).focus()
+        if not self._apply_prefill():
+            self._focus_prompt()
         self.set_interval(0.15, self._tick)
 
     def on_screen_resume(self) -> None:
-        self.reload()
+        if self._apply_prefill():
+            return
+        # Avoid full Markdown rebuild when the open thread is unchanged.
+        keep = self.current.id if self.current else None
+        updated = self.current.updated if self.current else None
+        self.genome = self._active()
+        threads = chat.list_threads()
+        if not threads:
+            self.reload()
+            self._focus_prompt()
+            return
+        self.threads = threads
+        stub = next((t for t in threads if t.id == keep), threads[0])
+        ol = self.query_one("#chats", OptionList)
+        ol.clear_options()
+        ol.add_options([Option(chat_prompt(t), id=t.id) for t in self.threads])
+        idx = next((i for i, t in enumerate(self.threads) if t.id == stub.id), 0)
+        ol.highlighted = idx
+        if (keep and stub.id == keep and stub.updated == updated
+                and self.current is not None):
+            box = self.query_one("#thread-box")
+            box.border_subtitle = self._thread_subtitle()
+            self.update_status()
+            self._focus_prompt()
+            return
+        self.current = chat.load(stub.id) or stub
+        self._show()
+        self._focus_prompt()
+
+    def _apply_prefill(self) -> bool:
+        """Ask GPT: текст в prompt активного чата. Новый тред — только если чатов нет."""
+        text = getattr(self.app, "chat_prefill", None) or ""
+        if not text:
+            return False
+        title = getattr(self.app, "chat_prefill_title", None) or "Ask · F3"
+        self.app.chat_prefill = None
+        self.app.chat_prefill_title = None
+        self._flush_notes()
+        threads = chat.list_threads()
+        if not threads:
+            t = chat.new_thread()
+            if title:
+                t.title = title[:48]
+                chat.save(t)
+            self.current = t
+            self.reload(keep=t.id)
+        else:
+            # Активный = текущий после reload, иначе самый свежий.
+            keep = self.current.id if self.current else threads[0].id
+            self.reload(keep=keep)
+            if (self.current and self.current.title == "New chat"
+                    and not self.current.messages and title):
+                self.current.title = title[:48]
+                chat.save(self.current)
+                self.reload(keep=self.current.id)
+        prompt = self.query_one("#prompt", PromptArea)
+        prompt.load_text(text)
+        prompt.focus()
+        self.app.notify("Ask GPT · review prompt · Ctrl+S / Alt+Enter / Send")
+        return True
 
     def on_screen_suspend(self) -> None:
         self._flush_notes()
@@ -144,15 +244,25 @@ class ChatWorkspace(Workspace):
             bits.append("active: — (open a file in F1)")
         return " · ".join(bits)
 
+    def _ensure_select_area(self) -> ReadOnlyClipTextArea:
+        """Mount select-mode TextArea on first use (keeps cold F6 free of a 3rd editor)."""
+        switch = self.query_one("#thread-switch", ContentSwitcher)
+        try:
+            return self.query_one("#thread-sel", ReadOnlyClipTextArea)
+        except Exception:
+            area = ReadOnlyClipTextArea("", id="thread-sel", highlight_cursor_line=False)
+            switch.mount(area)
+            return area
+
     def _show(self) -> None:
         t = self.current
         job = JOBS.get(JOB)
         waiting = bool(job and job.running)
         draft = job.draft if waiting and job else ""
         switch = self.query_one("#thread-switch", ContentSwitcher)
-        switch.current = "thread-sel" if self.select_mode else "thread-scroll"
         if self.select_mode:
-            area = self.query_one("#thread-sel", ReadOnlyClipTextArea)
+            area = self._ensure_select_area()
+            switch.current = "thread-sel"
             plain = thread_text(t, waiting, draft)
             if area.text != plain and not area.selected_text:
                 at_end = area.cursor_location[0] >= max(0, area.document.line_count - 2)
@@ -160,7 +270,10 @@ class ChatWorkspace(Workspace):
                 if at_end or waiting:
                     area.scroll_end(animate=False)
         else:
-            self.query_one("#thread-md", SelectableRichStatic).update(thread_view(t, waiting, draft))
+            switch.current = "thread-scroll"
+            body = self.query_one("#thread-md", SelectableRichStatic)
+            width = body.content_size.width or body.size.width or 88
+            body.update(thread_view(t, waiting, draft, width=max(40, width - 2)))
             self.query_one("#thread-scroll").scroll_end(animate=False)
         notes = self.query_one("#notes", ClipTextArea)
         if t and notes.text != t.notes:
@@ -205,10 +318,10 @@ class ChatWorkspace(Workspace):
         self.select_mode = not self.select_mode
         self._show()
         if self.select_mode:
-            self.query_one("#thread-sel", ReadOnlyClipTextArea).focus()
+            self._ensure_select_area().focus()
             self.app.notify("Select mode · drag or Shift+arrows · Ctrl+C · S back")
         else:
-            self.query_one("#prompt", Input).focus()
+            self._focus_prompt()
             self.app.notify("Markdown view")
 
     def action_pick_model(self) -> None:
@@ -307,16 +420,22 @@ class ChatWorkspace(Workspace):
 
         JOBS.start(JOB, "Gemini", work)
         self.reload(keep=tid)
-        self.query_one("#prompt", Input).focus()
+        self._focus_prompt()
 
-    @on(Input.Submitted, "#prompt")
-    def _send(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        event.input.value = ""
+    @on(Button.Pressed, "#send-btn")
+    def on_send_btn(self) -> None:
+        self.action_send_prompt()
+
+    def action_send_prompt(self) -> None:
+        prompt = self.query_one("#prompt", PromptArea)
+        text = prompt.text.strip()
         if not text:
+            self.app.notify("Type a message first", severity="warning")
             return
         if self._busy():
+            self.app.notify("Gemini is still answering · C to cancel", severity="warning")
             return
+        prompt.load_text("")
         if self.current is None:
             self.current = chat.new_thread()
             self.threads.insert(0, self.current)
@@ -367,7 +486,7 @@ class ChatWorkspace(Workspace):
         t = chat.new_thread()
         self.current = t
         self.reload(keep=t.id)
-        self.query_one("#prompt", Input).focus()
+        self._focus_prompt()
 
     def action_delete_chat(self) -> None:
         if not self.current or not self.query_one("#chats").has_focus:

@@ -14,9 +14,17 @@ from textual.strip import Strip
 from textual.widgets import Static
 
 from ...theme.styles import (
-    BRIGHT, BRIGHT_BOLD, DATE_STYLES, DIM, FAINT, GHOST, HI_REV, MAP, MUTED,
-    NAME_STYLE, OK, OK_BOLD, SIZE_STYLE, SOFT, WARN, WARN_BOLD, bold,
+    A_STYLE, ALERT, B_STYLE, BRIGHT, BRIGHT_BOLD, DATE_STYLES, DIM, FAINT,
+    GHOST, HI, HI_REV, MAP, MUTED, NAME_STYLE, OK, OK_BOLD, SIZE_STYLE, SOFT,
+    WARN, WARN_BOLD, bold,
 )
+
+# Our Y: ствол (общий префикс) + exclusive-суффиксы кандидатов при ничьей.
+OUR_Y_STEM = OK
+OUR_Y_ALT = (OK, A_STYLE, B_STYLE, WARN, HI, ALERT)
+# UI-only: het/mismatch и отсечённые anc>der развилки (в tip-счёт не входят).
+OUR_Y_UNCERTAIN = ALERT
+OUR_Y_PRUNED = FAINT
 from .data import date_class, year_class, year_label
 
 
@@ -79,7 +87,30 @@ def legend_text() -> Text:
     return t
 
 
-def glyph_legend(ours: str | None = None) -> Text:
+def our_y_styles(candidates: list[list[str]]) -> tuple[set[str], dict[str, str]]:
+    """Узлы Our Y + цвет: общий ствол, дальше — цвет кандидата."""
+    if not candidates:
+        return set(), {}
+    stem = list(candidates[0])
+    for path in candidates[1:]:
+        n = 0
+        while n < len(stem) and n < len(path) and stem[n] == path[n]:
+            n += 1
+        stem = stem[:n]
+    stem_set = set(stem)
+    styles = {name: OUR_Y_STEM for name in stem_set}
+    mine: set[str] = set(stem_set)
+    for i, path in enumerate(candidates):
+        color = OUR_Y_ALT[i % len(OUR_Y_ALT)]
+        for name in path:
+            mine.add(name)
+            if name not in stem_set:
+                styles[name] = color
+    return mine, styles
+
+
+def glyph_legend(ours: str | None = None, *, n_candidates: int = 1,
+                 show_noise: bool = False, tie_label: str = "") -> Text:
     t = Text(no_wrap=True, overflow="ellipsis")
 
     for glyph, label, style in (
@@ -96,7 +127,18 @@ def glyph_legend(ours: str | None = None) -> Text:
 
     if ours:
         t.append("   ● ", style=OK_BOLD)
-        t.append(f"our Y ({ours})", style=MUTED)
+        if n_candidates > 1:
+            kind = tie_label or "tied"
+            t.append(f"our DER ×{n_candidates} ({ours} · {kind} · O cycles)", style=MUTED)
+            for i in range(min(n_candidates, len(OUR_Y_ALT))):
+                t.append(" ●", style=OUR_Y_ALT[i])
+        else:
+            t.append(f"our DER ({ours})", style=MUTED)
+        if show_noise:
+            t.append("   ? ", style=f"bold {OUR_Y_UNCERTAIN}")
+            t.append("uncertain", style=MUTED)
+            t.append("   ○ ", style=OUR_Y_PRUNED)
+            t.append("pruned anc>der", style=MUTED)
 
     return t
 
@@ -202,6 +244,9 @@ class BranchView(ScrollView, can_focus=True):
 
         self.mine: set[str] = set()
         self.tip: str | None = None
+        self.our_styles: dict[str, str] = {}  # haplogroup → Rich color (Our Y)
+        self.our_uncertain: set[str] = set()  # het/mismatch noise (UI only)
+        self.our_pruned: set[str] = set()     # anc>der forks near Our path
 
     def set_source(
         self,
@@ -529,12 +574,24 @@ class BranchView(ScrollView, can_focus=True):
         color = DATE_STYLES[tone]
         on_path = name in self.mine
         is_tip = name == self.tip
+        our_color = self.our_styles.get(name) if on_path else None
+        is_uncertain = name in self.our_uncertain
+        is_pruned = (not on_path) and name in self.our_pruned
 
         rich = cls in ("rich", "hub")
 
-        if on_path:
+        if on_path and our_color:
+            line_style = f"bold {our_color}" if is_tip else our_color
+            marker_style = f"bold {our_color}"
+        elif on_path:
             line_style = OK_BOLD if is_tip else OK
             marker_style = OK_BOLD
+        elif is_uncertain:
+            line_style = OUR_Y_UNCERTAIN
+            marker_style = f"bold {OUR_Y_UNCERTAIN}"
+        elif is_pruned:
+            line_style = OUR_Y_PRUNED
+            marker_style = OUR_Y_PRUNED
         else:
             line_style = color if rich else f"dim {color}"
             marker_style = (
@@ -553,8 +610,14 @@ class BranchView(ScrollView, can_focus=True):
         left.append(guide[i], style=marker_style)
         left.append(guide[i + 1:], style=line_style)
 
-        if on_path:
+        if on_path and our_color:
+            name_style = f"bold {our_color}" if is_tip else our_color
+        elif on_path:
             name_style = OK_BOLD if is_tip else OK
+        elif is_uncertain:
+            name_style = f"bold {OUR_Y_UNCERTAIN}"
+        elif is_pruned:
+            name_style = OUR_Y_PRUNED
         elif ph:
             name_style = MUTED
         else:
@@ -568,6 +631,10 @@ class BranchView(ScrollView, can_focus=True):
             )
         else:
             left.append(name, style=name_style)
+        if is_uncertain:
+            left.append(" ?", style=f"bold {OUR_Y_UNCERTAIN}")
+        elif is_pruned:
+            left.append(" ○", style=OUR_Y_PRUNED)
 
         if self.vkids.get(name) and name not in self.expanded:
             left.append(

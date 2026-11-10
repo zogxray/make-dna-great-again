@@ -79,12 +79,15 @@ class Source:
     needs_genome = False          # D требует активный геном F1 (покрытие / Y-link)
     download_note = ""
 
-    def check(self, path: Path | None, store: Store | None = None) -> Status:
+    def check(self, path: Path | None, store: Store | None = None,
+              *, enrich: bool = True) -> Status:
         if path is None:
             return Status("unset", "not configured")
         try:
             st = self._check(path)
-            if store and st.state == "ok":
+            # enrich (Discover↔Haplotree coverage) is heavy — F2 list skips it;
+            # details / explicit recheck can turn it back on.
+            if enrich and store and st.state == "ok":
                 self.enrich(st, store)
             return st
         except OSError as exc:
@@ -258,23 +261,31 @@ class FtdnaHaplotree(Source):
         if not head.startswith(b'{"allNodes"') or not tail.rstrip().endswith(b"}"):
             return Status("partial", "not a complete haplotree JSON", facts,
                           [FileRow(path.name, size, "unexpected content", False)])
-        nodes, carry = 0, b""
-        needle = b'"haplogroupId":'
-        with path.open("rb") as fh:
-            while chunk := fh.read(8 << 20):
-                buf = carry + chunk
-                nodes += buf.count(needle)
-                carry = buf[-(len(needle) - 1):]
-        facts.insert(0, ("Haplogroups", f"≈ {nodes:,}"))
-        return Status("ok", f"≈ {nodes:,} haplogroups · {human_size(size)}", facts,
+        # Do NOT scan the ~130 MB JSON on every F2 open — that blocked the UI
+        # behind DuckDB after F1. Node count comes from a warm ylink index or enrich.
+        nodes = None
+        try:
+            from . import ylink
+            nodes = ylink.cached_haplotree_size(path)
+        except Exception:  # noqa: BLE001
+            nodes = None
+        if nodes is not None:
+            facts.insert(0, ("Haplogroups", f"{nodes:,}"))
+            return Status("ok", f"{nodes:,} haplogroups · {human_size(size)}", facts,
                           [FileRow(path.name, size, mtime_label(path))])
+        return Status("ok", f"{human_size(size)} · haplotree JSON", facts,
+                      [FileRow(path.name, size, mtime_label(path))])
 
     def enrich(self, st: Status, store: Store) -> None:
         cov = coverage(store)
         if isinstance(cov, str):
             return
-        st.summary = st.summary.replace(st.facts[0][1], f"{cov.tree_nodes:,}", 1)
-        st.facts[0] = ("Haplogroups", f"{cov.tree_nodes:,}")
+        st.summary = f"{cov.tree_nodes:,} haplogroups · " + (
+            st.summary.split(" · ", 1)[-1] if " · " in st.summary else st.summary
+        )
+        # Keep Size/Modified; put / update Haplogroups at the front.
+        st.facts = [(k, v) for k, v in st.facts if k != "Haplogroups"]
+        st.facts.insert(0, ("Haplogroups", f"{cov.tree_nodes:,}"))
         st.facts.insert(1, ("Downloaded from Discover", f"{cov.downloaded:,} ({cov.percent:.2f}%)"))
         if cov.named:
             st.facts.insert(2, ("Your Y markers", f"{cov.found:,} of {cov.named:,} named are haplotree variants"))
@@ -1187,6 +1198,146 @@ class PgsModels(Source):
         return pgs_catalog.build(path, job)
 
 
+# ───────────────────────── Seshat (Polaris snapshot) ─────────────────────────
+
+SESHAT_PAGE = "https://seshatdatabank.info/data"
+SESHAT_GITHUB_API = (
+    "https://api.github.com/repos/Seshat-Global-History-Databank/"
+    "build_polaris_dataset/contents"
+)
+SESHAT_POLARIS = "Polaris2026.xlsx"
+SESHAT_MANIFEST = "seshat-download-manifest.json"
+
+
+class Seshat(Source):
+    key = "seshat"
+    title = "Seshat · Polaris"
+    url = SESHAT_PAGE
+    about = ("Seshat Global History Databank snapshot (Polaris): polities with coded "
+             "social complexity, warfare, and religion variables across deep history. "
+             "F2 downloads the curated Excel release from the official GitHub mirror. "
+             "License: CC BY-NC (non-commercial). For LORE / culture briefs — not a Y tree.")
+    size_hint = "~3 MB Excel (Polaris sheets)"
+    can_download = True
+    can_verify = True
+
+    def workbook(self, path: Path) -> Path | None:
+        p = path / SESHAT_POLARIS
+        return p if p.is_file() and p.stat().st_size > 0 else None
+
+    def _sheet_names(self, xlsx: Path) -> list[str]:
+        """Имена листов из Office Open XML без openpyxl."""
+        try:
+            with zipfile.ZipFile(xlsx) as zf:
+                xml = zf.read("xl/workbook.xml").decode("utf-8", errors="replace")
+        except (OSError, KeyError, zipfile.BadZipFile):
+            return []
+        return re.findall(r'<sheet[^>]*\bname="([^"]+)"', xml)
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        rows = leftovers(path)
+        book = self.workbook(path)
+        facts: list[tuple[str, str]] = []
+        man = path / SESHAT_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                if data.get("release"):
+                    facts.append(("Release", str(data["release"])))
+                if data.get("github_sha"):
+                    facts.append(("GitHub SHA", str(data["github_sha"])[:12]))
+                if data.get("downloaded_at_utc"):
+                    facts.append(("Downloaded",
+                                  str(data["downloaded_at_utc"])[:19].replace("T", " ") + " UTC"))
+                if data.get("license"):
+                    facts.append(("License", str(data["license"])))
+            except (ValueError, TypeError, OSError):
+                pass
+        if not book:
+            if rows:
+                return Status("partial", "download incomplete", facts, rows)
+            return Status("missing", f"no {SESHAT_POLARIS}", facts, rows)
+        size = book.stat().st_size
+        sheets = self._sheet_names(book)
+        if sheets:
+            facts.insert(0, ("Sheets", f"{len(sheets)} · " + ", ".join(sheets[:6])
+                             + ("…" if len(sheets) > 6 else "")))
+        note = "OOXML workbook" if sheets else "Excel file"
+        rows.insert(0, FileRow(book.name, size, note))
+        if man.exists():
+            rows.append(FileRow(man.name, man.stat().st_size, "download meta"))
+        if not sheets:
+            return Status("partial", f"{book.name} is not a readable xlsx", facts, rows)
+        return Status("ok", f"{len(sheets)} sheets · {human_size(size)}", facts, rows)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / "seshat"
+
+    def _remote(self, job: Job) -> dict:
+        job.set_stage(f"querying GitHub for {SESHAT_POLARIS}")
+        req = urllib.request.Request(
+            f"{SESHAT_GITHUB_API}/{SESHAT_POLARIS}",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.load(resp)
+        if not isinstance(data, dict) or not data.get("download_url"):
+            raise RuntimeError(f"GitHub did not return download_url for {SESHAT_POLARIS}")
+        return data
+
+    def download(self, path: Path, job: Job) -> str:
+        remote = self._remote(job)
+        url = str(remote["download_url"])
+        size = int(remote["size"]) if isinstance(remote.get("size"), int) else None
+        sha = str(remote.get("sha") or "")
+        ensure_space(path, (size or (4 << 20)) + (8 << 20))
+        path.mkdir(parents=True, exist_ok=True)
+        dest = path / SESHAT_POLARIS
+        res = fetch(url, dest, job, SESHAT_POLARIS, size)
+        (path / SESHAT_MANIFEST).write_text(json.dumps({
+            "source": "Seshat Global History Databank",
+            "page": SESHAT_PAGE,
+            "release": "Polaris-2026",
+            "file": SESHAT_POLARIS,
+            "github_repo": "Seshat-Global-History-Databank/build_polaris_dataset",
+            "github_sha": sha or None,
+            "expected_size_bytes": size,
+            "license": "CC BY-NC",
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "download_result": res,
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+    def verify(self, path: Path, job: Job) -> str:
+        book = self.workbook(path) if path.is_dir() else None
+        if not book:
+            raise RuntimeError(f"no {SESHAT_POLARIS} to verify")
+        job.set_stage(f"checking {SESHAT_POLARIS}")
+        with book.open("rb") as fh:
+            magic = fh.read(4)
+        if magic[:2] != b"PK":
+            raise RuntimeError(f"{SESHAT_POLARIS}: not a ZIP/OOXML workbook")
+        sheets = self._sheet_names(book)
+        if not sheets:
+            raise RuntimeError(f"{SESHAT_POLARIS}: no sheets in workbook.xml")
+        man = path / SESHAT_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                exp = data.get("expected_size_bytes")
+                if isinstance(exp, int) and book.stat().st_size != exp:
+                    raise RuntimeError(
+                        f"size {book.stat().st_size:,} ≠ manifest {exp:,}")
+            except (ValueError, TypeError, OSError):
+                pass
+        return f"OK · {len(sheets)} sheets · {human_size(book.stat().st_size)}"
+
+
 class Gemini(Source):
     key = "gemini"
     title = "Google Gemini API"
@@ -1198,7 +1349,9 @@ class Gemini(Source):
     size_hint = "Gemini API quota (AI Studio)"
     download_note = "This is a key, not a download. Press P and paste it."
 
-    def check(self, path: Path | None, store: Store | None = None) -> Status:
+    def check(self, path: Path | None, store: Store | None = None,
+              *, enrich: bool = True) -> Status:
+        del enrich  # secrets have no Discover/Haplotree enrich step
         key = (store.secret(self.key) if store else None) or os.environ.get("GEMINI_API_KEY")
         if not key or not str(key).strip():
             return Status("unset", "API key not set")
@@ -1211,14 +1364,125 @@ class Gemini(Source):
                        ("Tools", "Google Search")])
 
 
+# ───────────────────────── Open Humans (public samples) ─────────────────────────
+
+class OpenHumans(Source):
+    key = "openhumans"
+    title = "Open Humans · public"
+    url = "https://www.openhumans.org/api/public-data/?source=direct-sharing-354"
+    about = ("Public Open Humans datafiles (project direct-sharing-354, ~14k catalog rows). "
+             "Most rows are wearables/surveys — filter to chip raw. "
+             "● READY / SUPPORTED = 23andMe / AncestryDNA original .txt (F1 parses). "
+             "○ NEED / NOT YET = FTDNA CSV, Big Y, VCF, zip — labeled, still downloadable. "
+             "Catalog is F8 Samples (also B from F2). D on a row (or Space-marked set) "
+             "fetches that genome → DuckDB (READY also → genome ingest). "
+             "V: API new items + missing under filter. "
+             "Respect OH goodwill / CC0 sharing norms — selective download, not a dump.")
+    size_hint = "catalog on disk · samples vary (chip files ~5–30 MB)"
+    can_download = True
+    can_verify = True
+    download_note = "F8 / B → catalog; D on a row downloads that genome (any compat)."
+
+    def suggest(self, store: Store) -> Path:
+        from .openhumans import default_samples_dir
+        return store.path(self.key) or default_samples_dir()
+
+    def _check(self, path: Path) -> Status:
+        from . import openhumans as oh
+        from . import openhumans_db as ohdb
+        cat = oh.load_catalog()
+        rows = leftovers(path) if path.is_dir() else []
+        facts: list[tuple[str, str]] = []
+        # Do NOT sync 14k rows here — that locked the app DB for minutes.
+        # DuckDB sync runs on F8 V / browse update / verify job only.
+        try:
+            n_db, _ = ohdb.catalog_synced()
+            if cat.n and n_db < cat.n:
+                facts.append(("DuckDB", f"{n_db:,}/{cat.n:,} · V / F8 to sync new"))
+        except Exception as exc:  # noqa: BLE001
+            facts.append(("DuckDB", f"unavailable · {exc}"))
+        if cat.n:
+            counts = cat.counts()
+            ready = counts.get(f"compat:{oh.COMPAT_READY}", 0)
+            need = counts.get(f"compat:{oh.COMPAT_NEED}", 0)
+            peek = counts.get(f"compat:{oh.COMPAT_PEEK}", 0)
+            skip = counts.get(f"compat:{oh.COMPAT_SKIP}", 0)
+            facts.append(("Catalog", f"{cat.n:,} files"
+                          + (f" · claimed {cat.claimed:,}" if cat.claimed else "")))
+            facts.append(("Compat",
+                          f"● {ready:,} READY · ○ {need:,} NEED · "
+                          f"△ {peek:,} PEEK · ✖ {skip:,} SKIP"))
+            facts.append(("Chip raw",
+                          f"{counts.get('kind:chip', 0):,} · "
+                          f"23andMe {counts.get('vendor:23andme', 0):,} · "
+                          f"Ancestry {counts.get('vendor:ancestry', 0):,} · "
+                          f"FTDNA {counts.get('vendor:ftdna', 0):,}"))
+            if cat.catalogued_at:
+                facts.append(("Catalogued",
+                              cat.catalogued_at[:19].replace("T", " ") + " UTC"))
+            facts.append(("Catalog dir", str(oh.catalog_dir())))
+        else:
+            facts.append(("Catalog", f"missing · expected {oh.catalog_jsonl()}"))
+        try:
+            st = ohdb.stats()
+            facts.append(("DuckDB",
+                          f"{st['catalog']:,} rows · {st['local']:,} local · "
+                          f"{st['ingested']:,} ingested · {st['error']:,} error"))
+        except Exception:  # noqa: BLE001
+            pass
+        local_n = 0
+        if path.is_dir():
+            ids = oh.local_ids(path)
+            local_n = len(ids)
+            facts.append(("Local samples", f"{local_n:,} file(s) with id_ prefix"))
+            for p in sorted(path.iterdir())[:12]:
+                if p.is_file() and not p.name.endswith(".part"):
+                    rows.append(FileRow(p.name, p.stat().st_size, "sample"))
+            if local_n > 12:
+                rows.append(FileRow(f"… +{local_n - 12} more", None, "samples"))
+        if not cat.n:
+            return Status("missing", "catalog.jsonl not found (run scripts/catalog_openhumans.py)",
+                          facts, rows)
+        if not path.is_dir():
+            return Status("partial", f"catalog {cat.n:,} · samples folder missing", facts, rows)
+        try:
+            st = ohdb.stats()
+            if st["ingested"] or local_n:
+                return Status(
+                    "ok",
+                    f"catalog {cat.n:,} · {local_n:,} local · "
+                    f"{st['ingested']:,} in DuckDB/genome",
+                    facts, rows,
+                )
+        except Exception:  # noqa: BLE001
+            if local_n:
+                return Status("ok", f"catalog {cat.n:,} · {local_n:,} local", facts, rows)
+        return Status("partial", f"catalog {cat.n:,} · no local samples yet (B to browse)",
+                      facts, rows)
+
+    def download(self, path: Path, job: Job) -> str:
+        """Not used for bulk dump — browser calls download_files on marked rows."""
+        raise NotImplementedError("Use B browse → mark → D")
+
+    def verify(self, path: Path, job: Job) -> str:
+        """Refresh catalog API for new ids, then download missing chip samples + DuckDB."""
+        from . import openhumans_db as ohdb
+        from .store import Store
+        path.mkdir(parents=True, exist_ok=True)
+        return ohdb.update_new_items(path, job, store=Store())
+
+
 SOURCES: list[Source] = [FtdnaDiscover(), FtdnaHaplotree(), YfullYtree(), Theytree(),
-                         Aadr(), ThousandGenomes(), RsidIdentity(), PgsModels(), Gemini()]
+                         Aadr(), ThousandGenomes(), RsidIdentity(), Seshat(),
+                         OpenHumans(), PgsModels(), Gemini()]
 BY_KEY = {s.key: s for s in SOURCES}
 
 # Группы левого меню F2: (заголовок, ключи источников по порядку).
 SOURCE_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("Y-DNA trees", ("ftdna_discover", "ftdna_haplotree", "yfull_ytree", "theytree")),
     ("Reference panels", ("aadr", "1000g", "rsid_identity")),
+    ("History & lore", ("seshat",)),
+    ("Public samples", ("openhumans",)),
     ("Polygenic scores", ("pgs_models",)),
     ("AI", ("gemini",)),
 ]

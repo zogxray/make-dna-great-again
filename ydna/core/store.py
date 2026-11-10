@@ -52,14 +52,29 @@ class Store:
         # Гарантируем schema + seed каталога F2.
         from . import db
         db.connect()
+        # path() hits DuckDB under the global lock — cache so F2 refresh_all
+        # does not serialize behind haplotree/coverage workers.
+        self._path_cache: dict[str, Path | None] = {}
 
     def path(self, key: str) -> Path | None:
+        if key in self._path_cache:
+            return self._path_cache[key]
         from . import sources_db
-        return sources_db.get_source_path(key)
+        p = sources_db.get_source_path(key)
+        self._path_cache[key] = p
+        return p
 
     def set_path(self, key: str, path: Path | None) -> None:
         from . import sources_db
-        sources_db.set_source_path(key, path.resolve() if path else None)
+        resolved = path.resolve() if path else None
+        sources_db.set_source_path(key, resolved)
+        self._path_cache[key] = resolved
+
+    def warm_paths(self) -> None:
+        """One round-trip: fill path cache for all F2 sources."""
+        from . import sources_db
+        for row in sources_db.list_sources():
+            self._path_cache[str(row["key"])] = row.get("path")
 
     def secret(self, key: str) -> str | None:
         from . import db

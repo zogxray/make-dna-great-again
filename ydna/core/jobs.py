@@ -133,6 +133,8 @@ class Jobs:
         self._queues: dict[str, deque[_Queued]] = {}
         self._qseq = 0
         self._lock = threading.Lock()
+        self._shutting_down = False
+        self._threads: list[threading.Thread] = []
 
     def get(self, key: str) -> Job | None:
         return self.items.get(key)
@@ -157,6 +159,8 @@ class Jobs:
     def start(self, key: str, title: str, fn: Callable[[Job], str | None]) -> Job:
         """fn(job) в потоке; строковый результат → job.message. Слот key должен быть свободен."""
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError(f"{title}: shutting down")
             old = self.items.get(key)
             if old and old.active:
                 raise RuntimeError(f"{title}: already running")
@@ -169,6 +173,8 @@ class Jobs:
     def enqueue(self, key: str, title: str, fn: Callable[[Job], str | None]) -> Job:
         """Если слот свободен — start; иначе в очередь (status=queued в списке F7)."""
         with self._lock:
+            if self._shutting_down:
+                raise RuntimeError(f"{title}: shutting down")
             cur = self.items.get(key)
             if cur and cur.active:
                 self._qseq += 1
@@ -195,6 +201,37 @@ class Jobs:
             job.cancel()
             return True
 
+    def cancel_all(self) -> int:
+        """Отменить active + сбросить очереди (для shutdown). Возвращает число затронутых."""
+        with self._lock:
+            self._shutting_down = True
+            self._queues.clear()
+            n = 0
+            for j in list(self.items.values()):
+                if j.status == "queued":
+                    j.cancel()
+                    n += 1
+                elif j.active:
+                    j.cancel()
+                    n += 1
+            return n
+
+    def wait_idle(self, timeout: float = 6.0) -> bool:
+        """Ждать, пока не останется active. True если успели."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not any(j.active for j in self.items.values()):
+                # добить короткие хвосты потоков
+                alive = [t for t in self._threads if t.is_alive()]
+                if not alive:
+                    return True
+                for t in alive:
+                    t.join(0.05)
+                if not any(t.is_alive() for t in self._threads):
+                    return True
+            time.sleep(0.05)
+        return not any(j.active for j in self.items.values())
+
     def _spawn(self, job: Job, fn: Callable[[Job], str | None]) -> None:
         key = job.key
 
@@ -212,11 +249,17 @@ class Jobs:
             job.finished = time.time()
             self._pump(key)
 
-        threading.Thread(target=run, name=f"job-{key}", daemon=True).start()
+        th = threading.Thread(target=run, name=f"job-{key}", daemon=True)
+        with self._lock:
+            self._threads = [t for t in self._threads if t.is_alive()]
+            self._threads.append(th)
+        th.start()
 
     def _pump(self, key: str) -> None:
         """После завершения слота — взять следующий из очереди."""
         with self._lock:
+            if self._shutting_down:
+                return
             if self.active_for(key):
                 return
             q = self._queues.get(key)

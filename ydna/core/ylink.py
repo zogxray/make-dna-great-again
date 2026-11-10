@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .genome import NO_CALL, Genome
+from .genome import NO_CALL, Genome, gt_class
 from .jobs import USER_AGENT, Job, ensure_space
 from .store import Store, cache_dir, config_dir
 
@@ -39,6 +39,8 @@ RESOURCE_FIELDS = ["haplogroup", "status", "resource_file", "updated_utc", "erro
 _LEGACY_NOT_FOUND = "no such resource (HTTP 403/404)"
 
 DER, ANC, MISMATCH, NOCALL = "der", "anc", "mismatch", "nocall"
+# Near-tie: тот же #DER-узлов, сумма DER не хуже лучшей больше чем на Δ (не posterior).
+NEAR_DER_SUM_DELTA = 2
 
 _lock = threading.Lock()
 _trees: dict[tuple, "Haplotree"] = {}
@@ -176,6 +178,18 @@ def _build_index(path: Path) -> tuple:
                 variants.setdefault(v["variant"], (i, v.get("position") or 0,
                                                    v.get("ancestral") or "", v.get("derived") or ""))
     return names, parent, variants, str(data.get("publishedDate") or "")
+
+
+def cached_haplotree_size(path: Path) -> int | None:
+    """Node count if this haplotree is already in the process cache (no I/O rebuild)."""
+    try:
+        st = path.stat()
+        key = (str(path.resolve()), st.st_size, st.st_mtime_ns, INDEX_VERSION)
+    except OSError:
+        return None
+    with _lock:
+        tree = _trees.get(key)
+        return len(tree) if tree is not None else None
 
 
 def load_haplotree(path: Path) -> Haplotree:
@@ -525,12 +539,60 @@ class YLink:
 
 @dataclass
 class YBranch:
-    """Ветка активного генома на haplotree: путь от корня к глубочайшему DER."""
+    """Ветка активного генома на haplotree: путь от корня к глубочайшему DER.
+
+    candidates — лучший путь и near-tie / точные ничьи (включая path).
+    UI красит развилки и циклит O. path / tip — активный (по умолчанию 0).
+    near_tie — среди candidates есть путь слабее точного best (не только равенство).
+
+    uncertain — узлы с het/mismatch (в tip-счёт НЕ входят, только UI).
+    pruned — дети Our-пути с anc>der (отсечённые развилки), только UI.
+    uncertain_het / uncertain_other — счётчики для статус-строки.
+    """
     tip: str
     path: list[str]
     der: dict[str, int]
     anc: dict[str, int]
     derived_marks: int
+    candidates: list[list[str]] = field(default_factory=list)
+    uncertain: dict[str, int] = field(default_factory=dict)
+    pruned: list[str] = field(default_factory=list)
+    uncertain_het: int = 0
+    uncertain_other: int = 0
+    near_tie: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.candidates and self.path:
+            self.candidates = [list(self.path)]
+        elif self.candidates and not self.path:
+            self.path = list(self.candidates[0])
+            self.tip = self.path[-1] if self.path else self.tip
+        if self.pruned and not isinstance(self.pruned, list):
+            self.pruned = list(self.pruned)
+
+    @property
+    def n_candidates(self) -> int:
+        return len(self.candidates) if self.candidates else (1 if self.path else 0)
+
+    @property
+    def tie_label(self) -> str:
+        """Для статуса/notify: '' | 'tied' | 'near-tie'."""
+        if self.n_candidates <= 1:
+            return ""
+        return "near-tie" if self.near_tie else "tied"
+
+    @property
+    def uncertain_marks(self) -> int:
+        return int(self.uncertain_het) + int(self.uncertain_other)
+
+    def select(self, index: int) -> None:
+        """Сделать candidates[index] активным path/tip (для цикла O)."""
+        if not self.candidates:
+            return
+        i = index % len(self.candidates)
+        self.path = list(self.candidates[i])
+        self.tip = self.path[-1] if self.path else self.tip
+        self.derived_marks = sum(self.der.get(n, 0) for n in self.path)
 
 
 def link_y(g: Genome, tree: Haplotree, disc: Discover | None) -> YLink | None:
@@ -574,7 +636,10 @@ def _sample_y_maps(genome: Genome) -> tuple[dict[int, str], dict[str, tuple[int,
 
 
 def _discover_counts(genome: Genome, index: DiscoverIndex) -> tuple[Counter, Counter]:
-    """DER/ANC по страницам Discover, как check_haplo --match any."""
+    """DER/ANC по страницам Discover (как check_haplo --match any).
+
+    Не используется в our_branch: оставлен для отладки / будущего optional merge.
+    """
     by_pos, by_name = _sample_y_maps(genome)
     der: Counter = Counter()
     anc: Counter = Counter()
@@ -608,18 +673,37 @@ def _discover_counts(genome: Genome, index: DiscoverIndex) -> tuple[Counter, Cou
     return der, anc
 
 
-def _node_counts(link: YLink, tree: Haplotree, genome: Genome | None) -> tuple[Counter, Counter]:
-    """Запасной путь без Discover: haplotree по имени (YLink) и по позиции, без двойного счёта."""
+def _node_counts(link: YLink, tree: Haplotree, genome: Genome | None
+                 ) -> tuple[Counter, Counter, Counter, int, int]:
+    """DER/ANC (+ mismatch для UI) по haplotree: имя и позиция, без двойного счёта.
+
+    mismatch/het в tip-счёт не входят — только подсветка «шум».
+    Возвращает der, anc, uncertain[node], het_n, other_mismatch_n.
+    """
     der: Counter = Counter()
     anc: Counter = Counter()
-    for m in link.marks.values():
+    uncertain: Counter = Counter()
+    het_n = other_n = 0
+    y = genome.chroms.get("Y") if genome else None
+
+    def _note_mismatch(name: str, gt: str) -> None:
+        nonlocal het_n, other_n
+        uncertain[name] += 1
+        if gt_class(gt) == "het":
+            het_n += 1
+        else:
+            other_n += 1
+
+    for i, m in link.marks.items():
         if m.state == DER:
             der[m.node] += 1
         elif m.state == ANC:
             anc[m.node] += 1
-    y = genome.chroms.get("Y") if genome else None
+        elif m.state == MISMATCH:
+            gt = y.gts[i] if y and 0 <= i < y.n else ""
+            _note_mismatch(m.node, gt)
     if not y:
-        return der, anc
+        return der, anc, uncertain, het_n, other_n
     by_pos = tree.positions()
     seen_pos: set[int] = set()
     for i in range(y.n):
@@ -640,93 +724,282 @@ def _node_counts(link: YLink, tree: Haplotree, genome: Genome | None) -> tuple[C
                 der[name] += 1
             elif st == ANC:
                 anc[name] += 1
-    return der, anc
+            elif st == MISMATCH:
+                _note_mismatch(name, gt)
+    return der, anc, uncertain, het_n, other_n
+
+
+def _pruned_near_path(tree: Haplotree, paths: list[list[str]],
+                      der: Counter, anc: Counter) -> list[str]:
+    """Дети узлов Our-пути с anc>der — развилки, которые walk отсёк."""
+    kids = tree.child_lists()
+    on: set[str] = set()
+    for path in paths:
+        on.update(path)
+    out: set[str] = set()
+    for name in on:
+        i = tree.index.get(name)
+        if i is None:
+            continue
+        for c in kids[i]:
+            cn = tree.names[c]
+            if anc[cn] > der[cn]:
+                out.add(cn)
+    return sorted(out)
+
+
+def _score_near(got: tuple[int, int], best: tuple[int, int]) -> bool:
+    """Тот же #DER-узлов и сумма DER в пределах NEAR_DER_SUM_DELTA от лучшей."""
+    n, s = got[0], got[1]
+    bn, bs = best[0], best[1]
+    if n != bn:
+        return False
+    return s >= bs - NEAR_DER_SUM_DELTA
 
 
 def our_branch(link: YLink, tree: Haplotree, genome: Genome | None = None,
                discover: Path | None = None, progress=None) -> YBranch | None:
-    """Путь образца, как check_haplo --tree.
+    """Путь образца по топологии haplotree.
 
-    Счёт DER/ANC — по скачанным Discover JSON (имя + позиция), топология — haplotree.
-    Без Discover — запасной счёт по вариантам haplotree.
+    Счёт DER/ANC — только по вариантам haplotree (имя из YLink + позиция hg38).
+    Discover-карточки в tip не участвуют: частичная папка и alias имён узлов
+    иначе ломали путь. Аргумент discover оставлен для совместимости вызовов.
     progress(stage, done, total) — для статус-строки, без блокировки UI.
     """
-    der: Counter | None = None
-    anc: Counter | None = None
-    if genome and discover and discover.is_dir():
-        try:
-            idx = load_discover_index(discover, progress)
-            if progress:
-                progress("Scoring Y SNPs against Discover", 0, 1)
-            der, anc = _discover_counts(genome, idx)
-            if progress:
-                progress("Scoring Y SNPs against Discover", 1, 1)
-        except (OSError, ValueError, TypeError):
-            der, anc = None, None
-    if not der:
-        if progress:
-            progress("Scoring Y SNPs against haplotree", 0, 1)
-        der, anc = _node_counts(link, tree, genome)
+    _ = discover  # tip не зависит от карточек Discover
+    if progress:
+        progress("Scoring Y SNPs against haplotree", 0, 1)
+    der, anc, uncertain, het_n, other_n = _node_counts(link, tree, genome)
+    if progress:
+        progress("Scoring Y SNPs against haplotree", 1, 1)
     if not der:
         return None
     if progress:
         progress("Finding Y path", 0, 1)
     kids = tree.child_lists()
-    memo: dict[int, tuple[int, int, list[str]] | None] = {}
+    # Детские пути с лучшим счётом и near-tie (не только точное равенство).
+    memo: dict[int, list[tuple[int, int, list[str]]]] = {}
 
-    def walk(i: int) -> tuple[int, int, list[str]] | None:
+    def walk(i: int) -> list[tuple[int, int, list[str]]]:
         if i in memo:
             return memo[i]
         name = tree.names[i]
         d, a = der[name], anc[name]
         if a > d:
-            memo[i] = None
-            return None
+            memo[i] = []
+            return []
         own = 1 if d else 0
-        best: tuple[int, int, list[str]] | None = None
+        child_paths: list[tuple[int, int, list[str]]] = []
         for c in kids[i]:
-            got = walk(c)
-            if got is None:
-                continue
-            if best is None or (got[0], got[1]) > (best[0], best[1]):
-                best = got
-        if best is None:
-            res = (own, d, [name])
+            child_paths.extend(walk(c))
+        if not child_paths:
+            res = [(own, d, [name])]
         else:
-            res = (own + best[0], d + best[1], [name] + best[2])
+            key = max((p[0], p[1]) for p in child_paths)
+            keep = [p for p in child_paths if _score_near((p[0], p[1]), key)]
+            res = [(own + p[0], d + p[1], [name] + p[2]) for p in keep]
         memo[i] = res
         return res
 
     roots = [i for i, p in enumerate(tree.parent) if p < 0]
     cands: list[tuple[int, int, list[str]]] = []
     for r in roots:
-        got = walk(r)
-        if got and got[0]:
-            cands.append(got)
+        for got in walk(r):
+            if got[0]:
+                cands.append(got)
     if not cands:
         return None
     cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    path = list(cands[0][2])
-    while path and der[path[-1]] == 0:
-        path.pop()
-    if not path:
+    best = (cands[0][0], cands[0][1])
+    tied = [c for c in cands if _score_near((c[0], c[1]), best)]
+    near_tie = any((c[0], c[1]) != best for c in tied)
+
+    def _trim(raw: list[str]) -> list[str]:
+        path = list(raw)
+        while path and der[path[-1]] == 0:
+            path.pop()
+        return path
+
+    # (score, path) — primary: точный best, затем имя tip.
+    scored: list[tuple[tuple[int, int], list[str]]] = []
+    seen_tips: set[str] = set()
+    for own, dsum, raw in tied:
+        path = _trim(raw)
+        if not path:
+            continue
+        tip = path[-1]
+        if tip in seen_tips:
+            continue
+        seen_tips.add(tip)
+        scored.append(((own, dsum), path))
+    scored.sort(key=lambda sp: (0 if sp[0] == best else 1, sp[1][-1]))
+    paths = [p for _sc, p in scored]
+    if not paths:
         return None
     if progress:
         progress("Finding Y path", 1, 1)
-    return YBranch(path[-1], path, dict(der), dict(anc), sum(der[n] for n in path))
+    primary = paths[0]
+    pruned = _pruned_near_path(tree, paths, der, anc)
+    return YBranch(
+        primary[-1], primary, dict(der), dict(anc),
+        sum(der[n] for n in primary), candidates=paths,
+        uncertain=dict(uncertain), pruned=pruned,
+        uncertain_het=het_n, uncertain_other=other_n,
+        near_tie=near_tie and len(paths) > 1,
+    )
+
+
+# Версия сериализации YLink в genome.y_links (смена → полный пересчёт).
+YLINK_CACHE_ALG = "ylink:v1"
+
+
+def ylink_fps(genome: Path, store: Store) -> tuple[str, str, str]:
+    """(genome_mtime_ns, haplotree_fp, discover_fp) for genome.y_links freshness."""
+    genome = Path(genome).expanduser().resolve()
+    gmt = str(genome.stat().st_mtime_ns) if genome.is_file() else ""
+    tree_path = store.path("ftdna_haplotree")
+    if tree_path and Path(tree_path).is_file():
+        st = Path(tree_path).stat()
+        tfp = f"{st.st_mtime_ns}:{st.st_size}"
+    else:
+        tfp = ""
+    folder = store.path("ftdna_discover")
+    if folder and Path(folder).is_dir():
+        folder = Path(folder).resolve()
+        log = folder.parent.parent / "resources.csv"
+        log_m = log.stat().st_mtime_ns if log.is_file() else 0
+        dfp = f"{YLINK_CACHE_ALG}:{folder}:{log_m}"
+    else:
+        dfp = YLINK_CACHE_ALG
+    return gmt, tfp, dfp
+
+
+def _pack_ylink(link: YLink) -> dict:
+    return {
+        "alg": YLINK_CACHE_ALG,
+        "marks": {
+            str(i): {
+                "node": m.node, "anc": m.anc, "der": m.der,
+                "state": m.state, "downloaded": bool(m.downloaded),
+                "pos_ok": bool(m.pos_ok),
+            }
+            for i, m in link.marks.items()
+        },
+        "named": int(link.named),
+        "pos_ok": int(link.pos_ok),
+        "states": {str(k): int(v) for k, v in link.states.items()},
+        "nodes": sorted(link.nodes),
+        "nodes_downloaded": int(link.nodes_downloaded),
+        "discover": bool(link.discover),
+        "published": str(link.published or ""),
+        "derived": [int(i) for i in link.derived],
+    }
+
+
+def _unpack_ylink(raw: dict) -> YLink | None:
+    if not isinstance(raw, dict) or raw.get("alg") != YLINK_CACHE_ALG:
+        return None
+    marks: dict[int, Mark] = {}
+    for k, v in (raw.get("marks") or {}).items():
+        if not isinstance(v, dict):
+            continue
+        try:
+            marks[int(k)] = Mark(
+                str(v.get("node") or ""),
+                str(v.get("anc") or ""),
+                str(v.get("der") or ""),
+                str(v.get("state") or NOCALL),
+                bool(v.get("downloaded")),
+                bool(v.get("pos_ok")),
+            )
+        except (TypeError, ValueError):
+            continue
+    states = Counter({str(k): int(v) for k, v in (raw.get("states") or {}).items()})
+    nodes = {str(n) for n in (raw.get("nodes") or [])}
+    derived = [int(i) for i in (raw.get("derived") or [])]
+    return YLink(
+        marks,
+        int(raw.get("named") or 0),
+        int(raw.get("pos_ok") or 0),
+        states,
+        nodes,
+        int(raw.get("nodes_downloaded") or 0),
+        bool(raw.get("discover")),
+        str(raw.get("published") or ""),
+        derived,
+    )
+
+
+def load_cached_ylink(genome: Path, store: Store) -> YLink | None:
+    """Fresh YLink from DuckDB, or None on miss / stale fingerprints."""
+    from . import db
+
+    genome = Path(genome).expanduser().resolve()
+    gmt, tfp, dfp = ylink_fps(genome, store)
+    if not tfp:
+        return None
+    row = db.fetchone(
+        "SELECT payload, genome_mtime_ns, tree_fp, discover_fp "
+        "FROM genome.y_links WHERE genome_path = ?",
+        [str(genome)],
+    )
+    if not row:
+        return None
+    if row[1] != gmt or row[2] != tfp or row[3] != dfp:
+        return None
+    raw = row[0]
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    return _unpack_ylink(raw) if isinstance(raw, dict) else None
+
+
+def save_cached_ylink(genome: Path, link: YLink, store: Store) -> None:
+    from . import db
+
+    genome = Path(genome).expanduser().resolve()
+    gmt, tfp, dfp = ylink_fps(genome, store)
+    payload = json.dumps(_pack_ylink(link), ensure_ascii=False)
+    with db.locked():
+        con = db.connect()
+        con.execute("""
+            INSERT INTO genome.y_links (
+                genome_path, payload, genome_mtime_ns, tree_fp, discover_fp, updated_at
+            ) VALUES (?, ?::JSON, ?, ?, ?, ?)
+            ON CONFLICT (genome_path) DO UPDATE SET
+                payload = excluded.payload,
+                genome_mtime_ns = excluded.genome_mtime_ns,
+                tree_fp = excluded.tree_fp,
+                discover_fp = excluded.discover_fp,
+                updated_at = excluded.updated_at
+        """, [
+            str(genome), payload, gmt, tfp, dfp, datetime.now(timezone.utc),
+        ])
 
 
 def link_genome(g: Genome, store: Store) -> YLink | str:
-    """YLink или пояснение, почему связи нет."""
+    """YLink или пояснение, почему связи нет. Hits genome.y_links when fresh."""
     if "Y" not in g.chroms:
         return "no Y chromosome in this file"
     tree_path = store.path("ftdna_haplotree")
     if not tree_path or not tree_path.is_file():
         return "set the FTDNA Y-DNA Haplotree path in F2 to link the named Y markers"
+    cached = load_cached_ylink(g.path, store)
+    if cached is not None:
+        return cached
     tree = load_haplotree(tree_path)
     folder = store.path("ftdna_discover")
     disc = discover_state(folder) if folder and folder.is_dir() else None
-    return link_y(g, tree, disc) or "no Y chromosome in this file"
+    link = link_y(g, tree, disc)
+    if link is None:
+        return "no Y chromosome in this file"
+    try:
+        save_cached_ylink(g.path, link, store)
+    except Exception:  # noqa: BLE001
+        pass
+    return link
 
 
 def active_genome() -> Path | None:

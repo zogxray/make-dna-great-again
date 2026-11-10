@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+import webbrowser
 from pathlib import Path
 
 from rich.text import Text
@@ -12,16 +14,17 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
-from ...core import aadr, admix, fstats, genome_db, kg, ref_db
+from ...core import aadr, admix, chat, fstats, genome_db, kg, ref_db
 from ...core.jobs import JOBS
 from ...core.pgs import SUPERPOPS
 from ...core.store import Store
 from ...core.ylink import YBranch, YLink, active_genome, link_genome, load_haplotree, our_branch
 from ..base import KeyBar, ModeBar, Workspace, alt_keys, busy_progress, fit, hide_busy, show_busy
 from ..data.workspace import job_line
-from .view import (REGIONS, card, decide_key, draw_map, draw_y_map, epoch_bar, group_prompt,
-                   layers_view, ranks_of, region_bar, region_of, sort_tuple, source_bar,
-                   tab_bar, tree_view)
+from .view import (CARD_TABS, FILTER_TABS, REGIONS, card, card_tab_bar, decide_key, draw_map, draw_y_map,
+                   epoch_bar, group_prompt, layers_view, ranks_of, region_bar, region_of,
+                   score_filter_panel, seshat_layer_for_groups, sort_tuple, source_bar,
+                   summary_prompt, tab_bar, tree_view)
 
 JOB = "aadr-f3"
 JOB_KG = "kg-f3"
@@ -29,7 +32,8 @@ JOB_PCA = "aadr-pca"
 JOB_QPADM = "aadr-qpadm"
 JOB_IMPUTE = "aadr-impute"
 JOB_PAINT = "kg-paint"
-JOBS_ALL = (JOB, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT)
+JOB_SUMMARY = "ref-summary"
+JOBS_ALL = (JOB, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT, JOB_SUMMARY)
 TABS = ("map", "y", "tree", "layers")
 
 
@@ -38,13 +42,14 @@ class ReferenceWorkspace(Workspace):
     DEFAULT_CSS = """
     #main { height: 1fr; }
     #left-col { width: 58; height: 1fr; }
-    #groups-box { height: 2fr; border: round $primary; }
+    #groups-box { height: 1fr; border: round $primary; }
     #card-box { height: 1fr; border: round $primary; }
     #map-box { width: 1fr; border: round $primary; }
     #groups-box:focus-within, #map-box:focus-within, #card-box:focus-within { border: round $accent; }
     #groups { height: 1fr; border: none; background: transparent; }
-    #source, #epochs, #regions, #view-tabs { height: 1; padding: 0 1; }
+    #source, #epochs, #regions, #view-tabs, #card-tabs { height: 1; padding: 0 1; }
     #map-scroll { height: 1fr; overflow-x: hidden; scrollbar-size-vertical: 1; background: #1E1923; }
+    #score-filter { height: 6; padding: 0 1; background: #1E1923; }
     #card-scroll { height: 1fr; scrollbar-size-vertical: 1; }
     #map { padding: 0; background: #1E1923; }
     #card { padding: 0 1; }
@@ -64,6 +69,7 @@ class ReferenceWorkspace(Workspace):
         Binding(alt_keys("g"), "toggle_source", "AADR/1000G"),
         Binding(alt_keys("v"), "toggle_tab", "Map/Tree/Layers"),
         Binding(alt_keys("c"), "cancel", "Cancel"),
+        Binding(alt_keys("x"), "score_clear", "Clear score filter"),
     ]
 
     def __init__(self, store: Store) -> None:
@@ -108,6 +114,30 @@ class ReferenceWorkspace(Workspace):
         self._play = None
         self._meta_by_name: dict[str, dict] = {}
         self.loading_msg: str | None = None
+        # False while worker OR post-loader GROUPS/MAP/GROUP paint runs.
+        self.ui_ready: bool = True
+        self.last_load_s: float = 0.0
+        self.last_apply_s: float = 0.0
+        self.last_paint_s: float = 0.0
+        self.last_fill_list_s: float = 0.0
+        self.last_refresh_map_s: float = 0.0
+        self.last_refresh_card_s: float = 0.0
+        # Score floors + context under the map (None / defaults = off).
+        self.score_lo_min: float | None = None   # cut far (low lo)
+        self.score_z_min: float | None = None    # cut imprecise Z
+        self.score_snp_min: int | None = None    # cut thin coverage
+        self.score_n_min: int | None = None      # cut small groups
+        self.score_se_max: float | None = None   # cut noisy SE
+        self.score_y: str = "all"                # all | line | same
+        self.score_coords: bool = False          # only groups with lat/lon
+        self.score_bp_max: float | None = None   # cut older than BP
+        self.filter_tab: str = "floors"          # floors | tips
+        # GROUP card tabs: our | catalog | summary
+        self.card_tab: str = "our"
+        # name → {text, model, ts}; same lifetime as lore_cache (session)
+        self.summary_cache: dict[str, dict] = {}
+        self.summary_job_key: str | None = None  # subject currently generating
+
         self._load_gen = 0
 
     def compose(self) -> ComposeResult:
@@ -120,12 +150,14 @@ class ReferenceWorkspace(Workspace):
                 with Vertical(id="groups-box"):
                     yield OptionList(id="groups")
                 with Vertical(id="card-box"):
+                    yield Static(id="card-tabs")
                     with VerticalScroll(id="card-scroll"):
                         yield Static(id="card")
             with Vertical(id="map-box"):
                 yield Static(id="view-tabs")
                 with VerticalScroll(id="map-scroll"):
                     yield Static(id="map")
+                yield Static(id="score-filter")
         yield KeyBar([("←→", "Epoch", "screen.epoch_step(1)"), ("Space", "Play", "screen.toggle_play"),
                       ("F", "Scan f3", "screen.score"), ("G", "AADR/1000G", "screen.toggle_source"),
                       ("V", "View", "screen.toggle_tab"),
@@ -134,9 +166,10 @@ class ReferenceWorkspace(Workspace):
                       ("U", "Questionable", "screen.toggle_quest"),
                       ("W", "World/fit", "screen.toggle_world"),
                       ("R", "Region", "screen.region_next"),
+                      ("X", "Clear filter", "screen.score_clear()"),
                       ("C", "Cancel", "screen.cancel"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -144,6 +177,7 @@ class ReferenceWorkspace(Workspace):
         self.query_one("#map-box").border_title = "MAP"
         self.query_one("#card-box").border_title = "GROUP"
         self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
+        self.query_one("#card-tabs", Static).update(card_tab_bar(self.card_tab))
         self.reload()
         self.query_one("#groups", OptionList).focus()
         self.set_interval(0.5, self._tick)
@@ -178,6 +212,13 @@ class ReferenceWorkspace(Workspace):
 
     def _begin_load(self, msg: str, *, title: str) -> int:
         self._load_gen += 1
+        self.ui_ready = False
+        self.last_load_s = 0.0
+        self.last_apply_s = 0.0
+        self.last_paint_s = 0.0
+        self.last_fill_list_s = 0.0
+        self.last_refresh_map_s = 0.0
+        self.last_refresh_card_s = 0.0
         self.loading_msg = msg
         self.genome = self._active()
         self._set_groups_title()
@@ -185,6 +226,39 @@ class ReferenceWorkspace(Workspace):
         show_busy(self.app, title, msg)
         busy_progress(self.app, msg, frac=0.02)
         return self._load_gen
+
+    def _finish_paint(self) -> None:
+        """GROUPS + MAP + GROUP card — still under BusyModal so bench/user see real cost."""
+        busy_progress(self.app, "GROUPS · MAP…", frac=0.92, title="Reference",
+                      subtitle="GROUPS · MAP…")
+        # Clear loading_msg so refresh_map/card draw for real (BusyModal still up).
+        self.loading_msg = None
+        self._set_groups_title()
+        t0 = time.perf_counter()
+        t = time.perf_counter()
+        self.fill_list()
+        self.last_fill_list_s = time.perf_counter() - t
+        # refresh_all minus map/card so we can split timings
+        src = source_bar(self.source)
+        self.query_one("#source", Static).update(src)
+        self.query_one("#epochs", Static).update(
+            epoch_bar(self.epoch, self.present_epochs(), self.playing, self._epoch_labels()))
+        self.query_one("#regions", Static).update(
+            region_bar(self.area, self.present_regions()))
+        self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
+        title = {"map": "MAP", "y": "Y", "tree": "TREE", "layers": "LAYERS"}.get(self.tab, "MAP")
+        self.query_one("#map-box").border_title = title
+        t = time.perf_counter()
+        self.refresh_map()
+        self.last_refresh_map_s = time.perf_counter() - t
+        t = time.perf_counter()
+        self.refresh_card()
+        self.last_refresh_card_s = time.perf_counter() - t
+        self.refresh_score_filter()
+        self.update_status()
+        self.last_paint_s = time.perf_counter() - t0
+        hide_busy(self.app)
+        self.ui_ready = True
 
     def reload(self) -> None:
         """Полная перезагрузка каталога + результатов + Y — в фоне, модальный BusyModal."""
@@ -199,6 +273,7 @@ class ReferenceWorkspace(Workspace):
         self.run_worker(lambda: self._genome_work(gen), thread=True, exclusive=True, group="ref-load")
 
     def _reload_work(self, gen: int) -> None:
+        t0 = time.perf_counter()
         store = self.store
         source = self.source
         questionable = self.questionable
@@ -234,13 +309,16 @@ class ReferenceWorkspace(Workspace):
         y = self._compute_y(cat, genome, store)
         problem = aadr_problem if source == "aadr" else (
             kg_problem or ("No 1000 Genomes pops." if not kg_groups else ""))
+        load_s = time.perf_counter() - t0
         self.app.call_from_thread(self._apply_reload, gen, {
             "genome": genome, "cat": cat, "problem": problem,
             "kg_groups": kg_groups, "kg_people_groups": kg_people, "kg_problem": kg_problem,
+            "load_s": load_s,
             **results, **y,
         })
 
     def _genome_work(self, gen: int) -> None:
+        t0 = time.perf_counter()
         genome = self._active()
         source = self.source
         questionable = self.questionable
@@ -251,8 +329,9 @@ class ReferenceWorkspace(Workspace):
         self.app.call_from_thread(self._load_progress, gen,
                                   f"Updating Y for {genome.name}…" if genome else "Updating…", 0.65)
         y = self._compute_y(cat, genome, self.store)
+        load_s = time.perf_counter() - t0
         self.app.call_from_thread(self._apply_genome, gen, {
-            "genome": genome, **results, **y,
+            "genome": genome, "load_s": load_s, **results, **y,
         })
 
     def _load_progress(self, gen: int, msg: str, frac: float = 0.1) -> None:
@@ -266,31 +345,48 @@ class ReferenceWorkspace(Workspace):
     def _apply_reload(self, gen: int, data: dict) -> None:
         if gen != self._load_gen:
             return
-        self.loading_msg = None
-        hide_busy(self.app)
-        self.genome = data["genome"]
-        self.cat = data["cat"]
-        self.problem = data["problem"]
-        self.kg_groups = data["kg_groups"]
-        self.kg_people_groups = data["kg_people_groups"]
-        self.kg_problem = data["kg_problem"]
-        self._apply_results_y(data)
-        self.fill_list()
-        self.refresh_all()
+        self.last_load_s = float(data.get("load_s") or 0.0)
+        try:
+            self.genome = data["genome"]
+            self.cat = data["cat"]
+            self.problem = data["problem"]
+            self.kg_groups = data["kg_groups"]
+            self.kg_people_groups = data["kg_people_groups"]
+            self.kg_problem = data["kg_problem"]
+            busy_progress(self.app, "apply · layers…", frac=0.88, title="Reference",
+                          subtitle="apply · layers…")
+            t = time.perf_counter()
+            self._apply_results_y(data)
+            self.last_apply_s = time.perf_counter() - t
+            self._finish_paint()
+        except Exception:
+            self.loading_msg = None
+            hide_busy(self.app)
+            self.ui_ready = True
+            raise
 
     def _apply_genome(self, gen: int, data: dict) -> None:
         if gen != self._load_gen:
             return
-        self.loading_msg = None
-        hide_busy(self.app)
-        self.genome = data["genome"]
-        if self.source == "aadr":
-            self.problem = "" if self.cat else "Set the AADR folder in F2."
-        else:
-            self.problem = self.kg_problem or ("No 1000 Genomes pops." if not self.kg_groups else "")
-        self._apply_results_y(data)
-        self.fill_list()
-        self.refresh_all()
+        self.last_load_s = float(data.get("load_s") or 0.0)
+        try:
+            self.genome = data["genome"]
+            if self.source == "aadr":
+                self.problem = "" if self.cat else "Set the AADR folder in F2."
+            else:
+                self.problem = self.kg_problem or (
+                    "No 1000 Genomes pops." if not self.kg_groups else "")
+            busy_progress(self.app, "apply · layers…", frac=0.88, title="Reference",
+                          subtitle="apply · layers…")
+            t = time.perf_counter()
+            self._apply_results_y(data)
+            self.last_apply_s = time.perf_counter() - t
+            self._finish_paint()
+        except Exception:
+            self.loading_msg = None
+            hide_busy(self.app)
+            self.ui_ready = True
+            raise
 
     def _apply_results_y(self, data: dict) -> None:
         self.results = data["results"]
@@ -519,6 +615,59 @@ class ReferenceWorkspace(Workspace):
             return True
         return region_of(g.lat, g.lon) == self.area
 
+    def _filter_group(self, name: str) -> aadr.Group | None:
+        if self.source == "kg":
+            pool = self.kg_people_groups if self.people_mode else self.kg_groups
+            return next((g for g in pool if g.name == name), None)
+        if not self.cat:
+            return None
+        if self.people_mode:
+            i = self.cat.by_gid.get(name)
+            return aadr.as_group(self.cat.samples[i]) if i is not None else None
+        return self.cat.groups.get(name)
+
+    def _passes_score_filter(self, name: str, scores: dict[str, aadr.F3]) -> bool:
+        """Floors + context under the map."""
+        need_score = (self.score_lo_min is not None or self.score_z_min is not None
+                      or self.score_snp_min is not None or self.score_n_min is not None
+                      or self.score_se_max is not None)
+        need_ctx = (self.score_y != "all" or self.score_coords
+                    or self.score_bp_max is not None)
+        if not need_score and not need_ctx:
+            return True
+        r = scores.get(name)
+        if need_score:
+            if not r or not r.ok:
+                return False
+            lo = r.est - 2 * r.se
+            if self.score_lo_min is not None and lo < self.score_lo_min:
+                return False
+            if self.score_z_min is not None and r.z < self.score_z_min:
+                return False
+            if self.score_snp_min is not None and r.snps < self.score_snp_min:
+                return False
+            if self.score_n_min is not None and r.n < self.score_n_min:
+                return False
+            if self.score_se_max is not None and r.se > self.score_se_max:
+                return False
+        if self.score_y != "all":
+            hit = self._hit_of(name)
+            if self.score_y == "same":
+                if not hit or hit.relation != "same":
+                    return False
+            elif self.score_y == "line":
+                if not hit or hit.relation not in aadr.ON_BRANCH:
+                    return False
+        if self.score_coords or self.score_bp_max is not None:
+            g = self._filter_group(name)
+            if self.score_coords:
+                if not g or g.lat is None or g.lon is None or (g.lat == 0 and g.lon == 0):
+                    return False
+            if self.score_bp_max is not None:
+                if not g or g.bp is None or g.bp > self.score_bp_max:
+                    return False
+        return True
+
     def _row_key(self, g: aadr.Group, scores: dict[str, aadr.F3]) -> tuple:
         """Один ряд: lo = est − 2·se, потом Z, SNP, Y."""
         r = scores.get(g.name)
@@ -536,7 +685,8 @@ class ReferenceWorkspace(Workspace):
             pool = self.kg_people_groups if self.people_mode else self.kg_groups
             rows = [g for g in pool
                     if (self.epoch == "all" or g.epoch == self.epoch)
-                    and self._in_region(g)]
+                    and self._in_region(g)
+                    and self._passes_score_filter(g.name, scores)]
             rows.sort(key=lambda g: self._row_key(g, scores))
             if (self.epoch == "all" and self.area == "all" and self.people_mode
                     and len(rows) > 250):
@@ -558,7 +708,8 @@ class ReferenceWorkspace(Workspace):
                 if self.y_only and not self._on_line(s.gid):
                     continue
                 if self.y_only or s.gid in self.hits_people or s.lat is not None or s.gid in self.people:
-                    rows.append(g)
+                    if self._passes_score_filter(s.gid, scores):
+                        rows.append(g)
         else:
             for g in self.cat.groups.values():
                 if self._gcount(g) <= 0:
@@ -570,7 +721,8 @@ class ReferenceWorkspace(Workspace):
                 if self.y_only and not self._on_line(g.name):
                     continue
                 if self.y_only or g.name in self.hits or g.lat is not None or g.name in self.results:
-                    rows.append(g)
+                    if self._passes_score_filter(g.name, scores):
+                        rows.append(g)
 
         rows.sort(key=lambda g: self._row_key(g, scores))
         if (self.epoch == "all" and self.area == "all" and not self.y_only
@@ -583,6 +735,7 @@ class ReferenceWorkspace(Workspace):
             return []
         hits = self.hits_people if self.people_mode else self.hits
         rows: list[aadr.Group] = []
+        scores = self._scores()
         if self.people_mode:
             for s in self.cat.samples:
                 if not self._kept(s) or s.gid not in hits:
@@ -591,6 +744,8 @@ class ReferenceWorkspace(Workspace):
                 if self.epoch != "all" and g.epoch != self.epoch:
                     continue
                 if not self._in_region(g):
+                    continue
+                if not self._passes_score_filter(s.gid, scores):
                     continue
                 rows.append(g)
         else:
@@ -601,23 +756,31 @@ class ReferenceWorkspace(Workspace):
                     continue
                 if not self._in_region(g):
                     continue
+                if not self._passes_score_filter(g.name, scores):
+                    continue
                 rows.append(g)
         return rows
 
     def _cap_rows(self, rows: list[aadr.Group], scores: dict[str, aadr.F3]) -> list[aadr.Group]:
         """Первые 200 по lo, плюс Y-линия и хвост unscored — не больше 250."""
+        # Compare by name — `g in list` uses Group dataclass __eq__ (~n² field scans).
         ok = [g for g in rows if (r := scores.get(g.name)) and r.ok]
-        other = [g for g in rows if g not in ok]
+        ok_names = {g.name for g in ok}
+        other = [g for g in rows if g.name not in ok_names]
         out: list[aadr.Group] = []
+        seen: set[str] = set()
         for g in ok[:200]:
             out.append(g)
-        extra_y = [g for g in rows if self._on_line(g.name) and g not in out]
+            seen.add(g.name)
+        extra_y = [g for g in rows if self._on_line(g.name) and g.name not in seen]
         extra_y.sort(key=lambda g: self._y_rank(g.name))
         for g in extra_y:
             out.append(g)
+            seen.add(g.name)
         for g in other:
-            if g not in out:
+            if g.name not in seen:
                 out.append(g)
+                seen.add(g.name)
             if len(out) >= 250:
                 break
         return out[:250]
@@ -675,6 +838,43 @@ class ReferenceWorkspace(Workspace):
             bits.append("Q")
         self.query_one("#groups-box").border_subtitle = " · ".join(bits)
         self._set_groups_title()
+        self.refresh_score_filter(shown=len(rows))
+
+    def refresh_score_filter(self, shown: int | None = None) -> None:
+        scores = self._scores()
+        if shown is None:
+            shown = len(self.visible())
+        total = sum(1 for r in scores.values() if r.ok)
+        box = self.query_one("#score-filter", Static)
+        # Content width inside padding: 0 1 → two cells of pad.
+        width = max(52, (box.size.width or 96) - 2)
+        # Two columns + "│ " gutter — must fit without wrap (wrap ate SE chrome).
+        col_w = max(24, (width - 2) // 2)
+        bar_w = max(6, col_w - 20)
+        bps: list[float] = []
+        for name, r in scores.items():
+            if not r.ok:
+                continue
+            g = self._filter_group(name)
+            if g and g.bp is not None and g.bp > 0:
+                bps.append(float(g.bp))
+        box.update(score_filter_panel(
+            scores,
+            lo_min=self.score_lo_min,
+            z_min=self.score_z_min,
+            snp_min=self.score_snp_min,
+            n_min=self.score_n_min,
+            se_max=self.score_se_max,
+            y_mode=self.score_y,
+            coords_only=self.score_coords,
+            bp_max=self.score_bp_max,
+            bp_values=bps,
+            shown=shown,
+            total=total,
+            bar_width=bar_w,
+            col_width=col_w,
+            tab=self.filter_tab,
+        ))
 
     @property
     def current(self) -> aadr.Group | None:
@@ -732,6 +932,7 @@ class ReferenceWorkspace(Workspace):
         self.query_one("#map-box").border_title = title
         self.refresh_map()
         self.refresh_card()
+        self.refresh_score_filter()
         self.update_status()
 
     def refresh_map(self) -> None:
@@ -807,16 +1008,29 @@ class ReferenceWorkspace(Workspace):
             title = labels.get(self.epoch, self.epoch)
         if self.people_mode:
             title += " · people"
+        seshat = []
+        if self.epoch != "all" and self.source == "aadr":
+            seshat = seshat_layer_for_groups(vis, epoch=self.epoch, store=self.store)
+            if seshat:
+                title += f" · §{len(seshat)}"
         body.update(draw_map(vis, self._scores(), self._ranks(),
                              self.current.name if self.current else None, title,
-                             self.world, cols, rows_n))
+                             self.world, cols, rows_n,
+                             culture_labels=(self.epoch != "all"),
+                             seshat_anchors=seshat or None))
 
-    def refresh_card(self) -> None:
+    def _card_subject(self) -> tuple[aadr.Group | None, aadr.Sample | None, str | None]:
+        """Current GROUP/PERSON selection + cache key for SUMMARY."""
         g = self.current
         sample = None
         if (self.source == "aadr" and self.people_mode and self.cat and g
                 and g.name in self.cat.by_gid):
             sample = self.cat.samples[self.cat.by_gid[g.name]]
+        key = sample.gid if sample is not None else (g.name if g else None)
+        return g, sample, key
+
+    def refresh_card(self) -> None:
+        g, sample, key = self._card_subject()
         if g is None:
             title = "GROUP"
         elif sample is not None:
@@ -824,8 +1038,16 @@ class ReferenceWorkspace(Workspace):
         else:
             title = f"GROUP · {g.name}"
         self.query_one("#card-box").border_title = fit(title, 40)
+        self.query_one("#card-tabs", Static).update(card_tab_bar(self.card_tab))
         info = self._meta_by_name.get(g.name) if g else None
         ranks = self._ranks()
+        busy = bool(key and self.summary_job_key == key
+                    and (job := JOBS.get(JOB_SUMMARY)) and job.running)
+        draft = ""
+        model_hint = ""
+        if busy and (job := JOBS.get(JOB_SUMMARY)):
+            draft = job.draft or ""
+            model_hint = job.stage or ""
         t = card(g, sample=sample,
                  cat=self.cat if self.source == "aadr" else None,
                  hit=self._hit_of(g.name) if g else None,
@@ -837,7 +1059,13 @@ class ReferenceWorkspace(Workspace):
                  place=info["place"] if info else None,
                  ok_total=info["ok_total"] if info else 0,
                  decide=info["decide"] if info else "lo",
-                 rank=ranks.get(g.name) if g else None)
+                 rank=ranks.get(g.name) if g else None,
+                 tab=self.card_tab,
+                 summary=self.summary_cache.get(key) if key else None,
+                 summary_busy=busy,
+                 summary_draft=draft,
+                 summary_model=model_hint,
+                 y_hits=self.hits_people)
         self.query_one("#card", Static).update(t)
 
     def update_status(self) -> None:
@@ -884,6 +1112,9 @@ class ReferenceWorkspace(Workspace):
             self.update_status()
             if self.tab == "layers" and not self.loading_msg:
                 self.refresh_map()
+            # Stream SUMMARY draft into the card while Gemini answers.
+            if self.card_tab == "summary" and JOBS.get(JOB_SUMMARY) and JOBS.get(JOB_SUMMARY).running:
+                self.refresh_card()
         if self.genome and not self.loading_msg:
             stamp = self._panel_stamp(self.genome, self.source, self.questionable)
             layer_stamp = ref_db.layer_stamps(self.genome, self.questionable)
@@ -895,6 +1126,9 @@ class ReferenceWorkspace(Workspace):
             job = JOBS.get(k)
             if job and not job.running and id(job) not in self.seen_job:
                 self.seen_job.add(id(job))
+                if k == JOB_SUMMARY:
+                    self._finish_summary_job(job)
+                    continue
                 sev = {"done": "information", "failed": "error"}.get(job.status, "warning")
                 self.app.notify(f"{job.title}: {job.message}", severity=sev, timeout=8)
                 self.refresh_all()
@@ -907,6 +1141,182 @@ class ReferenceWorkspace(Workspace):
     def _highlighted(self) -> None:
         self.refresh_card()
         self.refresh_map()
+
+    def action_score_set(self, axis: str, value: float) -> None:
+        """Click a band cell: floor (≥) or ceiling (≤) depending on axis."""
+        if axis == "lo":
+            self.score_lo_min = float(value)
+        elif axis == "z":
+            self.score_z_min = float(value)
+        elif axis == "snp":
+            self.score_snp_min = int(round(float(value)))
+        elif axis == "n":
+            self.score_n_min = max(1, int(round(float(value))))
+        elif axis == "se":
+            self.score_se_max = float(value)
+        elif axis == "age":
+            self.score_bp_max = float(value)
+        else:
+            return
+        self.fill_list()
+        self.refresh_all()
+
+    def _score_axis_values(self, axis: str) -> list[float]:
+        """Sorted unique observed values for one filter axis (for edge/step)."""
+        scores = self._scores()
+        ok = [r for r in scores.values() if r.ok]
+        if not ok:
+            return []
+        raw: list[float] = []
+        if axis == "lo":
+            raw = [r.est - 2 * r.se for r in ok]
+        elif axis == "z":
+            raw = [r.z for r in ok]
+        elif axis == "snp":
+            raw = [float(r.snps) for r in ok]
+        elif axis == "n":
+            raw = [float(max(1, r.n)) for r in ok]
+        elif axis == "se":
+            raw = [r.se for r in ok if r.se > 0]
+        elif axis == "age":
+            for r in ok:
+                g = self._filter_group(r.name)
+                if g and g.bp is not None and g.bp > 0:
+                    raw.append(float(g.bp))
+        else:
+            return []
+        # Unique sorted — step lands on real observed values (critical for clustered lo).
+        return sorted({float(v) for v in raw})
+
+    @staticmethod
+    def _log_step_size(i: int, n: int, *, dense_at_high: bool) -> int:
+        """Index step: finer near the dense end (lo packs at the high end).
+
+        Same spirit as ranks_of log bend — top of the lo scale needs 1-rank nudges.
+        """
+        if n <= 2:
+            return 1
+        # 0 at dense end → 1; 1 at sparse end → up to ~n/20
+        if dense_at_high:
+            dist = (n - 1 - i) / (n - 1)
+        else:
+            dist = i / (n - 1)
+        return max(1, int(round(1 + dist * max(1.0, n / 20.0))))
+
+    def action_score_step(self, axis: str, end: str) -> None:
+        """‹ / › — one log-aware step along observed values.
+
+        Floors: ‹ weaker (lower threshold), › stricter (higher).
+        Ceilings: ‹ stricter (lower), › looser (higher).
+        """
+        vals = self._score_axis_values(axis)
+        if not vals:
+            return
+        end = "hi" if end in ("hi", "right", "strong") else "lo"
+        floor = axis in ("lo", "z", "snp", "n")
+        # Dense packing: lo/Z/SNP/n near high; SE near low; age more even → treat as high-sparse.
+        dense_at_high = axis in ("lo", "z", "snp", "n")
+        cur = {
+            "lo": self.score_lo_min,
+            "z": self.score_z_min,
+            "snp": float(self.score_snp_min) if self.score_snp_min is not None else None,
+            "n": float(self.score_n_min) if self.score_n_min is not None else None,
+            "se": self.score_se_max,
+            "age": self.score_bp_max,
+        }.get(axis)
+        n = len(vals)
+        if cur is None:
+            # First step engages the filter from the inclusive end.
+            i = 0 if (floor and end == "lo") or (not floor and end == "hi") else n - 1
+            if floor and end == "lo":
+                # ‹ from off → lightest floor (min)
+                i = 0
+            elif floor and end == "hi":
+                i = max(0, n - 1 - self._log_step_size(n - 1, n, dense_at_high=dense_at_high))
+            elif not floor and end == "lo":
+                i = min(n - 1, self._log_step_size(0, n, dense_at_high=dense_at_high))
+            else:
+                i = n - 1
+        else:
+            # Nearest index in sorted unique values.
+            i = min(range(n), key=lambda k: (abs(vals[k] - float(cur)), k))
+            direction = -1 if end == "lo" else 1
+            step = self._log_step_size(i, n, dense_at_high=dense_at_high)
+            i = max(0, min(n - 1, i + direction * step))
+        self.action_score_set(axis, vals[i])
+
+    def action_score_edge(self, axis: str, end: str) -> None:
+        """« / » — jump to bar left (lo) or right (hi) extreme.
+
+        Floors (lo/Z/SNP/n): « clears (off), » sets max (strictest floor).
+        Ceilings (SE/age): « sets min (strictest), » clears (off).
+        """
+        vals = self._score_axis_values(axis)
+        if not vals:
+            return
+        end = "hi" if end in ("hi", "right", "strong") else "lo"
+        floor = axis in ("lo", "z", "snp", "n")
+
+        def clear() -> None:
+            self.action_score_clear(axis)
+
+        if floor:
+            if end == "lo":
+                clear()
+            else:
+                self.action_score_set(axis, vals[-1])
+            return
+        # ceilings
+        if end == "lo":
+            self.action_score_set(axis, vals[0])
+        else:
+            clear()
+
+    def action_score_clear(self, axis: str | None = None) -> None:
+        """Clear one axis, or all (X / reset)."""
+        if axis in (None, "", "all"):
+            self.score_lo_min = None
+            self.score_z_min = None
+            self.score_snp_min = None
+            self.score_n_min = None
+            self.score_se_max = None
+            self.score_y = "all"
+            self.score_coords = False
+            self.score_bp_max = None
+        elif axis == "lo":
+            self.score_lo_min = None
+        elif axis == "z":
+            self.score_z_min = None
+        elif axis == "snp":
+            self.score_snp_min = None
+        elif axis == "n":
+            self.score_n_min = None
+        elif axis == "se":
+            self.score_se_max = None
+        elif axis == "age":
+            self.score_bp_max = None
+        else:
+            return
+        self.fill_list()
+        self.refresh_all()
+
+    def action_score_y(self, mode: str) -> None:
+        if mode not in ("all", "line", "same"):
+            mode = "all"
+        self.score_y = mode
+        self.fill_list()
+        self.refresh_all()
+
+    def action_score_coords(self, on: bool = True) -> None:
+        self.score_coords = bool(on)
+        self.fill_list()
+        self.refresh_all()
+
+    def action_filter_tab(self, key: str) -> None:
+        if key not in FILTER_TABS or key == self.filter_tab:
+            return
+        self.filter_tab = key
+        self.refresh_score_filter()
 
     def action_epoch(self, key: str) -> None:
         self.epoch = key
@@ -1065,6 +1475,91 @@ class ReferenceWorkspace(Workspace):
     def action_toggle_tab(self) -> None:
         i = TABS.index(self.tab) if self.tab in TABS else 0
         self.action_tab(TABS[(i + 1) % len(TABS)])
+
+    def action_card_tab(self, key: str) -> None:
+        if key not in CARD_TABS or key == self.card_tab:
+            return
+        self.card_tab = key
+        self.refresh_card()
+        self.query_one("#card-scroll").scroll_home(animate=False)
+
+    def action_open_doi(self, doi: str) -> None:
+        doi = (doi or "").strip()
+        if not doi:
+            return
+        url = doi if doi.lower().startswith("http") else f"https://doi.org/{doi}"
+        try:
+            webbrowser.open(url)
+            self.app.notify(f"Open DOI · {doi}")
+        except Exception as exc:  # noqa: BLE001
+            self.app.notify(f"Could not open DOI: {exc}", severity="error")
+
+    def action_ask_summary(self, refresh: bool = False) -> None:
+        """SUMMARY tab: ask Chat model for a scientific brief grounded in ANNO."""
+        g, sample, key = self._card_subject()
+        if g is None or not key:
+            self.app.notify("Select a group first", severity="warning")
+            return
+        if (job := JOBS.get(JOB_SUMMARY)) and job.running:
+            self.app.notify("Summary already running · C to cancel", severity="warning")
+            return
+        if not chat.api_key(self.store):
+            self.app.notify("Set the Gemini API key in F2 (Google Gemini · P)",
+                            severity="warning")
+            return
+        if not refresh and key in self.summary_cache and self.summary_cache[key].get("text"):
+            self.card_tab = "summary"
+            self.refresh_card()
+            return
+        keep: list[aadr.Sample] = []
+        if self.cat and self.source == "aadr":
+            keep = [s for s in (self.cat.samples[i] for i in g.samples)
+                    if s.keep or (self.questionable and s.questionable)]
+        prompt = summary_prompt(g, keep, sample=sample)
+        title = f"Summary · {key}"[:48]
+        store = self.store
+        subject = key
+
+        def work(job) -> str:
+            t = chat.new_thread()
+            t.title = title
+            t.messages.append(chat.Message("user", prompt))
+            chat.save(t)
+            chat.send(store, t, job)
+            # Prefer the model reply on the thread (send also streams into job.draft).
+            text = next((m.text for m in reversed(t.messages) if m.role == "model"), "")
+            return (text or job.draft or "").strip() or "(empty reply)"
+
+        self.summary_job_key = subject
+        self.card_tab = "summary"
+        JOBS.start(JOB_SUMMARY, title, work)
+        self.refresh_card()
+        self.update_status()
+
+    def _finish_summary_job(self, job) -> None:
+        key = self.summary_job_key
+        self.summary_job_key = None
+        if not key:
+            self.refresh_card()
+            return
+        if job.status == "done":
+            # JOBS stores work() return value in job.message.
+            text = (job.message or job.draft or "").strip()
+            if text in ("done",):
+                text = (job.draft or "").strip()
+            model = chat.model_label(self.store)
+            self.summary_cache[key] = {
+                "text": text or "(empty reply)",
+                "model": model,
+                "ts": chat.now(),
+            }
+            self.app.notify(f"Summary · {key}", severity="information", timeout=6)
+        elif job.status == "failed":
+            self.app.notify(f"Summary failed: {job.message}", severity="error", timeout=10)
+        else:
+            self.app.notify(f"Summary: {job.message or job.status}", severity="warning", timeout=8)
+        self.card_tab = "summary"
+        self.refresh_card()
 
     def action_layer(self, kind: str) -> None:
         if not self.genome:

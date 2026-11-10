@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 from rich.text import Text
@@ -22,13 +23,36 @@ from .data import (STAGES, _apply_discover, graft_path, hydrate_node, load_or_bu
 from .screens import FilterScreen, HelpScreen, IssuesScreen, SearchResults
 from .tabs import TABS, Ctx
 from .view import (SHORT_CLASS, SORT_LABELS, SORT_MODES, BranchView, glyph_legend,
-                   legend_text, no_haplotree_guide)
+                   legend_text, no_haplotree_guide, our_y_styles)
 
 FETCH_JOB = "tree_discover_fetch"  # отдельно от F2 ftdna_discover, иначе джобы блокируют друг друга
 
 
 SECTION_KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "minus", "equals_sign"]
 SECTION_LABELS = "1234567890-="
+
+
+def _no_branch_reason(link: YLink, genome) -> str:
+    """Почему our_branch вернул None — для notify, без спама."""
+    y = getattr(genome, "chroms", {}).get("Y") if genome is not None else None
+    if y is not None and y.n:
+        nc = 0
+        if hasattr(y, "classes") and isinstance(y.classes, dict):
+            nc = int(y.classes.get("nocall", 0) or 0)
+        if nc >= y.n:
+            return f"Y has {y.n:,} SNPs, all no-call (--)"
+    states = link.states if isinstance(link.states, Counter) else Counter()
+    der = int(states.get("der", 0) or 0)
+    noc = int(states.get("nocall", 0) or 0)
+    named = int(link.named or 0)
+    if named and der == 0 and noc >= named:
+        return f"{named:,} named Y SNPs, all no-call (--)"
+    if named and der == 0:
+        return f"{named:,} named Y SNPs · 0 derived (anc/nocall/mismatch only)"
+    if not named:
+        return "no named Y SNPs matched the haplotree"
+    return "no derived Y path on the haplotree"
+
 
 class TreeWorkspace(Workspace):
     mode_key = "tree"
@@ -69,6 +93,7 @@ class TreeWorkspace(Workspace):
         Binding("l", "apply_local", "Apply local", show=False),
         Binding("c", "cancel_fetch", "Cancel fetch", show=False),
         Binding("m", "map_fullscreen", "Map fullscreen", show=False),
+        Binding("a", "ask_gpt", "Ask GPT", show=False),
         *[Binding(k, f"section({i})", t.title, show=False)
           for i, (k, t) in enumerate(zip(SECTION_KEYS, TABS))],
         Binding("left_square_bracket", "section_step(-1)", "Prev section", show=False),
@@ -99,6 +124,7 @@ class TreeWorkspace(Workspace):
         self.branch: YBranch | None = None
         self.branch_genome: Path | None = None
         self.branch_busy: str | None = None   # статус Linking Y… (лоадер до _apply_branch)
+        self.our_i: int = 0                  # активный кандидат Our Y при ничьей
         self._fetch_names: list[str] = []
         self._fetch_seen: set[int] = set()
 
@@ -157,7 +183,10 @@ class TreeWorkspace(Workspace):
         if self.stale:
             self.start_load()
         elif self.ready:
-            # Смена генома — только Our Y, без полного reload дерева.
+            # Смена генома — только Our Y. start_branch сам no-op, если этот
+            # path уже линковали (в т.ч. промах) — иначе hide_busy→resume→loop.
+            if self.branch_busy:
+                return
             self.start_branch()
 
     def on_resize(self, event) -> None:
@@ -197,6 +226,10 @@ class TreeWorkspace(Workspace):
         self.view.set_data(None)
         self.view.mine = set()
         self.view.tip = None
+        self.view.our_styles = {}
+        self.view.our_uncertain = set()
+        self.view.our_pruned = set()
+        self.our_i = 0
         self.query_one("#tree-box").border_title = "TREE · needs Haplotree"
         self.query_one("#stats", Static).update(
             "Haplotree not set · F2 → P" if missing_path is None
@@ -264,8 +297,12 @@ class TreeWorkspace(Workspace):
         # BusyModal держим до Our Y — иначе дерево мигает без подсветки ветки.
         self.branch = None
         self.branch_genome = None
+        self.our_i = 0
         self.view.mine = set()
         self.view.tip = None
+        self.view.our_styles = {}
+        self.view.our_uncertain = set()
+        self.view.our_pruned = set()
         if self.ctx:
             self.ctx.ours = set()
             self.ctx.tip = None
@@ -303,15 +340,31 @@ class TreeWorkspace(Workspace):
     def update_legend(self) -> None:
         legend = legend_text()
         legend.append("\n")
-        legend.append_text(glyph_legend(self.branch.tip if self.branch else None))
+        n = self.branch.n_candidates if self.branch else 1
+        noise = bool(self.branch and (
+            self.branch.uncertain or self.branch.pruned or self.branch.uncertain_marks))
+        legend.append_text(glyph_legend(
+            self.branch.tip if self.branch else None,
+            n_candidates=n, show_noise=noise,
+            tie_label=self.branch.tie_label if self.branch else ""))
         self.query_one("#legend", Static).update(legend)
 
     def start_branch(self, force: bool = False) -> None:
-        """Пересчёт Our Y. Лоадер закрывается только в _apply_branch."""
+        """Пересчёт Our Y. Лоадер закрывается только в _apply_branch.
+
+        Уже посчитанный геном (успех или «нет ветки») не трогаем снова —
+        иначе hide_busy → on_screen_resume → бесконечный Our Y / notify spam
+        на файлах без usable Y (сплошные --).
+        """
         if not self.ready:
             return
         path = self._active_genome()
-        if not force and path == self.branch_genome and (self.branch is not None or path is None):
+        # Тот же path уже линковали (branch или явный промах) — не крутить снова.
+        if not force and path is not None and path == self.branch_genome:
+            hide_busy(self.app)
+            self.view.focus()
+            return
+        if not force and path is None and self.branch_genome is None and self.branch is None:
             hide_busy(self.app)
             self.view.focus()
             return
@@ -355,9 +408,22 @@ class TreeWorkspace(Workspace):
             report("loading branch cache")
             branch = tree_db.load_branch(path, tree_path, disc)
             if branch is not None:
-                report("loading haplotree")
-                tree = (load_haplotree(tree_path)
-                        if tree_path and Path(tree_path).is_file() else None)
+                names: set[str] = set()
+                for p in (branch.candidates or [branch.path]):
+                    names.update(p)
+                names.update(branch.uncertain or {})
+                names.update(branch.pruned or [])
+                # Full haplotree only if Our Y names are missing from the F3 skeleton.
+                if any(n not in self.hg_nodes for n in names):
+                    report("loading haplotree")
+                    tree = (load_haplotree(tree_path)
+                            if tree_path and Path(tree_path).is_file() else None)
+                    if tree is None:
+                        self.app.call_from_thread(
+                            self._apply_branch, None, path, None, "haplotree not loaded")
+                        return
+                else:
+                    tree = None
                 self.app.call_from_thread(self._apply_branch, branch, path, tree)
                 return
             report("loading genome")
@@ -371,7 +437,9 @@ class TreeWorkspace(Workspace):
             tree = (load_haplotree(tree_path)
                     if tree_path and Path(tree_path).is_file() else None)
             if not isinstance(link, YLink) or not tree:
-                self.app.call_from_thread(self._apply_branch, None, path)
+                why = link if isinstance(link, str) else (
+                    "haplotree not loaded" if not tree else "no usable Y link")
+                self.app.call_from_thread(self._apply_branch, None, path, None, why)
                 return
             branch = our_branch(link, tree, g, disc, progress=report)
             if branch:
@@ -379,24 +447,31 @@ class TreeWorkspace(Workspace):
                     tree_db.save_branch(path, branch, tree_path, disc)
                 except Exception:
                     pass
-            self.app.call_from_thread(self._apply_branch, branch, path, tree)
+            why = None if branch else _no_branch_reason(link, g)
+            self.app.call_from_thread(self._apply_branch, branch, path, tree, why)
         except Exception:
-            self.app.call_from_thread(self._apply_branch, None, path)
+            self.app.call_from_thread(
+                self._apply_branch, None, path, None, "Our Y link failed")
 
     def _apply_branch(self, branch: YBranch | None, genome: Path | None,
-                      tree=None) -> None:
+                      tree=None, reason: str | None = None) -> None:
         if not self.ready:
             return
         # Устаревший воркер после смены генома — не трогаем текущий Linking Y / лоадер.
         if genome != self._active_genome():
             return
-        hide_busy(self.app)
-        self.branch_busy = None
         self.branch = branch
+        # Помечаем геном обработанным даже при промахе — стоп resume→retry loop.
         self.branch_genome = genome
-        if not branch or tree is None:
+        self.our_i = 0
+        if not branch:
+            hide_busy(self.app)
+            self.branch_busy = None
             self.view.mine = set()
             self.view.tip = None
+            self.view.our_styles = {}
+            self.view.our_uncertain = set()
+            self.view.our_pruned = set()
             if self.ctx:
                 self.ctx.ours = set()
                 self.ctx.tip = None
@@ -404,10 +479,23 @@ class TreeWorkspace(Workspace):
             self.update_status()
             self.view.focus()
             if genome:
-                self.app.notify(f"No Y branch for {genome.name}", severity="warning")
+                detail = reason or "no derived Y path"
+                self.app.notify(
+                    f"No Y branch for {genome.name} · {detail}",
+                    severity="warning", timeout=8)
             return
-        # Подсветка ветки: только graft недостающих узлов, не полный reload Discover-дерева.
-        added = graft_path(self.hg_nodes, tree, branch.path)
+        branch.select(0)
+        cands = list(branch.candidates or [branch.path])
+        # Подсветка: graft всех ничьих путей, не только primary.
+        # tree may be None when every name is already in the F3 skeleton (cached branch).
+        added = 0
+        all_names: set[str] = set()
+        for path in cands:
+            if tree is not None:
+                added += graft_path(self.hg_nodes, tree, path)
+            all_names.update(path)
+        all_names.update(branch.uncertain or {})
+        all_names.update(branch.pruned or [])
         rebuilt = False
         if added:
             self.hg_children, self.hg_roots = relink_children(self.hg_nodes)
@@ -416,35 +504,82 @@ class TreeWorkspace(Workspace):
             if self.ctx:
                 self.ctx.nodes = self.hg_nodes
                 self.ctx.children = self.hg_children
-            for name in branch.path:
+            for name in all_names:
                 if name not in self.haystack and name in self.hg_nodes:
                     self.haystack[name] = search_text(self.hg_nodes[name])
             rebuilt = True
         if self.vis_set is not None:
-            extra = {n for n in branch.path if n in self.hg_nodes} - self.vis_set
+            extra = {n for n in all_names if n in self.hg_nodes} - self.vis_set
             if extra:
                 self.vis_set.update(extra)
                 rebuilt = True
+        # Keep branch_busy through populate/focus: set_data resets cursor to a
+        # root and would otherwise trigger a full-tree Discover scan.
         if rebuilt:
             self.populate()
-        ours = {n for n in branch.path if n in self.hg_nodes}
-        self.view.mine = ours
-        self.view.tip = branch.tip if branch.tip in ours else (branch.path[-1] if ours else None)
-        if self.ctx:
-            self.ctx.ours = ours
-            self.ctx.tip = self.view.tip
+        self._paint_our_y()
         self.update_legend()
-        self.update_status()
         shown = self.view.focus_path(branch.path)
+        # focus_path posts Highlighted async — set current now so keybar/inspector
+        # don't scan the previous root while the message is still queued.
+        if shown:
+            self.current = shown
+        hide_busy(self.app)
+        self.branch_busy = None
+        self.update_keybar()
+        self.update_status()
+        if self.current:
+            self.refresh_inspector(keep_scroll=True)
         gname = genome.name if genome else "?"
         self.view.focus()
         if shown:
             grafted = f" · {added} from haplotree" if added else ""
+            if branch.n_candidates > 1:
+                tie = f" · {branch.n_candidates} {branch.tie_label or 'tied'} · O cycles"
+            else:
+                tie = ""
+            noise = ""
+            if branch.uncertain_marks:
+                noise = f" · {branch.uncertain_marks} uncertain"
+            if branch.pruned:
+                noise += f" · {len(branch.pruned)} pruned"
             self.app.notify(
-                f"Our Y: {branch.tip} · {gname}  ({branch.derived_marks} DER on path{grafted})")
+                f"Our Y: {branch.tip} · {gname}  "
+                f"({branch.derived_marks} DER on path{grafted}{tie}{noise})")
         else:
             self.app.notify(f"Our Y {branch.tip} · {gname} is hidden by the filter",
                             severity="warning")
+
+    def _paint_our_y(self) -> None:
+        """mine / цвета / tip / uncertain·pruned / ctx из активной ничьей Our Y."""
+        branch = self.branch
+        if not branch:
+            self.view.mine = set()
+            self.view.tip = None
+            self.view.our_styles = {}
+            self.view.our_uncertain = set()
+            self.view.our_pruned = set()
+            if self.ctx:
+                self.ctx.ours = set()
+                self.ctx.tip = None
+            return
+        cands = list(branch.candidates or [branch.path])
+        mine, styles = our_y_styles(cands)
+        mine = {n for n in mine if n in self.hg_nodes}
+        self.view.mine = mine
+        self.view.our_styles = {n: s for n, s in styles.items() if n in mine}
+        self.view.our_uncertain = {n for n in (branch.uncertain or {}) if n in self.hg_nodes}
+        self.view.our_pruned = {n for n in (branch.pruned or []) if n in self.hg_nodes}
+        tip = branch.tip if branch.tip in mine else (branch.path[-1] if branch.path else None)
+        self.view.tip = tip if tip in mine else None
+        if self.ctx:
+            # Inspector: все ничьи пути — «наши»; tip — активный кандидат.
+            self.ctx.ours = mine
+            self.ctx.tip = self.view.tip
+        try:
+            self.view.refresh()
+        except Exception:
+            pass
 
     def action_our_y(self) -> None:
         if not self.ready:
@@ -459,11 +594,23 @@ class TreeWorkspace(Workspace):
                 return
             self.start_branch(force=True)
             return
+        n = self.branch.n_candidates
+        # Уже на активном tip → следующий кандидат; иначе сначала вернуть к текущему.
+        if n > 1 and self.current == self.branch.tip:
+            self.our_i = (self.our_i + 1) % n
+            self.branch.select(self.our_i)
+            self._paint_our_y()
+            self.update_legend()
+            self.update_keybar()
+            self.update_status()
         shown = self.view.focus_path(self.branch.path)
         self.view.focus()
         gname = self.branch_genome.name if self.branch_genome else "?"
         if shown:
-            self.app.notify(f"Our Y: {shown} · {gname}")
+            if n > 1:
+                self.app.notify(f"Our Y {self.our_i + 1}/{n}: {shown} · {gname}")
+            else:
+                self.app.notify(f"Our Y: {shown} · {gname}")
         else:
             self.app.notify(f"Our Y {self.branch.tip} · {gname} is hidden by the filter",
                             severity="warning")
@@ -487,23 +634,24 @@ class TreeWorkspace(Workspace):
         items: list[tuple[str, str, str | None]] = [
             ("↑↓", "Navigate", None), ("←→", "Fold", None), ("/", "Search", "screen.focus_search"),
             ("F", "Filter", "screen.filter"), ("S", "Sort", "screen.sort"),
-            ("B", "Rich", "screen.next_rich"), ("O", "Our Y", "screen.our_y"),
+            ("B", "Rich", "screen.next_rich"),
+            ("O", "Our Y" + (" · cycle" if self.branch and self.branch.n_candidates > 1 else ""),
+             "screen.our_y"),
+            ("A", "Ask GPT", "screen.ask_gpt"),
             ("E", "Expand all", "screen.tree('expand_all')"),
             ("Z", "Collapse all", "screen.tree('collapse_all')"), ("Tab", "Panel", "screen.toggle_panel"),
             ("[", "Prev", "screen.section_step(-1)"), ("]", "Next section", "screen.section_step(1)"),
         ]
         if self._fetch_running():
             items.append(("C", "Cancel fetch", "screen.cancel_fetch"))
-        elif self.ready and self.current and self.ctx:
-            missing = self.ctx.missing_discover(self.current)
-            local = self.ctx.local_discover(self.current)
-            if self.current in local:
+        elif self.ready and self.current and self.ctx and not self.branch_busy:
+            cur = self.current
+            n_miss, _, self_miss, self_local = self.ctx.discover_subtree_stats(cur)
+            if self_local:
                 items.append(("L", "Apply local", "screen.apply_local"))
-            if self.current in missing:
+            if self_miss:
                 items.append(("D", "Fetch node", "screen.fetch_node"))
-            only_self = bool(self.hg_nodes.get(self.current, {}).get("placeholder")
-                             and missing == [self.current])
-            if missing and not only_self:
+            if n_miss and not (self_miss and n_miss == 1):
                 items.append(("⇧D", "Fetch branch", "screen.fetch_branch"))
         items += [("I", "Issues", "screen.issues"), ("?", "Help", "screen.help"),
                   ("Q", "Quit", "app.quit")]
@@ -518,11 +666,15 @@ class TreeWorkspace(Workspace):
     def refresh_inspector(self, *, keep_scroll: bool = False) -> None:
         if not self.current or not self.ctx:
             return
+        # Under Our Y BusyModal the cursor often sits on a root; Discover
+        # subtree scans there are invisible and very large — skip until linked.
+        if self.branch_busy:
+            return
         # JSON уже на диске, а узел ещё skeleton — подтянуть без сети.
         node = self.hg_nodes.get(self.current)
         if (node and node.get("placeholder") and node.get("haplotree")
                 and not self._fetch_running()
-                and self.ctx._discover_json(self.current).is_file()):
+                and self.ctx.has_discover_file(self.current)):
             self._ingest_discover([self.current], quiet=True)
             node = self.hg_nodes.get(self.current)
         # slim DuckDB-узел → тяжёлые Discover-поля с диска
@@ -628,7 +780,7 @@ class TreeWorkspace(Workspace):
         if not node.get("haplotree"):
             self.app.notify(f"{name}: not a haplotree node — cannot fetch", severity="warning")
             return
-        if self.ctx and self.ctx._discover_json(name).is_file():
+        if self.ctx and self.ctx.has_discover_file(name):
             self.action_apply_local()
             return
         self._start_fetch([name], f"Fetch {name}")
@@ -727,6 +879,7 @@ class TreeWorkspace(Workspace):
             return 0
         if self.ctx:
             self.ctx.folder = folder
+            self.ctx.invalidate_discover_index()
         loaded = skipped = 0
         for name in names:
             if name not in self.hg_nodes:
@@ -790,13 +943,21 @@ class TreeWorkspace(Workspace):
             if i:
                 t.append(" › ", style="#8A8294")
             missing = self.hg_nodes[n].get("placeholder")
+            our = self.view.our_styles.get(n) if n in self.view.mine else None
             if n == self.current:
-                style = "bold #53A94B" if n in self.view.mine else "bold #D4AD72"
+                if our:
+                    style = f"bold {our}"
+                else:
+                    style = "bold #53A94B" if n in self.view.mine else "bold #D4AD72"
+            elif our:
+                style = our
             elif n in self.view.mine:
                 style = "#53A94B"
             else:
                 style = "#8A8294" if missing else "#C3BCCC"
             t.append(n, style=click(f"screen.goto({n!r})", style))
+            if n in self.view.our_uncertain:
+                t.append("?", style="bold #B04A4A")
         crumbs.update(t)
 
     def update_status(self) -> None:
@@ -815,8 +976,19 @@ class TreeWorkspace(Workspace):
             y = f"    {self.branch_busy}"
         elif self.branch:
             gname = self.branch_genome.name if self.branch_genome else "?"
-            y = (f"    Y: {self.branch.tip} · {gname} "
-                 f"({self.branch.derived_marks} DER)")
+            n = self.branch.n_candidates
+            slot = f"{self.our_i + 1}/{n} " if n > 1 else ""
+            bits = [f"{self.branch.derived_marks} DER"]
+            if self.branch.uncertain_marks:
+                u = self.branch.uncertain_marks
+                het = self.branch.uncertain_het
+                bits.append(f"{u} uncertain" + (f" ({het} het)" if het else ""))
+            if self.branch.pruned:
+                bits.append(f"{len(self.branch.pruned)} pruned")
+            if n > 1:
+                bits.append(self.branch.tie_label or "tied")
+                bits.append("O cycles")
+            y = f"    Y: {slot}{self.branch.tip} · {gname} ({' · '.join(bits)})"
         else:
             active = self._active_genome()
             y = f"    Y: — · {active.name}" if active else "    Y: —"
@@ -860,6 +1032,31 @@ class TreeWorkspace(Workspace):
         if handler:
             handler(self.ctx)
             self.refresh_inspector()
+
+    def action_ask_gpt(self) -> None:
+        """Компактный промпт по текущей вкладке → F6 Chat."""
+        if not self.ready or not self.ctx or not self.current:
+            self.app.notify("Select a haplogroup first", severity="warning")
+            return
+        node = self.hg_nodes.get(self.current)
+        if not node:
+            self.app.notify("No node loaded", severity="warning")
+            return
+        # Подтянуть Discover-поля, как в инспекторе — иначе промпт будет скелетом.
+        if self.folder:
+            try:
+                hydrate_node(node, self.folder)
+            except Exception:  # noqa: BLE001
+                pass
+        from .ask import build_ask_prompt, tab_title_at
+        tab = tab_title_at(self.section)
+        prompt = build_ask_prompt(self.ctx, node, tab)
+        title = f"Ask · {node.get('name') or '?'} · {tab}"
+        open_fn = getattr(self.app, "open_chat_prefill", None)
+        if callable(open_fn):
+            open_fn(prompt, title=title)
+        else:
+            self.app.notify("Chat mode unavailable", severity="error")
 
     def action_map_fullscreen(self) -> None:
         """M — полноэкранная Migration Map: карта + Contact log / Migration справа."""

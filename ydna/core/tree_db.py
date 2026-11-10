@@ -357,9 +357,15 @@ def load_release(release_id: int) -> dict[str, Any]:
     }
 
 
-def branch_fps(genome: Path, haplotree: Path | None, discover: Path | None) -> tuple[str, str, str]:
-    import os
+# Версия алгоритма Our Y в кэше tree.branches (колонка discover_fp).
+# Раньше сюда писали отпечаток папки Discover; tip теперь только haplotree —
+# смена stamp сбрасывает старые Discover-скоренные ветки.
+OUR_Y_ALG = "our_y:haplotree-v4-neartie"
 
+
+def branch_fps(genome: Path, haplotree: Path | None, discover: Path | None) -> tuple[str, str, str]:
+    """(genome_mtime, haplotree_fp, our_y_alg). discover не влияет на tip."""
+    _ = discover
     genome = Path(genome)
     gmt = str(genome.stat().st_mtime_ns) if genome.is_file() else ""
     if haplotree and Path(haplotree).is_file():
@@ -367,19 +373,41 @@ def branch_fps(genome: Path, haplotree: Path | None, discover: Path | None) -> t
         tfp = f"{st.st_mtime_ns}:{st.st_size}"
     else:
         tfp = ""
-    dfp = ""
-    if discover and Path(discover).is_dir():
-        n = size = newest = 0
-        with os.scandir(discover) as it:
-            for e in it:
-                if e.name.endswith(".json") and e.is_file():
-                    st = e.stat()
-                    n += 1
-                    size += st.st_size
-                    if st.st_mtime_ns > newest:
-                        newest = st.st_mtime_ns
-        dfp = f"{n}:{size}:{newest}"
-    return gmt, tfp, dfp
+    return gmt, tfp, OUR_Y_ALG
+
+
+def _pack_branch_path(branch) -> Any:
+    """path-колонка: {path, candidates, uncertain, pruned, …}."""
+    cands = list(getattr(branch, "candidates", None) or [branch.path])
+    return {
+        "path": list(branch.path),
+        "candidates": cands,
+        "uncertain": dict(getattr(branch, "uncertain", None) or {}),
+        "pruned": list(getattr(branch, "pruned", None) or []),
+        "uncertain_het": int(getattr(branch, "uncertain_het", 0) or 0),
+        "uncertain_other": int(getattr(branch, "uncertain_other", 0) or 0),
+        "near_tie": bool(getattr(branch, "near_tie", False)),
+    }
+
+
+def _unpack_branch_path(raw) -> tuple[
+    list[str], list[list[str]], dict[str, int], list[str], int, int, bool
+]:
+    if isinstance(raw, dict):
+        path = [str(x) for x in (raw.get("path") or [])]
+        cands_raw = raw.get("candidates") or ([path] if path else [])
+        cands = [[str(x) for x in p] for p in cands_raw if p]
+        if not cands and path:
+            cands = [path]
+        unc_raw = raw.get("uncertain") or {}
+        uncertain = {str(k): int(v) for k, v in unc_raw.items()} if isinstance(unc_raw, dict) else {}
+        pruned = [str(x) for x in (raw.get("pruned") or [])]
+        het = int(raw.get("uncertain_het") or 0)
+        other = int(raw.get("uncertain_other") or 0)
+        near = bool(raw.get("near_tie"))
+        return path, cands, uncertain, pruned, het, other, near
+    path = [str(x) for x in (raw or [])]
+    return path, ([path] if path else []), {}, [], 0, 0, False
 
 
 def load_branch(genome: Path, haplotree: Path | None, discover: Path | None):
@@ -396,10 +424,16 @@ def load_branch(genome: Path, haplotree: Path | None, discover: Path | None):
         return None
     if row[5] != gmt or row[6] != tfp or row[7] != dfp:
         return None
-    path = _parse_json(row[1], [])
+    path, candidates, uncertain, pruned, het, other, near = _unpack_branch_path(
+        _parse_json(row[1], []))
     der = _parse_json(row[2], {})
     anc = _parse_json(row[3], {})
-    return YBranch(row[0], path, der, anc, int(row[4] or 0))
+    tip = row[0] or (path[-1] if path else "")
+    return YBranch(
+        tip, path, der, anc, int(row[4] or 0), candidates=candidates,
+        uncertain=uncertain, pruned=pruned, uncertain_het=het, uncertain_other=other,
+        near_tie=near,
+    )
 
 
 def save_branch(genome: Path, branch, haplotree: Path | None, discover: Path | None) -> None:
@@ -423,6 +457,7 @@ def save_branch(genome: Path, branch, haplotree: Path | None, discover: Path | N
                 discover_fp = excluded.discover_fp,
                 updated_at = excluded.updated_at
         """, [
-            str(genome), branch.tip, _j(branch.path), _j(branch.der), _j(branch.anc),
+            str(genome), branch.tip, _j(_pack_branch_path(branch)),
+            _j(branch.der), _j(branch.anc),
             int(branch.derived_marks), gmt, tfp, dfp, datetime.now(timezone.utc),
         ])

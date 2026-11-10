@@ -234,25 +234,54 @@ class _Canvas:
         return False
 
 
-def _extract(mm: dict) -> tuple[list, dict, Any, dict]:
+def _hg_legend_colors(mm: dict) -> dict[str, str]:
+    """Имя из haplogroup_legend → hex (как в Migration path)."""
+    out: dict[str, str] = {}
+    for item in mm.get("haplogroup_legend") or mm.get("legend") or []:
+        if isinstance(item, dict) and item.get("name") and item.get("color"):
+            out[str(item["name"])] = str(item["color"])
+    return out
+
+
+def _color_for(name: str, legend: dict[str, str], fallback: str = "#FBF6F0") -> str:
+    """Полное имя клады или корень до '-'; затем fallback."""
+    key = str(name or "")
+    if key in legend:
+        return legend[key]
+    root = key.split("-", 1)[0]
+    if root in legend:
+        return legend[root]
+    return fallback
+
+
+def _extract(mm: dict) -> tuple[list, dict, Any, dict, dict]:
+    """segs, nodes, origin, deg, node_stroke (цвет линии у узла)."""
     segs, nodes, origin, deg = [], {}, None, {}
+    node_stroke: dict[str, str] = {}
     for f in _d(mm.get("geojson")).get("features") or []:
         if not isinstance(f, dict):
             continue
         g, pr = _d(f.get("geometry")), _d(f.get("properties"))
         c = g.get("coordinates")
         if g.get("type") == "LineString" and c:
-            segs.append((c, pr.get("stroke") or COL["route"]))
+            stroke = pr.get("stroke") or COL["route"]
+            segs.append((c, stroke))
             if pr.get("startNode"):
-                nodes.setdefault(pr["startNode"], c[0])
-                deg[pr["startNode"]] = deg.get(pr["startNode"], 0) + 1
+                sn = pr["startNode"]
+                nodes.setdefault(sn, c[0])
+                deg[sn] = deg.get(sn, 0) + 1
+                node_stroke.setdefault(sn, stroke)
             if pr.get("endNode"):
-                nodes.setdefault(pr["endNode"], c[-1])
+                en = pr["endNode"]
+                nodes.setdefault(en, c[-1])
+                node_stroke.setdefault(en, stroke)
         elif g.get("type") == "Point" and c and pr.get("name"):
             nodes[pr["name"]] = c
+            if pr.get("color"):
+                node_stroke.setdefault(pr["name"], pr["color"])
             if pr.get("type") == "haplogroup":
                 origin = c
-    return segs, nodes, origin, deg
+    return segs, nodes, origin, deg, node_stroke
 
 
 def _contacts(ancient: list, mm: dict) -> list[dict]:
@@ -269,29 +298,89 @@ def _contacts(ancient: list, mm: dict) -> list[dict]:
     return out
 
 
+def _fit_col(text: Any, width: int) -> str:
+    s = str(text or "")
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s + " " * (width - len(s))
+    if width == 1:
+        return s[:1]
+    return s[: width - 1] + "…"
+
+
+def _short_country(name: str) -> str:
+    if name == "Russian Federation":
+        return "Russia"
+    if name == "United States":
+        return "USA"
+    if name == "United Kingdom":
+        return "UK"
+    return name
+
+
+def _contact_when(cl: list, fmt: Callable[[Any], str]) -> str:
+    ages = [x.get("age_estimate_mean") for x in cl if x.get("age_estimate_mean") is not None]
+    if not ages:
+        return "?"
+    if len(ages) > 1 and min(ages) != max(ages):
+        return f"{fmt(max(ages))} … {fmt(min(ages))}"
+    return fmt(max(ages))
+
+
+def _contact_place(cl: list) -> str:
+    first = cl[0] if cl else {}
+    place = first.get("site") or first.get("geography") or first.get("country_name") or "?"
+    country = _short_country(str(first.get("country_name") or ""))
+    place_s = str(place)
+    if country and country != place_s and country not in place_s:
+        return f"{place_s} · {country}"
+    return place_s
+
+
+def _contact_hg(cl: list) -> str:
+    return str((cl[0] if cl else {}).get("haplogroup_y") or "")
+
+
+def _contact_col_widths(width: int) -> tuple[int, int, int, int, int]:
+    """id, when, place, hg, n — под узкую правую панель / широкую карту."""
+    id_w, n_w = 3, 3
+    when_w = 12 if width >= 44 else 10
+    hg_w = 10 if width >= 48 else 8
+    pad = 8  # разделители между колонками
+    place_w = max(8, width - id_w - when_w - hg_w - n_w - pad)
+    return id_w, when_w, place_w, hg_w, n_w
+
+
+def _contact_rows(centers: list, fmt: Callable[[Any], str],
+                  limit: int) -> list[tuple[int, str, str, str, int]]:
+    rows: list[tuple[int, str, str, str, int]] = []
+    for i, _cx, _cy, cl in centers[:limit]:
+        rows.append((i, _contact_when(cl, fmt), _contact_place(cl), _contact_hg(cl), len(cl)))
+    return rows
+
+
 def contact_log_lines(centers: list, fmt: Callable[[Any], str] = str,
-                      limit: int = 40) -> list[tuple[str, str]]:
-    """Строки CONTACT LOG (newest first) для правой панели / Doc: [(text, style), ...]."""
+                      limit: int = 40, width: int = 42) -> list[tuple[str, str]]:
+    """CONTACT LOG B2: таблица # / when / place · country / hg / n.
+
+    ▲ только на карте; в логе — номер строки (= подпись у маркера).
+    """
     out: list[tuple[str, str]] = []
     if not centers:
         return out
+    width = max(28, width)
+    id_w, when_w, place_w, hg_w, n_w = _contact_col_widths(width)
     out.append((f"CONTACT LOG · newest first · {len(centers)}", "bold #B04A4A"))
-    for i, _cx, _cy, cl in centers[:limit]:
-        ages = [x.get("age_estimate_mean") for x in cl if x.get("age_estimate_mean") is not None]
-        when = fmt(max(ages)) if ages else "?"
-        if len(ages) > 1 and min(ages) != max(ages):
-            when = f"{fmt(max(ages))} … {fmt(min(ages))}"
-        first = cl[0]
-        place = first.get("site") or first.get("geography") or first.get("country_name") or "?"
-        country = first.get("country_name") or ""
-        hg = first.get("haplogroup_y") or ""
-        bit = f"▲{i}  {when}  {place}"
-        if country and country != place:
-            bit += f"  · {country}"
-        if hg:
-            bit += f"  · {hg}"
-        bit += f"  ×{len(cl)}"
-        out.append((bit, "#AEA5B8"))
+    out.append(("# on map = ▲ · row id matches map label", "#8A8294"))
+    hdr = (f"{'#':>{id_w}}  {_fit_col('when', when_w)}  {_fit_col('place / country', place_w)}  "
+           f"{_fit_col('hg', hg_w)}  {'n':>{n_w}}")
+    out.append((hdr, "#8A8294"))
+    out.append(("─" * min(width, len(hdr)), "#433F47"))
+    for i, when, place, hg, n in _contact_rows(centers, fmt, limit):
+        line = (f"{i:>{id_w}}  {_fit_col(when, when_w)}  {_fit_col(place, place_w)}  "
+                f"{_fit_col(hg, hg_w)}  {n:>{n_w}}")
+        out.append((line, "#AEA5B8"))
     if len(centers) > limit:
         out.append((f"… {len(centers) - limit} more", "#8A8294"))
     return out
@@ -299,12 +388,23 @@ def contact_log_lines(centers: list, fmt: Callable[[Any], str] = str,
 
 def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
                fmt: Callable[[Any], str] = str, world: bool = False, cols: int = 96,
-               max_rows: int = 30, with_log: bool = True) -> list:
-    """Рисует карту. Возвращает centers [(i, cx, cy, cluster), ...] newest first."""
+               max_rows: int = 30, with_log: bool = True,
+               show_path_legend: bool | None = None) -> list:
+    """Рисует карту. Возвращает centers [(i, cx, cy, cluster), ...] newest first.
+
+    show_path_legend: None → как not with_log (легенда под картой на fullscreen).
+    False — не рисовать (легенда уже в боковой панели).
+    """
     cols = max(30, cols)
     mm = _d(mm)
-    segs, nodes, origin, deg = _extract(mm)
+    segs, nodes, origin, deg, node_stroke = _extract(mm)
+    legend = _hg_legend_colors(mm)
+    if show_path_legend is None:
+        show_path_legend = not with_log
     contacts = _contacts(ancient, mm)
+
+    def node_color(name: str) -> str:
+        return _color_for(name, legend, node_stroke.get(name) or "#FBF6F0")
     _rl = [pt[0] for c, _ in segs for pt in c]
     rlo, rhi = (min(_rl), max(_rl)) if _rl else (None, None)
 
@@ -356,8 +456,11 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
         lon1 = lon0 + 360
     lon_c, lat_c = (lon0 + lon1) / 2, (lat0 + lat1) / 2
     W = cols * 2
-    scale = min(W / (lon1 - lon0), (max_rows * 4) / (lat1 - lat0))
-    rows = max(12, min(max_rows, math.ceil((lat1 - lat0) * scale / 4)))
+    max_rows = max(1, max_rows)
+    scale = min(W / (lon1 - lon0), (max_rows * 4) / max(lat1 - lat0, 1e-6))
+    # Не больше max_rows (иначе fullscreen даёт вертикальный скролл).
+    want = math.ceil((lat1 - lat0) * scale / 4) if scale else max_rows
+    rows = max(1, min(max_rows, want))
     cv = _Canvas(cols, rows)
     px = lambda lon, lat: ((lon - lon_c) * scale + cv.W / 2, (lat_c - lat) * scale + cv.H / 2)
     cell = lambda lon, lat: (int(px(lon, lat)[0]) >> 1, int(px(lon, lat)[1]) >> 2)
@@ -409,13 +512,15 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
             cv.line(x0, y0, x1, y1, "route", color)
             cv.line(x0, y0 + 1, x1, y1 + 1, "route", color)
 
-    # ── маркеры (сначала все, потом подписи) ──
+    # ── маркеры (цвет = haplogroup_legend / stroke сегмента) ──
     for name, c in nodes.items():
         cx, cy = cell(*c)
-        cv.mark(cx, cy, "◆", "bold #FBF6F0")
+        cv.mark(cx, cy, "◆", f"bold {node_color(name)}")
     if origin:
         cx, cy = cell(*origin)
-        cv.mark(cx, cy, "◉", "bold #53A94B")
+        route_hg = str(mm.get("haplogroup") or title or "")
+        oc = node_color(route_hg) if route_hg else MAP.get("origin", "#53A94B")
+        cv.mark(cx, cy, "◉", f"bold {oc}")
     centers = []
     for i, cl in enumerate(ordered, 1):
         lon = sum(float(x["longitude"]) for x in cl) / len(cl)
@@ -431,7 +536,7 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
     for rank, i in enumerate(prio):
         name = keys[i]
         cx, cy = cell(*nodes[name])
-        ok = rank < budget and cv.label(cx, cy, name, "bold #5882C7")
+        ok = rank < budget and cv.label(cx, cy, name, f"bold {node_color(name)}")
         if not ok and (cx, cy) != ocell:
             cv.over.pop((cx, cy), None)
     for i, cx, cy, cl in centers[:30]:
@@ -508,26 +613,55 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
         leg += [("   ··", "#3C3247"), (f" ring {gstep}°", "#AEA5B8")]
     pad_line(leg)
 
-    # ── журнал контактов (newest first; на полноэкране — в правой панели) ──
+    # ── LEGEND одной строкой под картой (цвета = Migration path) ──
+    if legend and show_path_legend:
+        used_roots = {str(n).split("-", 1)[0] for n in nodes}
+        used_roots |= {str(n) for n in nodes if n in legend}
+        items: list[tuple[str, str]] = []
+        for item in mm.get("haplogroup_legend") or mm.get("legend") or []:
+            if not isinstance(item, dict) or not item.get("name") or not item.get("color"):
+                continue
+            nm = str(item["name"])
+            if nm in used_roots or nm in nodes or nm.split("-", 1)[0] in used_roots:
+                items.append((nm, str(item["color"])))
+        if not items:
+            items = list(legend.items())
+        raw = [i for i in (mm.get("haplogroup_legend") or []) if isinstance(i, dict)]
+        order = {str(i.get("name")): k for k, i in enumerate(raw)}
+        items.sort(key=lambda kv: order.get(kv[0], 10_000))
+        row: list[tuple[str, str]] = [(" LEGEND ", "bold #D4AD72")]
+        used = len(" LEGEND ")
+        for nm, col in items:
+            piece = f"■■ {nm}  "
+            if used + len(piece) > total_w:
+                break
+            row += [("■■ ", col), (f"{nm}  ", "#AEA5B8")]
+            used += len(piece)
+        pad_line(row)
+
+    # ── журнал контактов B2 (newest first; на полноэкране — в правой панели) ──
     if with_log and centers:
-        pad_line([(" CONTACT LOG · newest first", "bold #B04A4A")], 28)
-        for i, cx, cy, cl in centers[:18]:
-            ages = [x.get("age_estimate_mean") for x in cl if x.get("age_estimate_mean") is not None]
-            when = fmt(max(ages)) if ages else "?"
-            if len(ages) > 1 and min(ages) != max(ages):
-                when = f"{fmt(max(ages))} … {fmt(min(ages))}"
-            first = cl[0]
-            place = first.get("site") or first.get("geography") or first.get("country_name") or "?"
-            country = first.get("country_name") or ""
-            hg = first.get("haplogroup_y") or ""
-            wide = total_w >= 84
-            when_w = 24 if wide else 18
-            place_w = 26 if wide else max(8, total_w - 4 - when_w - 2 - 4)
-            parts = [(f" ▲{i:<2}", "bold #B04A4A"), (f" {when[:when_w]:<{when_w}} ", "#BD5454"),
-                     (f"{str(place)[:place_w]:<{place_w}} ", "#5882C7"), (f"×{len(cl):<2} ", "#B04A4A")]
-            if wide:
-                parts += [(f"{country[:16]:<16} ", "#AEA5B8"), (hg, "#AEA5B8")]
-            pad_line(parts)
+        log_w = max(36, total_w - 1)
+        id_w, when_w, place_w, hg_w, n_w = _contact_col_widths(log_w)
+        pad_line([(f" CONTACT LOG · newest first · {len(centers)}", "bold #B04A4A")])
+        pad_line([(" # on map = ▲ · row id matches map label", "#8A8294")])
+        pad_line([
+            (f" {'#':>{id_w}}  ", "#8A8294"),
+            (_fit_col("when", when_w) + "  ", "#8A8294"),
+            (_fit_col("place / country", place_w) + "  ", "#8A8294"),
+            (_fit_col("hg", hg_w) + "  ", "#8A8294"),
+            (f"{'n':>{n_w}}", "#8A8294"),
+        ])
+        rule = "─" * min(log_w, id_w + when_w + place_w + hg_w + n_w + 10)
+        pad_line([(f" {rule}", "#433F47")])
+        for i, when, place, hg, n in _contact_rows(centers, fmt, 18):
+            pad_line([
+                (f" {i:>{id_w}}  ", "bold #B04A4A"),
+                (_fit_col(when, when_w) + "  ", "#BD5454"),
+                (_fit_col(place, place_w) + "  ", "#5882C7"),
+                (_fit_col(hg, hg_w) + "  ", "#AEA5B8"),
+                (f"{n:>{n_w}}", "#B04A4A"),
+            ])
         if len(centers) > 18:
             pad_line([(f" … {len(centers) - 18} more", "#AEA5B8")], 14)
 
@@ -544,19 +678,154 @@ def _big_triangle(cv: _Canvas, cx: int, cy: int, color: str) -> None:
         cv.mark(cx + dx, cy, "▲", sty)
 
 
+def _cell_is_ocean(cv: "_Canvas", cx: int, cy: int) -> bool:
+    """True for empty/grid sea — no coast, border, or sample marks."""
+    if not (0 <= cx < cv.cols and 0 <= cy < cv.rows):
+        return False
+    if (cx, cy) in cv.over or (cx, cy) in cv.taken:
+        return False
+    layers = cv.cells.get((cx, cy))
+    if not layers:
+        return True
+    return set(layers).issubset({"grid"})
+
+
+def _geo_ocean_score(lon: float, lat: float) -> int:
+    """Higher = better sea for the legend (Atlantic / Pacific / Southern Ocean)."""
+    # Normalize lon to [-180, 180]
+    while lon > 180:
+        lon -= 360
+    while lon < -180:
+        lon += 360
+    score = 0
+    # Atlantic basin west of Europe / Africa
+    if -70.0 <= lon <= -5.0 and -50.0 <= lat <= 65.0:
+        score += 8
+    # Pacific
+    if lon <= -140.0 or lon >= 150.0:
+        score += 6
+    # Southern Ocean
+    if lat <= -40.0:
+        score += 4
+    # Mid-ocean bonus: far from typical land masses
+    if abs(lon) > 20 and not ( -10 <= lon <= 60 and 30 <= lat <= 70):
+        score += 1
+    return score
+
+
+def _ocean_legend(cv: "_Canvas", lines: list[tuple[str, str]], *,
+                  lon_c: float, lat_c: float, scale: float) -> None:
+    """Paint group/Seshat summary in the corner with the most ocean."""
+    if not lines:
+        return
+    width = min(22, max(12, max((len(t) for t, _ in lines), default=12) + 1))
+    width = min(width, max(8, cv.cols // 3))
+    height = min(len(lines), max(1, cv.rows - 2))
+    if width > cv.cols or height > cv.rows:
+        return
+
+    def cell_ll(cx: int, cy: int) -> tuple[float, float]:
+        lon = lon_c + ((cx * 2 + 1) - cv.W / 2) / max(scale, 1e-9)
+        lat = lat_c - ((cy * 4 + 2) - cv.H / 2) / max(scale, 1e-9)
+        return lon, lat
+
+    def legend_fit(x0: int, y0: int) -> tuple[int, int] | None:
+        """Return (ocean, -blocked) for the legend rect, or None if too land-heavy."""
+        ocean = blocked = 0
+        for dy in range(height):
+            for dx in range(width):
+                if _cell_is_ocean(cv, x0 + dx, y0 + dy):
+                    ocean += 1
+                else:
+                    blocked += 1
+        if blocked > max(2, width // 2):
+            return None
+        return (ocean, -blocked)
+
+    # Score each corner by ocean in its quadrant (where the sea is),
+    # then place the legend flush in the winning corner.
+    qx = max(width, cv.cols // 3)
+    qy = max(height, cv.rows // 3)
+    corners = (
+        # name, legend origin, quadrant x0/x1/y0/y1
+        (0, 0, 0, qx, 0, qy),                                          # NW
+        (cv.cols - width, 0, cv.cols - qx, cv.cols, 0, qy),            # NE
+        (0, cv.rows - height, 0, qx, cv.rows - qy, cv.rows),           # SW
+        (cv.cols - width, cv.rows - height,
+         cv.cols - qx, cv.cols, cv.rows - qy, cv.rows),                # SE
+    )
+    best_pos: tuple[int, int] | None = None
+    best_score: tuple[int, int, int, int] | None = None
+    for lx, ly, x0, x1, y0, y1 in corners:
+        lx = max(0, min(lx, cv.cols - width))
+        ly = max(0, min(ly, cv.rows - height))
+        fit = legend_fit(lx, ly)
+        if fit is None:
+            continue
+        # Weight open cells by geography so real sea beats empty map padding.
+        mass = ocean_q = 0
+        for cy in range(y0, y1):
+            for cx in range(x0, x1):
+                if _cell_is_ocean(cv, cx, cy):
+                    ocean_q += 1
+                    lon, lat = cell_ll(cx, cy)
+                    mass += 1 + _geo_ocean_score(lon, lat)
+        score = (mass, ocean_q, fit[0], fit[1])
+        if best_score is None or score > best_score:
+            best_score = score
+            best_pos = (lx, ly)
+
+    # Fallback: densest ocean pocket anywhere if every corner is land-heavy.
+    if best_pos is None:
+        for y0 in range(0, cv.rows - height + 1):
+            for x0 in range(0, cv.cols - width + 1):
+                fit = legend_fit(x0, y0)
+                if fit is None:
+                    continue
+                sc = (fit[0], fit[1], 0, 0)
+                if best_score is None or sc > best_score:
+                    best_score = sc
+                    best_pos = (x0, y0)
+
+    if best_pos is None:
+        x0, y0 = 0, 0
+    else:
+        x0, y0 = best_pos
+
+    for dy in range(height):
+        text, style = lines[dy]
+        body = (" " + text)[: width - 1].ljust(width - 1)
+        for dx, ch in enumerate(body):
+            cx, cy = x0 + dx, y0 + dy
+            if 0 <= cx < cv.cols and 0 <= cy < cv.rows:
+                sty = f"{style} on {BG}" if ch != " " else f"#5A5361 on {BG}"
+                cv.over[(cx, cy)] = (ch if ch != " " else " ", sty)
+                cv.taken.add((cx, cy))
+
+
 def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
-                cols: int = 96, max_rows: int = 28, selected: str | None = None) -> None:
-    """Точки на той же брайлевской карте: каждый dict — lon, lat, color, label (необяз.)."""
+                cols: int = 96, max_rows: int = 28, selected: str | None = None,
+                culture_labels: bool = False,
+                anchors: list[dict] | None = None) -> None:
+    """Точки на брайлевской карте. Подписи культур/Seshat — сводка в океане.
+
+    culture_labels: ocean legend of cultures (count · name), not over land/points.
+    anchors: Seshat names in the same ocean summary (not labeled on the map).
+    """
     cols = max(30, cols)
     pts = [(float(p["lon"]), float(p["lat"]), p) for p in points
            if p.get("lat") is not None and p.get("lon") is not None]
-    if world or not pts:
+    # Anchors only affect legend / optional extent — not drawn as map text.
+    anchor_pts = [(float(a["lon"]), float(a["lat"]), a) for a in (anchors or [])
+                  if a.get("lat") is not None and a.get("lon") is not None]
+    extent = pts  # map framing from genotype points only
+    if world or not extent:
         lon0, lon1, lat0, lat1 = -180.0, 180.0, -58.0, 84.0
     else:
-        lon0 = min(p[0] for p in pts) - 8
-        lon1 = max(p[0] for p in pts) + 8
-        lat0 = min(p[1] for p in pts) - 6
-        lat1 = max(p[1] for p in pts) + 6
+        lon0 = min(p[0] for p in extent) - 8
+        lon1 = max(p[0] for p in extent) + 8
+        lat0 = min(p[1] for p in extent) - 6
+        lat1 = max(p[1] for p in extent) + 6
         if lon1 - lon0 < 40:
             m = (lon0 + lon1) / 2
             lon0, lon1 = m - 20, m + 20
@@ -599,6 +868,8 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
                 cv.line(x0, y0, x1, y1, layer)
 
     selected_cell = None
+    # culture → (count, best_rank, color)
+    cult_sum: dict[str, tuple[int, float, str]] = {}
     for lon, lat, p in pts:
         cx, cy = cell(lon, lat)
         color = p.get("color") or COL["coast"]
@@ -612,13 +883,46 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
             cv.dot(*map(round, px(lon, lat)), "route", color)
             if is_sel:
                 cv.mark(cx, cy, "◆", f"bold {color}")
+        cult = (p.get("culture") or "").strip()
+        if cult and culture_labels:
+            rank = float(p.get("rank") if p.get("rank") is not None else -1.0)
+            prev = cult_sum.get(cult)
+            if prev is None:
+                cult_sum[cult] = (1, rank, str(color))
+            else:
+                n, pr, pc = prev
+                cult_sum[cult] = (n + 1, max(pr, rank), pc if pr >= rank else str(color))
+
     if selected_cell:
         cx, cy, p = selected_cell
         if p.get("glyph"):
             _big_triangle(cv, cx, cy, p.get("color") or "#5882C7")
-        lab = p.get("label") or p.get("id") or ""
-        if lab:
-            cv.label(cx, cy, lab[:18], f"bold {p.get('color') or '#5882C7'}")
+        # No text label on the map — selection is ◆ only; name lives in the corner.
+
+    legend: list[tuple[str, str]] = []
+    if culture_labels and cult_sum:
+        ranked = sorted(cult_sum.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
+        sel_cult = ""
+        if selected_cell:
+            sel_cult = (selected_cell[2].get("culture")
+                        or selected_cell[2].get("label") or "")
+        budget = max(6, min(12, rows - 3))
+        for cult, (n, _rank, color) in ranked[:budget]:
+            mark = "◆" if cult and cult == sel_cult else "·"
+            legend.append((f"{mark}{n:>3} {cult}"[:20], f"bold {color}"))
+    if culture_labels and anchor_pts:
+        if legend:
+            legend.append(("§ Seshat", "#8A8294"))
+        seshat_budget = max(2, min(5, rows // 4))
+        ranked_a = sorted(
+            anchor_pts,
+            key=lambda t: -float(t[2].get("rank") if t[2].get("rank") is not None else 0),
+        )
+        for _lon, _lat, a in ranked_a[:seshat_budget]:
+            lab = (a.get("label") or a.get("id") or "§").strip()
+            legend.append((f"§ {lab}"[:20], a.get("color") or "#AEA5B8"))
+    if legend:
+        _ocean_legend(cv, legend, lon_c=lon_c, lat_c=lat_c, scale=scale)
 
     total_w = cols + 6
 

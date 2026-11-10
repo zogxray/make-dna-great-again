@@ -63,7 +63,7 @@ class JobsWorkspace(Workspace):
             ("A", "Pause all", "screen.pause_all"),
             ("/|F", "Filter", "screen.cycle_filter"),
             ("Tab", "Panel", "app.focus_next"),
-            ("F1–F8", "Modes", None),
+            ("F1–F9", "Modes", None),
             ("Q", "Quit", "app.quit"),
         ], id="help")
         yield Static(id="status")

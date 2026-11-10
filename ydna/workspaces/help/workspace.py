@@ -1,4 +1,4 @@
-"""Режим Help (F8): флоу и UX по экранам."""
+"""Режим Help (F9): флоу и UX по экранам."""
 
 from __future__ import annotations
 
@@ -36,15 +36,28 @@ class HelpWorkspace(Workspace):
             with VerticalScroll(id="help-scroll"):
                 yield SelectableRichStatic(id="help-body")
         yield KeyBar([("↑↓", "Scroll", None), ("PgUp/Dn", "Page", None),
-                      ("F1–F8", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
         self.query_one("#help-box").border_title = "HELP · flow & screens"
-        self.query_one("#help-body", SelectableRichStatic).update(help_view())
+        self._paint_help()
         self.query_one("#status", Static).update(
-            "Advanced-amateur guide · not an R/admixture2 manual · F1–F8 switch modes")
+            "Advanced-amateur guide · not an R/admixture2 manual · F1–F9 switch modes")
         self.query_one("#help-scroll").focus()
+
+    def on_resize(self) -> None:
+        # Re-bake only when width jumps a lot (wrap changes); cheap Text otherwise.
+        body = self.query_one("#help-body", SelectableRichStatic)
+        w = body.content_size.width or body.size.width
+        if w and abs(w - (getattr(self, "_help_w", 0) or 0)) >= 8:
+            self._paint_help()
+
+    def _paint_help(self) -> None:
+        body = self.query_one("#help-body", SelectableRichStatic)
+        w = body.content_size.width or body.size.width or 100
+        self._help_w = w
+        body.update(help_view(width=max(40, w - 2)))
 
     def action_scroll(self, delta: int) -> None:
         self.query_one("#help-scroll").scroll_relative(y=delta, animate=False)
