@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .store import APP_TITLE
+from ..core.store import APP_TITLE
 
 
 def self_command(passthrough: list[str]) -> list[str]:

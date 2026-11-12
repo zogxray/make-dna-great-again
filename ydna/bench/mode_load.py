@@ -395,7 +395,7 @@ async def run_mode_load_bench(
     profile: bool = True,
 ) -> BenchReport:
     """Drive YDnaApp through F1–F10; return timings + write profiles under out_dir."""
-    from ..app import YDnaApp
+    from ..tui.app import YDnaApp
     from ..core import db
     from ..core.single import AlreadyRunning, acquire, release
     from ..core.store import cache_dir

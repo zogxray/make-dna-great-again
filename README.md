@@ -84,6 +84,13 @@ python -m ydna
 python ydna_tui.py
 ```
 
+Headless CLI (JSON/text, no Textual) — subcommands grow under `ydna cli`:
+
+```bash
+ydna cli --help
+python -m ydna.cli --help
+```
+
 Separate desktop window (terminal emulator — not a browser):
 
 ```bash
