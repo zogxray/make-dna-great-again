@@ -1,0 +1,80 @@
+name: Release Linux (Ubuntu/Debian)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build amd64 .deb / .tar.gz
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            BASE="$(python -c 'import re,pathlib; t=pathlib.Path("pyproject.toml").read_text(); m=re.search(r"^version\\s*=\\s*\"([^\"]+)\"", t, re.M); print(m.group(1) if m else "0.0.0")')"
+            # Debian versions allow ~ for pre-releases; avoid '+' in artifact names.
+            V="${BASE}~git.${GITHUB_SHA::7}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version $V"
+
+      - name: System deps for .deb
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev binutils
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          MAKE_DEB: "1"
+        run: |
+          chmod +x packaging/build_linux.sh packaging/make_deb.sh
+          ./packaging/build_linux.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: make-dna-great-again-linux-amd64
+          path: |
+            dist/make-dna-great-again-*-linux-amd64.tar.gz
+            dist/make-dna-great-again_*_amd64.deb
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/make-dna-great-again-*-linux-amd64.tar.gz
+            dist/make-dna-great-again_*_amd64.deb
+          generate_release_notes: true
+          body: |
+            ## Linux (Ubuntu / Debian amd64)
+
+            ```bash
+            # .deb
+            sudo apt install ./make-dna-great-again_*_amd64.deb
+            ydna
+
+            # or tarball
+            tar xf make-dna-great-again-*-linux-amd64.tar.gz
+            ./ydna/ydna
+            ```
+
+            App state: `~/.config/make-dna-great-again/`

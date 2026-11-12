@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Make DNA Great Again
+GenericName=Genotype TUI
+Comment=Local TUI for your genotype (Y tree, GWAS, Gemini)
+Exec=ydna --window
+Icon=utilities-terminal
+Terminal=false
+Categories=Science;Education;Utility;
+Keywords=DNA;Y-DNA;GWAS;genotype;
+StartupNotify=false

@@ -32,6 +32,35 @@ haplotree (and TheYtree hg19 when the file is GRCh37).
 
 ## Install
 
+### Ubuntu / Debian (binary)
+
+Download the `.deb` or `.tar.gz` from
+[GitHub Releases](https://github.com/zogxray/make-dna-great-again/releases)
+(or the **Release Linux** Actions artifacts).
+
+```bash
+# .deb (amd64)
+sudo apt install ./make-dna-great-again_*_amd64.deb
+ydna   # also: mdga
+```
+
+```bash
+# tarball — no root needed
+tar xf make-dna-great-again-*-linux-amd64.tar.gz
+./ydna/ydna
+```
+
+Rebuild locally (needs Python 3.10+ and `dpkg-deb` for `.deb`):
+
+```bash
+source ../venv/bin/activate   # or any venv
+./packaging/build_linux.sh
+```
+
+CI: workflow **Release Linux (Ubuntu/Debian)** — run manually or push a `v*` tag.
+
+### From source
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
@@ -55,13 +84,21 @@ python -m ydna
 python ydna_tui.py
 ```
 
+Separate desktop window (terminal emulator — not a browser):
+
+```bash
+ydna --window
+```
+
 ```bash
 ydna --genome ~/Downloads/genome.txt
 ydna --input /path/to/discover/haplogroups --genome ~/kit.txt
 ```
 
+- `--window` — open in a new terminal window, then return
 - `--genome FILE` — preload into **F1** (repeatable)
 - `--input DIR` — Discover folder (else path from **F2**)
+- `MDGA_TERMINAL=kitty` (etc.) — force which emulator `--window` uses
 
 Quit with **Q** (confirm → shutdown progress in the UI, then exit). App state lives in
 `~/.config/make-dna-great-again/ydna.duckdb`
@@ -159,6 +196,10 @@ Effect sizes on *your* SNPs — not medical advice.
 
 Match the active F1 genome against the local GWAS Catalog associations table
 (from **F2 → GWAS Catalog → D** / **P**).
+
+First match builds a local DuckDB index under `~/.cache/make-dna-great-again/gwas_index/`
+(one-time per catalog file); later matches join in ~1–3s. Fallback:
+`MDGA_GWAS_MATCH=python`.
 
 - Traits: **L** — **CUR** (themed shortlist) / **ALL** (every matched trait)  
 - Associations for the selected trait · detail **HIT** / **ASK**  

@@ -18,12 +18,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Make DNA Great Again: local TUI for your genotype.",
     )
+    parser.add_argument(
+        "--window", action="store_true",
+        help="Open in a separate terminal window (desktop), then exit this process",
+    )
     parser.add_argument("--input", type=Path, default=None,
                         help="Папка с JSON-файлами Discover (по умолчанию — путь из режима Data, "
                              "иначе data/ftdna/discover)")
     parser.add_argument("--genome", action="append", default=[], type=Path, metavar="FILE",
                         help="Файл генотипирования для режима Genome (можно несколько раз)")
     args = parser.parse_args(argv)
+
+    if args.window:
+        # Must not take the singleton lock here — the windowed child will.
+        passthrough: list[str] = []
+        if args.input is not None:
+            passthrough += ["--input", str(args.input)]
+        for g in args.genome:
+            passthrough += ["--genome", str(g)]
+        from .core.window_launch import launch_in_window
+        return launch_in_window(passthrough)
 
     from .core.single import AlreadyRunning, acquire, db_busy_message, is_db_busy_error
     try:

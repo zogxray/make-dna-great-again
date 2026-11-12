@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,7 +37,10 @@ def cache_dir() -> Path:
 
 
 def project_root() -> Path:
-    """Корень репозитория make-dna-great-again/ (родитель пакета ydna/)."""
+    """Корень репозитория / установки (родитель пакета ydna/, либо каталог бинарника)."""
+    if getattr(sys, "frozen", False):
+        # PyInstaller onedir: executable lives next to _internal/
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
 
 

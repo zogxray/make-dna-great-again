@@ -1,7 +1,9 @@
-"""Match an F1 genome against the local GWAS Catalog associations table (F2).
+"""Match an F1 genome against the local GWAS Catalog associations table (F5).
 
-Streams the associations TSV once, keeps only rows whose rsIDs appear in the
-genome. Optional on-disk cache keyed by genome path + catalog mtime + p-cut.
+Fast path: one-time DuckDB index (rsIDs exploded) + join.
+Fallback: stream the associations TSV in Python (legacy).
+
+Optional on-disk result cache keyed by genome path + catalog mtime + p-cut.
 """
 
 from __future__ import annotations
@@ -9,8 +11,9 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -21,6 +24,7 @@ from .store import cache_dir
 
 _RS = re.compile(r"(rs\d+)", re.I)
 _P_CUTS = (None, 5e-8, 1e-5, 1e-3)  # None = no cut
+_INDEX_SCHEMA = 3  # bump to invalidate on-disk indexes
 
 
 @dataclass
@@ -117,6 +121,14 @@ def _cache_file(genome: Path, assoc: Path, p_max: float | None) -> Path:
     return d / f"{digest}.json.gz"
 
 
+def _index_path(assoc: Path) -> Path:
+    key = f"{assoc.resolve()}|{assoc.stat().st_mtime_ns}|{_INDEX_SCHEMA}"
+    digest = hashlib.sha1(key.encode()).hexdigest()[:20]
+    d = cache_dir() / "gwas_index"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{digest}.duckdb"
+
+
 def catalog_date(folder: Path) -> str:
     man = folder / "gwas-download-manifest.json"
     if not man.is_file():
@@ -174,32 +186,236 @@ def save_cached(path: Path, result: MatchResult) -> None:
     tmp.replace(path)
 
 
-def match_genome(
+def _engine() -> str:
+    """duckdb (default) | python — override with MDGA_GWAS_MATCH."""
+    return (os.environ.get("MDGA_GWAS_MATCH") or "duckdb").strip().lower()
+
+
+def _ensure_duckdb_index(assoc_path: Path, job: Job | None) -> Path:
+    """Build (once) a DuckDB file with exploded rsIDs + row metadata."""
+    import duckdb
+
+    out = _index_path(assoc_path)
+    if out.is_file() and out.stat().st_size > 0:
+        return out
+
+    if job:
+        job.set_stage("indexing GWAS catalog (one-time)", 1)
+        job.check()
+
+    tmp = out.with_suffix(".duckdb.partial")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    con = duckdb.connect(str(tmp))
+    try:
+        # quote='' — Catalog TSV is unquoted; ignore_errors skips rare bad lines.
+        # all_varchar: keep OR/BETA / ids exactly as in the TSV (no float reformat).
+        con.execute(
+            """
+            CREATE TABLE assoc_rows AS
+            SELECT
+              row_number() OVER () AS row_id,
+              SNPS AS snps,
+              "STRONGEST SNP-RISK ALLELE" AS strong,
+              COALESCE(NULLIF(TRIM("DISEASE/TRAIT"), ''), 'unknown') AS trait,
+              COALESCE("MAPPED_TRAIT", '') AS mapped_trait,
+              COALESCE("MAPPED_GENE", '') AS gene,
+              try_cast(NULLIF(TRIM("P-VALUE"), '') AS DOUBLE) AS p,
+              COALESCE("OR or BETA", '') AS or_beta,
+              COALESCE(CHR_ID, '') AS chrom,
+              COALESCE(CHR_POS, '') AS pos,
+              COALESCE("STUDY ACCESSION", '') AS study,
+              COALESCE(PUBMEDID, '') AS pubmed,
+              COALESCE("FIRST AUTHOR", '') AS author,
+              COALESCE("DATE", '') AS date
+            FROM read_csv(?, delim='\t', header=true, quote='',
+                          all_varchar=true, ignore_errors=true,
+                          parallel=true, null_padding=true)
+            """,
+            [str(assoc_path)],
+        )
+        # Explode every rs in SNPS; if none, fall back to STRONGEST cell — same as Python.
+        con.execute(
+            """
+            CREATE TABLE assoc_rs AS
+            WITH extracted AS (
+              SELECT
+                row_id,
+                regexp_extract_all(COALESCE(snps, ''), '(?i)rs\\d+') AS from_snps,
+                regexp_extract_all(COALESCE(strong, ''), '(?i)rs\\d+') AS from_strong
+              FROM assoc_rows
+            ),
+            picked AS (
+              SELECT
+                row_id,
+                CASE WHEN len(from_snps) > 0 THEN from_snps ELSE from_strong END AS rs_list
+              FROM extracted
+            )
+            SELECT
+              p.row_id,
+              lower(r.rs) AS rsid_l
+            FROM picked p, UNNEST(p.rs_list) AS r(rs)
+            WHERE r.rs IS NOT NULL AND length(r.rs) > 0
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE meta AS
+            SELECT
+              ?::VARCHAR AS assoc_path,
+              ?::BIGINT AS mtime_ns,
+              ?::INTEGER AS schema_ver,
+              (SELECT count(*) FROM assoc_rows) AS n_rows,
+              (SELECT count(DISTINCT rsid_l) FROM assoc_rs) AS catalog_rs
+            """,
+            [str(assoc_path.resolve()), int(assoc_path.stat().st_mtime_ns), _INDEX_SCHEMA],
+        )
+        con.execute("CREATE INDEX idx_assoc_rs_rsid ON assoc_rs(rsid_l)")
+    finally:
+        con.close()
+
+    tmp.replace(out)
+    if job:
+        job.progress(1)
+    return out
+
+
+def _match_duckdb(
     folder: Path,
+    assoc_path: Path,
     genome: Genome,
+    rs_map: dict[str, str],
+    rs_lookup: dict[str, tuple[str, str]],
     *,
-    p_max: float | None = 5e-8,
-    job: Job | None = None,
-    use_cache: bool = True,
+    p_max: float | None,
+    job: Job | None,
 ) -> MatchResult:
-    """Match genome rsIDs to GWAS Catalog associations under optional p-value cut."""
-    src = GwasCatalog()
-    assoc_path = src.associations_tsv(folder)
-    if assoc_path is None:
-        raise RuntimeError("GWAS Catalog associations table not found — download in F2")
+    import duckdb
+    import pyarrow as pa
 
-    cache = _cache_file(genome.path, assoc_path, p_max)
-    if use_cache:
-        hit = load_cached(cache)
-        if hit is not None:
-            return hit
+    db_path = _ensure_duckdb_index(assoc_path, job)
+    if job:
+        job.set_stage("joining genome × GWAS index", 1)
+        job.check()
 
-    rs_map = genome_rs_map(genome)
-    if not rs_map:
-        raise RuntimeError("genome has no rsIDs loaded")
-    # lower-case key for matching; keep original genotype via rs_map lookup by normalized
-    rs_lookup = {_norm_rs(k).lower(): (k, v) for k, v in rs_map.items()}
+    rsid_l = list(rs_lookup.keys())
+    canon = [rs_lookup[k][0] for k in rsid_l]
+    gt = [rs_lookup[k][1] for k in rsid_l]
+    geno = pa.table({"rsid_l": rsid_l, "canon": canon, "gt": gt})
 
+    con = duckdb.connect()
+    try:
+        # ATTACH returns a result in DuckDB 2 — drain it before other work.
+        con.execute(f"ATTACH ? AS gwas (READ_ONLY)", [str(db_path)]).fetchall()
+        con.register("geno", geno)
+        catalog_rs = int(con.execute("SELECT catalog_rs FROM gwas.meta").fetchall()[0][0])
+        rows = con.execute(
+            """
+            SELECT
+              g.canon AS rsid,
+              g.gt AS you,
+              COALESCE(a.strong, '') AS strong,
+              a.p AS p,
+              COALESCE(a.or_beta, '') AS or_beta,
+              a.trait AS trait,
+              COALESCE(a.mapped_trait, '') AS mapped_trait,
+              COALESCE(a.gene, '') AS gene,
+              COALESCE(a.chrom, '') AS chrom,
+              COALESCE(a.pos, '') AS pos,
+              COALESCE(a.study, '') AS study,
+              COALESCE(a.pubmed, '') AS pubmed,
+              COALESCE(a.author, '') AS author,
+              COALESCE(a.date, '') AS date
+            FROM gwas.assoc_rs ar
+            JOIN gwas.assoc_rows a USING (row_id)
+            JOIN geno g ON g.rsid_l = ar.rsid_l
+            WHERE (?::DOUBLE IS NULL)
+               OR (a.p IS NOT NULL AND a.p <= ?::DOUBLE)
+            """,
+            [p_max, p_max],
+        ).fetchall()
+    finally:
+        con.close()
+
+    if job:
+        job.progress(1)
+
+    matched_rs: set[str] = set()
+    trait_counts: Counter[str] = Counter()
+    assocs: list[Assoc] = []
+    for (rsid, you, strong, p, or_beta, trait, mapped, gene,
+         chrom, pos, study, pubmed, author, date) in rows:
+        key = _norm_rs(str(rsid)).lower()
+        matched_rs.add(key)
+        trait_s = (trait or "").strip() or "unknown"
+        trait_counts[trait_s] += 1
+        assocs.append(Assoc(
+            rsid=str(rsid),
+            you=str(you or ""),
+            risk=_risk_allele(str(strong or ""), str(rsid)),
+            p=float(p) if p is not None else None,
+            or_beta=str(or_beta or "").strip(),
+            trait=trait_s,
+            mapped_trait=str(mapped or "").strip(),
+            gene=str(gene or "").strip(),
+            chrom=str(chrom or "").strip(),
+            pos=str(pos or "").strip(),
+            study=str(study or "").strip(),
+            pubmed=str(pubmed or "").strip(),
+            author=str(author or "").strip(),
+            date=str(date or "").strip(),
+        ))
+
+    assocs.sort(key=_assoc_sort_key)
+    return MatchResult(
+        genome=str(genome.path),
+        catalog=str(assoc_path),
+        catalog_date=catalog_date(folder),
+        genome_rs=len(rs_map),
+        catalog_rs=catalog_rs,
+        matched_rs=len(matched_rs),
+        traits_hit=len(trait_counts),
+        p_max=p_max,
+        assocs=assocs,
+        trait_counts=dict(trait_counts),
+    )
+
+
+def _assoc_sort_key(a: Assoc):
+    """Deterministic order (ties must not depend on scan/join order)."""
+    return (
+        a.trait.lower(),
+        a.p is None,
+        a.p if a.p is not None else 1.0,
+        a.rsid,
+        a.study,
+        a.pubmed,
+        a.mapped_trait,
+        a.gene,
+        a.or_beta,
+        a.risk,
+        a.chrom,
+        a.pos,
+        a.author,
+        a.date,
+        a.you,
+    )
+
+
+def _match_python(
+    folder: Path,
+    assoc_path: Path,
+    genome: Genome,
+    rs_map: dict[str, str],
+    rs_lookup: dict[str, tuple[str, str]],
+    *,
+    p_max: float | None,
+    job: Job | None,
+) -> MatchResult:
     if job:
         job.set_stage("scanning GWAS associations", max(1, assoc_path.stat().st_size))
 
@@ -211,7 +427,7 @@ def match_genome(
 
     with assoc_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
         header = fh.readline()
-        bytes_read += len(header.encode("utf-8", errors="replace"))
+        bytes_read += len(header)
         cols = [c.strip() for c in header.rstrip("\n\r").split("\t")]
         idx = {c: i for i, c in enumerate(cols)}
 
@@ -238,12 +454,13 @@ def match_genome(
             raise RuntimeError(f"{assoc_path.name}: missing SNPS / DISEASE/TRAIT columns")
 
         n_lines = 0
+        st_size = assoc_path.stat().st_size
         for line in fh:
             n_lines += 1
-            bytes_read += len(line.encode("utf-8", errors="replace"))
+            bytes_read += len(line)
             if job and n_lines % 50_000 == 0:
                 job.check()
-                job.progress(min(bytes_read, assoc_path.stat().st_size))
+                job.progress(min(bytes_read, st_size))
             parts = line.rstrip("\n\r").split("\t")
             if len(parts) <= i_snps:
                 continue
@@ -298,10 +515,9 @@ def match_genome(
     if job:
         job.progress(assoc_path.stat().st_size)
 
-    # Prefer smaller p first within a trait when listing.
-    assocs.sort(key=lambda a: (a.trait.lower(), a.p is None, a.p if a.p is not None else 1.0, a.rsid))
+    assocs.sort(key=_assoc_sort_key)
 
-    result = MatchResult(
+    return MatchResult(
         genome=str(genome.path),
         catalog=str(assoc_path),
         catalog_date=catalog_date(folder),
@@ -313,6 +529,50 @@ def match_genome(
         assocs=assocs,
         trait_counts=dict(trait_counts),
     )
+
+
+def match_genome(
+    folder: Path,
+    genome: Genome,
+    *,
+    p_max: float | None = 5e-8,
+    job: Job | None = None,
+    use_cache: bool = True,
+) -> MatchResult:
+    """Match genome rsIDs to GWAS Catalog associations under optional p-value cut."""
+    src = GwasCatalog()
+    assoc_path = src.associations_tsv(folder)
+    if assoc_path is None:
+        raise RuntimeError("GWAS Catalog associations table not found — download in F2")
+
+    cache = _cache_file(genome.path, assoc_path, p_max)
+    if use_cache:
+        hit = load_cached(cache)
+        if hit is not None:
+            return hit
+
+    rs_map = genome_rs_map(genome)
+    if not rs_map:
+        raise RuntimeError("genome has no rsIDs loaded")
+    rs_lookup = {_norm_rs(k).lower(): (k, v) for k, v in rs_map.items()}
+
+    engine = _engine()
+    result: MatchResult | None = None
+    if engine not in ("python", "scan", "tsv"):
+        try:
+            result = _match_duckdb(
+                folder, assoc_path, genome, rs_map, rs_lookup,
+                p_max=p_max, job=job,
+            )
+        except Exception:  # noqa: BLE001 — fall back to proven Python scanner
+            result = None
+
+    if result is None:
+        result = _match_python(
+            folder, assoc_path, genome, rs_map, rs_lookup,
+            p_max=p_max, job=job,
+        )
+
     if use_cache:
         try:
             save_cached(cache, result)

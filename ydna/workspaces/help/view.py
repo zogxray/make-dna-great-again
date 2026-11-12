@@ -165,8 +165,10 @@ table from F2.
   «GWAS · F5»): Catalog facts, allelic concordance, population-genetic limits.
   Cached per trait panel; **Refresh** regenerates. Needs LLM ready (F7 channel).
 - **/** search in **TRAITS** (trait · rsID · gene · GCST) · **R** rescan
-  (ignore cache). First match can take a minute; later opens reuse an on-disk
-  cache keyed by genome + catalog mtime + p-cut.
+  (ignore cache). First match on a catalog builds a DuckDB index under
+  `~/.cache/make-dna-great-again/gwas_index/` (one-time per associations file);
+  later matches join in a few seconds. Result cache (genome + catalog mtime +
+  p-cut) still applies. Fallback scanner: `MDGA_GWAS_MATCH=python`.
 
 Needs: active F1 file + **F2 → GWAS Catalog → D** (or **P**).
 

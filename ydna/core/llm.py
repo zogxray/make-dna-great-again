@@ -6,6 +6,7 @@ No silent failover — the chosen channel is the only one used for a send.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -40,8 +41,11 @@ def load_dotenv(path: Path | None = None) -> Path | None:
     if path is not None:
         candidates.append(path)
     candidates.append(Path.cwd() / ".env")
-    # ydna/core/llm.py → repo root make-dna-great-again/
-    candidates.append(Path(__file__).resolve().parents[2] / ".env")
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / ".env")
+    else:
+        # ydna/core/llm.py → repo root make-dna-great-again/
+        candidates.append(Path(__file__).resolve().parents[2] / ".env")
     seen: set[Path] = set()
     loaded: Path | None = None
     for p in candidates:
