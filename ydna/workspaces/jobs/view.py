@@ -1,4 +1,4 @@
-"""Форматирование списка и карточки задачи для F7 Jobs."""
+"""Форматирование списка и карточки задачи для F8 Jobs."""
 
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ def kind_guess(job: Job) -> str:
         return "chat"
     if "pgs" in k or t.startswith("pgs"):
         return "score"
+    if "gwas" in k or "gwas" in t:
+        return "gwas"
     if s.startswith(("downloading", "retry")) or "download" in t:
         return "download"
     if "fetch" in t or "discover" in k:
@@ -72,7 +74,7 @@ def detail_text(job: Job | None, *, filter_name: str, n_total: int) -> Text:
     if job is None:
         t.append("JOBS · background manager\n\n", style="bold")
         t.append(
-            "Two panels: list ← → detail. Tasks still start from F2 / F3 / F4 / F6;\n"
+            "Two panels: list ← → detail. Tasks still start from F2 / F3 / F4 / F5 / F7;\n"
             "this screen mirrors JOBS (pause, cancel, clear; Discover stages queue).\n\n",
             style="#AEA5B8",
         )
@@ -80,7 +82,8 @@ def detail_text(job: Job | None, *, filter_name: str, n_total: int) -> Text:
         t.append("  download   F2 files (.part resume)\n", style="#8A8294")
         t.append("  fetch      Discover JSON packs (queue stages 1–5)\n", style="#8A8294")
         t.append("  score      F4 PGS\n", style="#8A8294")
-        t.append("  chat       F6 Gemini\n", style="#8A8294")
+        t.append("  gwas       F5 match / ASK note\n", style="#8A8294")
+        t.append("  chat       F7 Gemini\n", style="#8A8294")
         t.append("  verify     MD5 / checks\n\n", style="#8A8294")
         t.append("Status legend\n", style="bold #D4AD72")
         for key, (icon, style) in STATUS_ICON.items():
@@ -148,6 +151,6 @@ def detail_text(job: Job | None, *, filter_name: str, n_total: int) -> Text:
         t.append("  [X]  clear finished from this list\n", style="#FBF6F0")
     else:
         t.append("  —\n", style="#8A8294")
-    t.append("\nNote  tasks are still started in F2/F3/F4/F6; F7 is the monitor.\n",
+    t.append("\nNote  tasks are still started in F2/F3/F4/F5/F7; F8 is the monitor.\n",
              style="#8A8294")
     return t

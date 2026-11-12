@@ -1,6 +1,6 @@
 """Единый DuckDB-файл приложения: ~/.config/make-dna-great-again/ydna.duckdb.
 
-Схемы: chat (F6), genome (F1 RAW), data (F2), pgs (F4), ref (F5 results).
+Схемы: chat (F6), genome (F1 RAW), data (F2), pgs (F4), ref (F6 results).
 Все обращения к соединению — под _lock (UI + фоновые JOBS).
 """
 

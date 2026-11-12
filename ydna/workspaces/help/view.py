@@ -1,4 +1,4 @@
-"""Текст F9 Help: флоу и UX для продвинутого любителя (не мануал по API)."""
+"""Текст F10 Help: флоу и UX для продвинутого любителя (не мануал по API)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from rich.padding import Padding
 from rich.text import Text
 
 # Live Markdown is re-rendered on every Textual layout pass (hundreds of times on
-# first F9 mount). Bake once to Text — same look, cheap Static updates.
+# first F10 mount). Bake once to Text — same look, cheap Static updates.
 _HELP_TEXT: Text | None = None
 _HELP_BAKED_WIDTH: int | None = None
 _DEFAULT_WIDTH = 100
@@ -30,14 +30,15 @@ Technical guts exist under the hood; this page is about **what to do** and
 
 1. **F1 Genome** — open your RAW/TXT (23andMe, Ancestry, Argenética, …).
 2. **F2 Data** — point paths at the references you care about (at least FTDNA
-   Haplotree; Discover folder if you want rich Y cards; AADR if you want F5).
+   Haplotree; Discover folder if you want rich Y cards; AADR if you want F6).
 3. **F3 Tree** — walk the Y tree with **your** branch highlighted (**O** = Our Y).
 4. **F4 PGS** — polygenic scores when you have a models folder from F2.
-5. **F5 Reference** — f3 / ancient & 1000 Genomes panels against AADR (or 1000G).
-6. **F6 Chat** — ask Gemini with the same context you already loaded (API key in F2).
-7. **F7 Jobs** — watch downloads / fetches / scores (cancel here; start them elsewhere).
-8. **F8 Samples** — Open Humans public kits (filter, get missing, DuckDB).
-9. **F9 Help** — you are here.
+5. **F5 GWAS** — match the active F1 chip against the local GWAS Catalog (F2).
+6. **F6 Reference** — f3 / ancient & 1000 Genomes panels against AADR (or 1000G).
+7. **F7 Chat** — ask Gemini with the same context you already loaded (API key in F2).
+8. **F8 Jobs** — watch downloads / fetches / scores (cancel here; start them elsewhere).
+9. **F9 Samples** — Open Humans public kits (filter, get missing, DuckDB).
+10. **F10 Help** — you are here.
 
 You can skip screens. Nothing forces a “full report”.
 
@@ -53,7 +54,7 @@ You can skip screens. Nothing forces a “full report”.
   to the haplotree from F2). Later opens reuse that store.
 
 **UX tip:** F1 is the “who am I looking at?” switch for every other mode.
-Change the active file here; F3/F5 follow it.
+Change the active file here; F3/F5/F6 follow it.
 
 ---
 
@@ -65,15 +66,15 @@ Grouped sources (FTDNA, YFull/TheYtree overlays, PGS models, AADR, Seshat Polari
 Open Humans public samples, Gemini key…).
 Each row: path status, size hints, optional fetch/verify in the background.
 
-**Open Humans** catalog is **F8 Samples** (opens directly). In F2: **P** path,
-**B** jump to F8, **V** API new + missing under filter. Per-genome download is
+**Open Humans** catalog is **F9 Samples** (opens directly). In F2: **P** path,
+**B** jump to F9, **V** API new + missing under filter. Per-genome download is
 **D on a catalog row** (Space-mark several). ● READY / ○ NEED are labels only —
 NEED stays downloadable; READY also ingests into `genome.*`.
 
 **Discover fetch stages (keys 1–5 / D)** on the FTDNA Discover source:
 
 1. Our path (tip→root) · 2. Children below Our · 3. This genome (exclusive) ·
-4. All F1 genomes (exclusive) · 5. Whole tree (confirm twice). Progress in **F7**.
+4. All F1 genomes (exclusive) · 5. Whole tree (confirm twice). Progress in **F8**.
 
 **Minimum for a useful Y session**
 
@@ -81,11 +82,17 @@ NEED stays downloadable; READY also ingests into `genome.*`.
 - FTDNA **Discover** folder → dates, countries, ancient cards on nodes (optional
   but the tree feels empty without it).
 
-**Minimum for F5**
+**Minimum for F6**
 
 - **AADR** folder (the classic `.geno` / `.ind` / `.anno` trio).
 - **Seshat · Polaris** — historical polity codes (religion / complexity); **D** pulls
   the Excel snapshot (~3 MB, CC BY-NC). Feeds F3 **LORE** anchors (not a myth download).
+
+**GWAS Catalog**
+
+- **D** pulls the NHGRI-EBI “latest” FTP snapshot (associations, studies, EFO
+  mappings) into a local folder. Or **P** to an existing dump. Feeds **F5**
+  (genome × catalog match). Not a scoring engine — that is F4 PGS.
 
 **PGS models (F4)**
 
@@ -111,7 +118,7 @@ Useful reflexes
   ties and near-ties (same #DER nodes, sum within 2) paint forks in different
   colors; **O** cycles them. Het / odd alleles are **not** scored — shown as
   `?` uncertain; rejected `anc>der` siblings as `○` pruned.
-- **A** — Ask GPT: builds a short prompt from the current tab and opens **F6**
+- **A** — Ask GPT: builds a short prompt from the current tab and opens **F7**
   (into the active chat · Ctrl+S / Alt+Enter / Send). On **LORE**: skald+scientist weave
   (HARD / RECONSTRUCTED / STORY) from genome · ancient · Seshat · children geo.
 - Search `/`, filter **F**, sort **S**, rich branches **B**.
@@ -132,7 +139,7 @@ to another file or 1000 Genomes-style references from the catalog.
 Catalog comes from **F2 → PGS models → D** (or **P** to a folder with
 `catalog/catalog.tsv`).
 
-- Left: short lists (**L** — CUR / CAT / DIS / LOW / FEW) and **/** search
+- Left: **L** — CUR (shortlist) / ALL (catalog) / HOLD (triage); on ALL: **F** gates (any/ok/low/few/dis); **/** search
   (trait, PGS id, theme).
 - Center: card for the selected model.
 - **G** / **A** — score theme or all; results stick for that genome.
@@ -142,12 +149,35 @@ conversation starters, not diagnoses.
 
 ---
 
-## F5 · Reference
+## F5 · GWAS
+
+**Job:** intersect the active F1 genome with the local GWAS Catalog associations
+table from F2.
+
+- Stats strip: catalog SNP count, how many of those rsIDs are on your chip,
+  traits hit, optional **p-value cut** (**P** cycles genome-wide / 5e-8 / 1e-5 /
+  1e-3 / any).
+- Left: traits — **L** toggles **CUR** (themed shortlist: intelligence, sleep,
+  body, … — same spirit as F4 CUR) / **ALL** (every matched Catalog trait).
+  Center: associations for the highlighted trait (your genotype vs reported risk
+  allele). Right: detail **HIT** / **ASK** (**C** copy rsID, **B** PubMed).
+- **A** / ASK tab runs a **scientific** brief in-place (shared F7 thread
+  «GWAS · F5»): Catalog facts, allelic concordance, population-genetic limits.
+  Cached per focal row; **Refresh** regenerates. Needs Gemini key in F2.
+- **/** search in **TRAITS** (trait · rsID · gene · GCST) · **R** rescan
+  (ignore cache). First match can take a minute; later opens reuse an on-disk
+  cache keyed by genome + catalog mtime + p-cut.
+
+Needs: active F1 file + **F2 → GWAS Catalog → D** (or **P**).
+
+---
+
+## F6 · Reference
 
 **Job:** put your genome next to published panels — mainly **AADR** ancients
 (and optionally 1000 Genomes), with f3-style results you already computed offline.
 
-What loads when you open F5
+What loads when you open F6
 
 - AADR **catalog** (who the groups are, including Y labels on ancients).
 - **Your result bundles** for this genome (the scan you ran earlier).
@@ -163,7 +193,7 @@ AADR ↔ 1000G. Map / tree / layers views are different lenses on the same group
 
 ---
 
-## F6 · Chat
+## F7 · Chat
 
 **Job:** notebook-ish threads with Gemini (key + model in F2).
 
@@ -174,23 +204,23 @@ AADR ↔ 1000G. Map / tree / layers views are different lenses on the same group
 - **N** copies the last model reply into NOTES; **S** select-mode for copy/paste.
 
 The model does not automatically see your RAW file; talk in terms of what you
-already found in F3–F5, or paste snippets into NOTES / the prompt yourself.
+already found in F3–F6, or paste snippets into NOTES / the prompt yourself.
 From F3, **A** prefills Ask GPT into the **active** chat (new chat only if none exist).
 
 ---
 
-## F7 · Jobs
+## F8 · Jobs
 
 **Job:** see what is running in the background.
 
 - Two panels: task list + detail (progress, rate, ETA, message).
-- Tasks still **start** in F2 / F3 / F4 / F6; F7 monitors them.
+- Tasks still **start** in F2 / F3 / F4 / F5 / F7; F8 monitors them.
 - **P** pause/resume · **A** pause all · **C** cancel (or drop queued) · **X** clear finished · **/** filter.
-- Discover stages 1–5 on F2 **enqueue** if the slot is busy; F7 shows the queue.
+- Discover stages 1–5 on F2 **enqueue** if the slot is busy; F8 shows the queue.
 
 ---
 
-## F8 · Samples
+## F9 · Samples
 
 **Job:** Open Humans catalog (the mode itself — no intermediate screen).
 **D** on the highlighted row downloads that genome (or all Space-marked); **V**
@@ -201,7 +231,7 @@ Compat: ● READY (F1 parses), ○ NEED CODE, △ PEEK, ✖ SKIP noise.
 
 ---
 
-## F9 · Help
+## F10 · Help
 
 This page.
 
@@ -215,16 +245,17 @@ This page.
 | F2 | Where is the reference data? Is it complete? |
 | F3 | Where am I on the Y tree? What do Discover cards say? |
 | F4 | How do PGS models land on *my* genotypes? |
-| F5 | How do I sit among ancients / reference pops (f3 + Y tags)? |
-| F6 | Can I think out loud with a model, with notes beside? |
-| F7 | What is running in the background right now? |
-| F8 | Which public samples do I have / still need? |
-| F9 | What is the intended path through the app? |
+| F5 | Which curated GWAS hits land on *my* chip SNPs? |
+| F6 | How do I sit among ancients / reference pops (f3 + Y tags)? |
+| F7 | Can I think out loud with a model, with notes beside? |
+| F8 | What is running in the background right now? |
+| F9 | Which public samples do I have / still need? |
+| F10 | What is the intended path through the app? |
 
 Everything important stays on your machine. Slow first opens are usually
 “build or unpack a cache once”; warm revisits should feel light.
 
-**Q** quits (confirm → shutdown progress in the UI, then exit). **F1–F9** switch modes anytime.
+**Q** quits (confirm → shutdown progress in the UI, then exit). **F1–F10** switch modes anytime.
 
 Only one app window at a time. If a second start says “already running”, close the
 other window or `kill` that PID — you do not need to touch any database files.
@@ -246,7 +277,7 @@ def _bake_help(width: int) -> Text:
 
 
 def help_view(*, width: int | None = None) -> RenderableType:
-    """Cached help body for F9. Pass width to rebuild after a large resize."""
+    """Cached help body for F10. Pass width to rebuild after a large resize."""
     global _HELP_TEXT, _HELP_BAKED_WIDTH
     w = width if width is not None else (_HELP_BAKED_WIDTH or _DEFAULT_WIDTH)
     if _HELP_TEXT is None or w != _HELP_BAKED_WIDTH:

@@ -198,7 +198,7 @@ class GenomeWorkspace(Workspace):
                       ("Z", "Collapse all", "screen.collapse_all"),
                       ("N", "Next derived Y", "screen.next_derived"), ("Esc", "Clear filter", None),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:

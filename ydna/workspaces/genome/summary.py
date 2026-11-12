@@ -172,7 +172,7 @@ def onboarding_summary() -> Text:
     d.title("3 · TREE (F3)")
     d.line("Browse the full haplotree; Discover JSON enriches cards where present")
     d.title("THEN")
-    d.line("F4 PGS · F5 Reference · F6 Chat", DIM)
+    d.line("F4 PGS · F5 GWAS · F6 Reference · F7 Chat", DIM)
     return d.t
 
 

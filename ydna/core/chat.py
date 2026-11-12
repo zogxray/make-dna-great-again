@@ -1,4 +1,4 @@
-"""F6 Chat: треды на диске и Gemini Interactions API. Без UI."""
+"""F7 Chat: треды на диске и Gemini Interactions API. Без UI."""
 
 from __future__ import annotations
 
@@ -25,9 +25,12 @@ READ_IDLE_S = 90.0          # no bytes from the wire → fail
 WRITE_S = 60.0
 WALL_S = 600.0              # whole Interactions call ceiling
 WALL_MS = int(WALL_S * 1000)
-# One shared F6 thread for all F5 SUMMARY asks (ref.summaries.thread_id → this id).
+# Shared F7 threads for mode-embedded asks (stable ids; titles show current F-keys).
 REF_THREAD_ID = "ref-f5"
-REF_THREAD_TITLE = "Reference · F5"
+REF_THREAD_TITLE = "Reference · F6"
+GWAS_THREAD_ID = "gwas-f5"
+GWAS_THREAD_TITLE = "GWAS · F5"
+_SHARED_THREAD_IDS = frozenset({REF_THREAD_ID, GWAS_THREAD_ID})
 _SKIP = ("image", "embedding", "banana", "omni", "antigravity", "deep-research",
          "tts", "veo", "aqa", "robotics", "native-audio", "live")
 _models_cache: tuple[float, list["ChatModel"]] | None = None
@@ -205,8 +208,9 @@ def save_notes(thread: Thread) -> None:
 def delete(tid: str) -> None:
     from . import db
 
-    if tid == REF_THREAD_ID:
-        raise RuntimeError("Reference · F5 chat is shared — clear messages in NOTES, do not delete")
+    if tid in _SHARED_THREAD_IDS:
+        title = REF_THREAD_TITLE if tid == REF_THREAD_ID else GWAS_THREAD_TITLE
+        raise RuntimeError(f"{title} is shared — clear messages in NOTES, do not delete")
 
     def _once() -> None:
         with db.locked():
@@ -242,8 +246,29 @@ def ensure_reference_thread() -> Thread:
     return t
 
 
+def ensure_gwas_thread() -> Thread:
+    """Load or create the single F5 GWAS ASK chat."""
+    t = load(GWAS_THREAD_ID)
+    if t is not None:
+        if t.title != GWAS_THREAD_TITLE:
+            t.title = GWAS_THREAD_TITLE
+            save(t)
+        return t
+    t = Thread(id=GWAS_THREAD_ID, title=GWAS_THREAD_TITLE)
+    save(t)
+    return t
+
+
 def is_reference_thread(tid: str | None) -> bool:
     return bool(tid) and tid == REF_THREAD_ID
+
+
+def is_gwas_thread(tid: str | None) -> bool:
+    return bool(tid) and tid == GWAS_THREAD_ID
+
+
+def is_shared_thread(tid: str | None) -> bool:
+    return bool(tid) and tid in _SHARED_THREAD_IDS
 
 
 def last_user_index(thread: Thread) -> int | None:

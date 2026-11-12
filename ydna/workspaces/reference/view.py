@@ -1,4 +1,4 @@
-"""Тексты F5: строка группы, карточка, карта по эпохам."""
+"""Тексты F6: строка группы, карточка, карта по эпохам."""
 
 from __future__ import annotations
 
@@ -433,7 +433,7 @@ _SUMMARY_MD_CACHE_MAX = 32
 
 
 def _bake_md(body: str, *, width: int = CARD_W) -> Text:
-    """Parse SUMMARY Markdown once → styled Text (same approach as F6 chat)."""
+    """Parse SUMMARY Markdown once → styled Text (same approach as F7 chat)."""
     text = (body or "").rstrip() or " "
     key = (hash(text), max(36, width))
     cached = _SUMMARY_MD_CACHE.get(key)
@@ -1181,7 +1181,7 @@ def _summary_tab(d: Text, *,
     d.append(" No summary yet.\n\n", style=MUTED)
     d.append(" ")
     d.append(" Ask summary ", style=click("screen.ask_summary()", "bold reverse #D4AD72"))
-    d.append("  → shared F6 chat «Reference · F5»\n\n", style=MUTED)
+    d.append("  → shared F7 chat «Reference · F6»\n\n", style=MUTED)
     d.append(" Prompt sketch (what we send):\n", style="#8A8294")
     d.append("  · group + place/date/Y/mt from ANNO\n", style="#71697A")
     d.append("  · pubs + DOIs\n", style="#71697A")

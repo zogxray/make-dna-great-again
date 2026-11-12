@@ -183,7 +183,7 @@ def lore(ctx, doc: Doc, node: dict) -> None:
     doc.title("GENERATE")
     put(doc,
         ("A", click("screen.ask_gpt", "bold reverse #D4AD72")),
-        ("  weave LORE from anchors → F6  · skald + scientist · HARD / RECON / STORY",
+        ("  weave LORE from anchors → F7  · skald + scientist · HARD / RECON / STORY",
          "#71697A"))
 
     cached = _cache_get(ctx, name)

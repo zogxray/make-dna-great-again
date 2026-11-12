@@ -7,9 +7,9 @@ factory. You keep the data, you choose what to run, screens stay inspectable.
 
 Intended reader: you already know haplogroups and PCA-ish ancestry talk, you are
 tired of black-box consumer sites, but you are not living in R/`admixture` yet.
-Same guide lives inside the app as **F9 Help** (flow & UX; light on internals).
+Same guide lives inside the app as **F10 Help** (flow & UX; light on internals).
 
-Modes: **F1 Genome → F2 Data → F3 Tree → F4 PGS → F5 Reference → F6 Chat → F7 Jobs → F8 Samples → F9 Help**.
+Modes: **F1 Genome → F2 Data → F3 Tree → F4 PGS → F5 GWAS → F6 Reference → F7 Chat → F8 Jobs → F9 Samples → F10 Help**.
 
 ## Requirements
 
@@ -18,10 +18,11 @@ Modes: **F1 Genome → F2 Data → F3 Tree → F4 PGS → F5 Reference → F6 Ch
 - Optional external data (paths in **F2**):
   - FTDNA Y-DNA Haplotree JSON — **F3** + Y linking
   - FTDNA Discover haplogroup JSON folder — rich **F3** cards
-  - AADR panel — **F5**
-  - 1000 Genomes PLINK2 set — **F4** / some **F5** layers
+  - AADR panel — **F6**
+  - 1000 Genomes PLINK2 set — **F4** / some **F6** layers
   - PGS catalog built in **F2** (or pointed at with **P**) — **F4**
-  - Gemini API key — **F6**
+  - GWAS Catalog dump from **F2** — **F5**
+  - Gemini API key — **F7**
 
 Formats in **F1**: 23andMe, AncestryDNA, MyHeritage, FTDNA, Argenética; **VCF**
 (incl. `.vcf.bz2` / `.vcf.gz`); **FTDNA Big Y** CSV (`Type`/`Position`/`SNPName`/
@@ -72,14 +73,15 @@ that window or `kill <pid>`. You do not need to touch database files.
 ## Suggested path (first hour)
 
 1. **F1 Genome** — open RAW/TXT/VCF/Big Y.
-2. **F2 Data** — at least FTDNA Haplotree; Discover if you want rich Y cards; AADR for F5.
+2. **F2 Data** — at least FTDNA Haplotree; Discover if you want rich Y cards; AADR for F6.
 3. **F3 Tree** — walk the tree with **your** branch (**O** = Our Y).
 4. **F4 PGS** — after **F2 → PGS models → D** (or **P** to a catalog folder).
-5. **F5 Reference** — f3 / ancients (or 1000G) against AADR.
-6. **F6 Chat** — Gemini (key in F2).
-7. **F7 Jobs** — watch long downloads / Discover / PGS / Gemini.
-8. **F8 Samples** — Open Humans public kits (filter / get missing / DuckDB).
-9. **F9 Help** — this guide inside the TUI.
+5. **F5 GWAS** — after **F2 → GWAS Catalog → D** (or **P**): chip × associations.
+6. **F6 Reference** — f3 / ancients (or 1000G) against AADR.
+7. **F7 Chat** — Gemini (key in F2).
+8. **F8 Jobs** — watch long downloads / Discover / PGS / GWAS / Gemini.
+9. **F9 Samples** — Open Humans public kits (filter / get missing / DuckDB).
+10. **F10 Help** — this guide inside the TUI.
 
 You can skip screens. Nothing forces a “full report”.
 
@@ -95,14 +97,14 @@ Pick the active genotype and see what is in the file.
 - **Big Y CSV**: Known SNP (name → position via haplotree) + Novel Variant (by
   Position). Build defaults to GRCh38.
 
-F1 is the “who am I looking at?” switch — F3/F5 follow the active file.
+F1 is the “who am I looking at?” switch — F3/F5/F6 follow the active file.
 
 ## F2 · Data
 
 Point the app at reference datasets; download or verify in the background.
 
 **Minimum for a useful Y session:** Haplotree JSON; Discover folder strongly recommended.  
-**Minimum for F5:** AADR (`.geno` / `.ind` / `.anno`).
+**Minimum for F6:** AADR (`.geno` / `.ind` / `.anno`).
 
 | Source | How it gets on disk |
 |--------|---------------------|
@@ -110,7 +112,8 @@ Point the app at reference datasets; download or verify in the background.
 | FTDNA Haplotree | **D** in F2, or **P** to an existing JSON. |
 | AADR / 1000 Genomes | **D** or **P**. Large downloads. |
 | Seshat · Polaris | **D** — polity / religion codes (~3 MB Excel, CC BY-NC). |
-| Open Humans | **F8** (or F2 **B**) is the catalog; **D on a row** downloads that genome (any compat) → DuckDB (+ READY → genome). **V**: API new + missing under filter. |
+| Open Humans | **F9** (or F2 **B**) is the catalog; **D on a row** downloads that genome (any compat) → DuckDB (+ READY → genome). **V**: API new + missing under filter. |
+| GWAS Catalog | **D** in F2 — latest FTP snapshot (associations, studies, EFO). Or **P** to a folder. Used by **F5**. |
 | PGS models | **D** in F2 (needs F1 genome for coverage), or **P** to an existing catalog folder. |
 | Gemini | **P** (key in DuckDB) or `GEMINI_API_KEY`. |
 
@@ -119,7 +122,7 @@ Point the app at reference datasets; download or verify in the background.
 1. **Our** path (tip→root) · **2** Children below Our · **3** This genome ·
 4. All F1 genomes · **5** / **A** whole tree (confirm twice).
 
-Direct JSON first; HaplogroupSearch only if the resource 403/404. Progress in **F7**.
+Direct JSON first; HaplogroupSearch only if the resource 403/404. Progress in **F8**.
 
 URLs and readiness checks are in the F2 detail panel.
 
@@ -146,17 +149,30 @@ file or 1000 Genomes-style refs from the catalog.
 Build the catalog once in **F2 → PGS models → D** (needs F1 for SNP coverage), or
 **P** to an existing work folder with `catalog/catalog.tsv`.
 
-- **L** — curated / catalog / diseases / low cov / too few  
+- **L** — CUR (shortlist) / ALL (catalog) / HOLD (triage); on ALL: **F** gate filter  
 - **G** / **A** — score theme or all · results stick for that genome  
 
 Effect sizes on *your* SNPs — not medical advice.
 
-## F5 · Reference
+## F5 · GWAS
+
+Match the active F1 genome against the local GWAS Catalog associations table
+(from **F2 → GWAS Catalog → D** / **P**).
+
+- Traits: **L** — **CUR** (themed shortlist) / **ALL** (every matched trait)  
+- Associations for the selected trait · detail **HIT** / **ASK**  
+- **A** / ASK — scientific note in-tab via shared chat **GWAS · F5** (Gemini key in F2)  
+- **P** cycles p-value cut · **/** search traits · **R** rescan · **C** copy rsID · **B** PubMed  
+- First scan can take a minute; results cache by genome + catalog mtime + cut  
+
+Not a polygenic score — that is **F4**.
+
+## F6 · Reference
 
 Your genome next to published panels — mainly **AADR** (and optionally 1000G),
 with f3-style results you computed offline.
 
-Opening F5 loads: AADR **catalog** (who the groups are + Y labels), **your result
+Opening F6 loads: AADR **catalog** (who the groups are + Y labels), **your result
 bundles**, and **Y relation tags** (same / ancestor / downstream / other), same
 Our Y idea as F3. “Loading AADR…” means that whole package.
 
@@ -167,7 +183,7 @@ Left column: **GROUPS** (list) above **GROUP** (card).
 **LAYERS** (smartpca / qpAdm / imputation / ChromoPainter) need lab binaries on
 `PATH` — optional research tools, not the default path.
 
-## F6 · Chat
+## F7 · Chat
 
 Threads with Gemini (key + model in F2).
 
@@ -175,21 +191,21 @@ Threads with Gemini (key + model in F2).
 - Enter sends; replies stream and are stored locally  
 - **N** last reply → NOTES · **S** select mode for copy  
 
-The model does not auto-read your RAW file — talk from F3–F5 findings or paste.
+The model does not auto-read your RAW file — talk from F3–F6 findings or paste.
 
-## F7 · Jobs
+## F8 · Jobs
 
-Background task monitor (list + detail). Downloads, Discover fetches, PGS,
-Tasks still **start** from F2/F3/F4/F6; F7 watches them. **P** pause/resume,
+Background task monitor (list + detail). Downloads, Discover fetches, PGS, GWAS.
+Tasks still **start** from F2/F3/F4/F5/F7; F8 watches them. **P** pause/resume,
 **A** pause all, **C** cancel (or drop a queued item), **X** clear finished.
 Discover stages 1–5 on F2 enqueue onto the same slot when one is already active.
 
-## F8 · Samples
+## F9 · Samples
 
 Open Humans catalog is the mode itself (no landing / B). **D** on a row downloads
 that genome; ● READY / ○ NEED are labels — NEED is not blocked. **V** = API new + missing.
 
-## F9 · Help
+## F10 · Help
 
 In-app copy of this flow guide. Scroll with ↑↓ / PgUp/Dn.
 
@@ -201,18 +217,19 @@ In-app copy of this flow guide. Scroll with ↑↓ / PgUp/Dn.
 | F2 | Where is the reference data? Is it complete? |
 | F3 | Where am I on the Y tree? What do Discover cards say? |
 | F4 | How do PGS models land on *my* genotypes? |
-| F5 | How do I sit among ancients / reference pops (f3 + Y tags)? |
-| F6 | Can I think out loud with a model, with notes beside? |
-| F7 | What is running in the background right now? |
-| F8 | Which public samples do I have / still need? |
-| F9 | What is the intended path through the app? |
+| F5 | Which curated GWAS hits land on *my* chip SNPs? |
+| F6 | How do I sit among ancients / reference pops (f3 + Y tags)? |
+| F7 | Can I think out loud with a model, with notes beside? |
+| F8 | What is running in the background right now? |
+| F9 | Which public samples do I have / still need? |
+| F10 | What is the intended path through the app? |
 
 Everything important stays on your machine. Slow first opens are usually “build
 or unpack a cache once”; warm revisits should feel light.
 
 ## Keys (common)
 
-- **F1–F9** — switch mode  
+- **F1–F10** — switch mode  
 - **Tab** — next panel  
 - **Q** — quit  
 - Mode-specific hints sit on the bottom key bar of each screen  
@@ -229,7 +246,7 @@ python -m ydna --genome /path/to/kit.txt
 
 ```bash
 pip install -e '.[dev]'
-python -m ydna.bench.mode_load              # F1→F9 wall times + UI-thread cProfile
+python -m ydna.bench.mode_load              # F1→F10 wall times + UI-thread cProfile
 python -m ydna.bench.mode_load --deep-only  # profile catalog/tree/AADR/PGS loaders only
 MDGA_LOCAL_BENCH=1 pytest tests/test_mode_load_profile.py -s
 ```

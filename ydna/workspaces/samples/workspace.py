@@ -1,4 +1,4 @@
-"""Режим Samples (F8): каталог Open Humans — сразу, без промежуточного экрана."""
+"""Режим Samples (F9): каталог Open Humans — сразу, без промежуточного экрана."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ _COMPAT_SHORT = {
 
 
 class SamplesWorkspace(Workspace):
-    """F8 · Open Humans catalog (filter, per-row D, DuckDB)."""
+    """F9 · Open Humans catalog (filter, per-row D, DuckDB)."""
 
     mode_key = "samples"
     DEFAULT_CSS = """
@@ -95,7 +95,7 @@ class SamplesWorkspace(Workspace):
             ("X", "Noise", "screen.toggle_noise"),
             ("/", "Query", "screen.query"),
             ("Enter", "F1 if local", "screen.open_local"),
-            ("F1–F9", "Modes", None),
+            ("F1–F10", "Modes", None),
             ("Q", "Quit", "app.quit"),
         ]
 
@@ -419,7 +419,7 @@ class SamplesWorkspace(Workspace):
     def action_sync_db(self) -> None:
         job = JOBS.get("openhumans")
         if job and job.active:
-            self.app.notify("Open Humans task already running (see F7)", severity="warning")
+            self.app.notify("Open Humans task already running (see F8)", severity="warning")
             return
         folder = self._folder()
         folder.mkdir(parents=True, exist_ok=True)
@@ -439,7 +439,7 @@ class SamplesWorkspace(Workspace):
     def _enqueue_download(self, files: list[oh.OhFile], *, note: str) -> None:
         job = JOBS.get("openhumans")
         if job and job.active:
-            self.app.notify("Open Humans download already running (see F7)", severity="warning")
+            self.app.notify("Open Humans download already running (see F8)", severity="warning")
             return
         if not files:
             self.app.notify("Nothing to download", severity="warning")

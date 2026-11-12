@@ -1,4 +1,4 @@
-"""Local load profile: open F1–F9, time until idle, write cProfile reports.
+"""Local load profile: open F1–F10, time until idle, write cProfile reports.
 
 Requires your real ``data/`` (private). Not for CI.
 

@@ -1,4 +1,4 @@
-"""Open F1–F9 in order, time until each mode is idle, cProfile hotspots.
+"""Open F1–F10 in order, time until each mode is idle, cProfile hotspots.
 
 Uses the real local ``data/`` tree (private — never commit kits). Safe to run
 only on your machine; skips if another app instance holds the lock.
@@ -46,7 +46,7 @@ class ModeTiming:
     ttfl_s: float | None = None  # time to first BusyModal; None = never shown
     loader_s: float = 0.0        # how long BusyModal stayed up
     busy_stages: list[str] = field(default_factory=list)
-    # F5 Reference breakdown (worker / apply / GROUPS·MAP·GROUP)
+    # F6 Reference breakdown (worker / apply / GROUPS·MAP·GROUP)
     ref_load_s: float | None = None
     ref_apply_s: float | None = None
     ref_paint_s: float | None = None
@@ -87,16 +87,16 @@ class BenchReport:
         lines = [
             "Mode load bench — все времена в секундах (s), wall-clock",
             "",
-            "Что измеряем на каждый F1–F9:",
+            "Что измеряем на каждый F1–F10:",
             "  wall     полное время режима: F-клавиша → UI готов (press + ready)",
             "  press    синхронный switch_mode / первый mount экрана (до ожидания)",
-            "           сюда же попадает тяжёлый Rich/Markdown без BusyModal (F9)",
+            "           сюда же попадает тяжёлый Rich/Markdown без BusyModal (F10)",
             "  to_busy  до первого BusyModal (спиннер); — = не было",
             "  busy     сколько спиннер реально висел на экране",
             "  ready    после press: до тишины (нет модалки / воркеров / paint)",
             "  stages   тексты стадий BusyModal по порядку",
             "",
-            "F5 Reference дополнительно дробит busy на фазы:",
+            "F6 Reference дополнительно дробит busy на фазы:",
             "  worker   фон: каталог AADR / Y / results",
             "  apply    main thread: слои / бандлы после воркера",
             "  paint    main thread: GROUPS list + MAP + GROUP card",
@@ -138,7 +138,7 @@ class BenchReport:
                     shown = "…" + shown[-61:]
                 lines.append(f"     stages: {shown}")
         lines.append("-" * 80)
-        lines.append(f"TOTAL (весь прогон F1–F9): {_fmt_s(self.total_s, width=0)}")
+        lines.append(f"TOTAL (весь прогон F1–F10): {_fmt_s(self.total_s, width=0)}")
         lines.append(f"отчёт → {self.out_dir}")
         lines.append("        summary.txt  — эта таблица")
         lines.append("        detail.md    — то же + cProfile сниппеты")
@@ -172,7 +172,7 @@ class BenchReport:
             blocks.append(f"- **wall** `{t.wall_s:.3f}s` — полное время режима")
             blocks.append(
                 f"- **press** `{t.press_s:.3f}s` — mount/switch "
-                f"(для F9 это почти весь wall: Markdown help, данных нет)"
+                f"(для F10 это почти весь wall: Markdown help, данных нет)"
             )
             blocks.append(f"- **to_busy** `{to_busy}` — до первого BusyModal")
             blocks.append(f"- **busy** `{t.loader_s:.3f}s` — спиннер на экране")
@@ -394,7 +394,7 @@ async def run_mode_load_bench(
     size: tuple[int, int] = (140, 40),
     profile: bool = True,
 ) -> BenchReport:
-    """Drive YDnaApp through F1–F9; return timings + write profiles under out_dir."""
+    """Drive YDnaApp through F1–F10; return timings + write profiles under out_dir."""
     from ..app import YDnaApp
     from ..core import db
     from ..core.single import AlreadyRunning, acquire, release
@@ -600,7 +600,7 @@ def run_deep_loaders(out_dir: Path) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Profile F1–F9 mode load times (local data/).")
+    parser = argparse.ArgumentParser(description="Profile F1–F10 mode load times (local data/).")
     parser.add_argument("--timeout", type=float, default=180.0,
                         help="Per-mode idle timeout seconds (default 180)")
     parser.add_argument("--quick", action="store_true",

@@ -21,6 +21,30 @@ LIST_W = 40
 BIG_DELTA = 25
 SORTS = {"theme": "theme", "delta": "Δ", "a": "A", "b": "B"}
 
+# HOLD section headers (status → label); browse gates use short chips in workspace.
+STATUS_LABEL = {
+    "ok": "Chip-ready",
+    "low_coverage": "Low coverage",
+    "too_few_matched": "Too few matched",
+    "excluded_disease": "Clinical / disease",
+    "no_rsid_column": "No rsID column",
+    "variants_out_of_range": "Variants out of range",
+    "eur_below_threshold": "EUR below threshold",
+    "ancestry_unknown": "Ancestry unknown",
+    "download_failed": "Download failed",
+    "pending_coverage": "Pending coverage",
+    "read_error": "Read error",
+    "no_usable_variants": "No usable variants",
+}
+
+BROWSE_GATE_LABELS = (
+    ("any", "any"),
+    ("ok", "ok"),
+    ("low", "low"),
+    ("few", "few"),
+    ("dis", "dis"),
+)
+
 
 def pct_style(p: float) -> str:
     return GRADIENT[min(int(p / 100 * len(GRADIENT)), len(GRADIENT) - 1)]
@@ -61,30 +85,77 @@ def z_text(z: float | None) -> str:
 
 def theme_header(theme: str, total: int, done: int) -> Text:
     t = Text(no_wrap=True)
-    t.append(THEME_LABEL.get(theme, theme).upper(), style="bold #D4AD72")
+    label = THEME_LABEL.get(theme) or STATUS_LABEL.get(theme) or theme
+    t.append(label.upper(), style="bold #D4AD72")
     t.append(f"  {done}/{total}", style="#8A8294")
     return t
 
 
-def model_prompt(m: Model, r: Result | None) -> Text:
+def _compact_n(n: int) -> str:
+    if n >= 1000:
+        v = n / 1000
+        s = f"{v:.0f}k" if v >= 10 else f"{v:.1f}k"
+        return s.replace(".0k", "k")
+    return f"{n:,}"
+
+
+def _cov_style(c: float) -> str:
+    if c >= 0.80:
+        return OK
+    if c >= 0.50:
+        return DIM
+    if c >= 0.20:
+        return WARN
+    return BAD
+
+
+def _trait_title(trait: str) -> str:
+    """Drop trailing '(10,055)' — size lives on the strength line."""
+    s = trait.strip()
+    if s.endswith(")") and " (" in s:
+        head, _, tail = s.rpartition(" (")
+        if tail[:-1].replace(",", "").replace(" ", "").isdigit():
+            return head
+    return s
+
+
+def model_prompt(m: Model, r: Result | None, width: int | None = None) -> Text:
+    """List card: trait / strength / id+% / blank line.
+
+    Trailing NBSP keeps a real empty row (plain spaces/newlines are collapsed).
+    """
+    w = max(20, min(LIST_W, int(width or LIST_W)))
     t = Text(no_wrap=True)
     if r and not r.error and r.eur:
-        t.append("✔ ", style="#53A94B")
+        tail, you_style = f"{r.eur.pct:.0f}%", pct_style(r.eur.pct)
     elif r and r.error:
-        t.append("✖ ", style="#8BAB4A")
-    else:
-        t.append("· ", style="#71697A")
-    t.append(fit(m.trait, LIST_W - 2) + "\n", style="bold" if r else "")
-    t.append(f"  {m.pgs_id} ", style="#8A8294")
-    if r and r.error:
-        t.append("failed", style="#8BAB4A")
-    elif r and r.eur:
-        t.append(f"{r.eur.pct:5.1f}% ", style=pct_style(r.eur.pct))
-        bar(t, r.eur.pct, LIST_W - 20)
+        tail, you_style = "failed", BAD
     elif m.status and m.status not in ("ok", ""):
-        t.append(m.status.replace("_", " "), style="#B04A4A")
+        tail, you_style = m.status.replace("_", " "), BAD
     else:
-        t.append("not scored", style="#71697A")
+        tail, you_style = "not scored", DIM
+
+    t.append(fit(_trait_title(m.trait), w) + "\n", style="bold" if r else "")
+
+    parts: list[tuple[str, str]] = [(_compact_n(m.variants), DIM)]
+    if m.cov_w is not None:
+        parts.append((f"cov {m.cov_w:.0%}", _cov_style(m.cov_w)))
+    if m.eur_pct is not None:
+        parts.append((f"EUR {m.eur_pct:.0f}%", DIM))
+    while parts and len(" · ".join(s for s, _ in parts)) > w:
+        parts.pop()
+    for i, (s, style) in enumerate(parts):
+        if i:
+            t.append(" · ", style=DIM)
+        t.append(s, style=style)
+    t.append("\n")
+
+    t.append(m.pgs_id, style="#8A8294")
+    room = max(1, w - len(m.pgs_id) - 1)
+    tail_fit = fit(tail, room)
+    pad = max(1, w - len(m.pgs_id) - len(tail_fit))
+    t.append(" " * pad + tail_fit + "\n", style=you_style)
+    t.append("\u00a0")  # blank row between cards
     return t
 
 

@@ -10,7 +10,31 @@ from typing import Any
 from . import db
 
 
-_MENUS_SEED = "menus_seed_v1"  # bump when CURATED / system tabs change
+_MENUS_SEED = "menus_seed_v3"  # bump when CURATED / system tabs change
+
+# Triage queue: not the working shortlist, not “browse everything”.
+HOLD_STATUSES = (
+    "low_coverage",
+    "too_few_matched",
+    "excluded_disease",
+    "no_rsid_column",
+    "variants_out_of_range",
+    "eur_below_threshold",
+    "ancestry_unknown",
+    "download_failed",
+    "pending_coverage",
+    "read_error",
+    "no_usable_variants",
+)
+
+# ALL (browse) gate chips → status sets; None = no filter.
+BROWSE_GATES: dict[str, set[str] | None] = {
+    "any": None,
+    "ok": {"ok"},
+    "low": {"low_coverage"},
+    "few": {"too_few_matched"},
+    "dis": {"excluded_disease"},
+}
 
 
 def _menus_seed_sig() -> str:
@@ -31,7 +55,7 @@ def menus_seeded(con=None) -> bool:
 
 
 def seed_menus(con=None, *, force: bool = False) -> None:
-    """Системные вкладки: curated / catalog / diseases / low cov / too few.
+    """Системные вкладки: CUR (shortlist) / ALL (browse) / HOLD (triage).
 
     Idempotent: skips DELETE/INSERT when ``menus_seed`` meta already matches
     current CURATED (F4 was rewriting ~100 curated rows on every open).
@@ -41,11 +65,10 @@ def seed_menus(con=None, *, force: bool = False) -> None:
     # Короткие ярлыки: ряд вкладок должен влезать в узкую колонку MODELS (~46).
     menus = [
         ("curated", "CUR", "selection", 0, True),
-        ("catalog", "CAT", "catalog", 1, True),
-        ("diseases", "DIS", "diseases", 2, True),
-        ("low_coverage", "LOW", "status", 3, True),
-        ("too_few_matched", "FEW", "status", 4, True),
+        ("browse", "ALL", "browse", 1, True),
+        ("hold", "HOLD", "hold", 2, True),
     ]
+    retired = ("catalog", "diseases", "low_coverage", "too_few_matched")
     items = [
         (i, pid, label, theme)
         for i, (pid, theme, label) in enumerate(CURATED)
@@ -69,6 +92,10 @@ def seed_menus(con=None, *, force: bool = False) -> None:
         if not force and menus_seeded(c):
             return
         c.executemany(sql_menus, menus)
+        c.executemany(
+            "UPDATE pgs.menus SET active = FALSE WHERE id = ?",
+            [(rid,) for rid in retired],
+        )
         c.execute("DELETE FROM pgs.menu_items WHERE menu_id = 'curated'")
         c.executemany("""
             INSERT INTO pgs.menu_items (menu_id, ord, pgs_id, label, theme)
@@ -218,15 +245,39 @@ def load_catalog_ok() -> list:
     return load_by_status("ok")
 
 
-def load_by_status(status: str) -> list:
-    """Модели с данным status (порядок theme / cov_w)."""
+def _sort_by_theme(models: list) -> list:
     from .pgs import THEMES
     order = {k: i for i, (k, _) in enumerate(THEMES)}
+    models.sort(key=lambda m: (order.get(m.theme, 99), -(m.cov_w or 0), m.pgs_id))
+    return models
+
+
+def load_by_status(status: str) -> list:
+    """Модели с данным status (порядок theme / cov_w)."""
     rows = db.fetchall(f"""
         SELECT {_MODEL_COLS} FROM pgs.models WHERE status = ?
     """, [status])
+    return _sort_by_theme([_row_model(r) for r in rows])
+
+
+def load_browse(statuses: set[str] | None = None) -> list:
+    """Весь themed-каталог (pgs.models); optional status gate."""
+    rows = db.fetchall(f"SELECT {_MODEL_COLS} FROM pgs.models")
     out = [_row_model(r) for r in rows]
-    out.sort(key=lambda m: (order.get(m.theme, 99), -(m.cov_w or 0), m.pgs_id))
+    if statuses is not None:
+        out = [m for m in out if (m.status or "") in statuses]
+    return _sort_by_theme(out)
+
+
+def load_hold() -> list:
+    """Triage: low/few/clinical + technical rejects; group key = status."""
+    rows = db.fetchall(f"""
+        SELECT {_MODEL_COLS} FROM pgs.models
+        WHERE status IN ({",".join("?" * len(HOLD_STATUSES))})
+    """, list(HOLD_STATUSES))
+    out = [_row_model(r) for r in rows]
+    order = {s: i for i, s in enumerate(HOLD_STATUSES)}
+    out.sort(key=lambda m: (order.get(m.status or "", 99), -(m.cov_w or 0), m.pgs_id))
     return out
 
 

@@ -1,4 +1,4 @@
-"""F5 в DuckDB (schema ref): runs / f3 / run_blobs + кэш AADR-каталога + Y badges + summaries."""
+"""F6 в DuckDB (schema ref): runs / f3 / run_blobs + кэш AADR-каталога + Y badges + summaries."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from . import db
 KEEP = object()  # не трогать blob / people при save
 
 
-# ─── F5 SUMMARY briefs (linked to chat.REF_THREAD_ID) ───
+# ─── F6 SUMMARY briefs (linked to chat.REF_THREAD_ID) ───
 
 def load_summaries() -> dict[str, dict]:
     """subject → {text, model, ts} for the GROUP card cache."""
@@ -108,7 +108,7 @@ def _hit_from_json(raw: dict):
 
 def load_y_badges(genome: Path, catalog_fp: str, tree_fp: str, discover_fp: str,
                   tip: str, path: list[str], link) -> dict | None:
-    """Кэш Y-бейджей F5 или None при промахе / устаревании."""
+    """Кэш Y-бейджей F6 или None при промахе / устаревании."""
     genome = Path(genome).expanduser().resolve()
     row = db.fetchone("""
         SELECT catalog_fp, tree_fp, discover_fp, tip, path_fp, link_fp,
@@ -118,7 +118,7 @@ def load_y_badges(genome: Path, catalog_fp: str, tree_fp: str, discover_fp: str,
     if not row:
         return None
     want_link = _link_fp(link)
-    # Без link в руках (чистый F5 cold) — доверяем сохранённым бейджам;
+    # Без link в руках (чистый F6 cold) — доверяем сохранённым бейджам;
     # если link есть и отпечаток другой — промах (y_ours_other мог смениться).
     if (row[0] != catalog_fp or row[1] != tree_fp or row[2] != discover_fp
             or row[3] != tip or row[4] != _path_fp(path)

@@ -1,4 +1,4 @@
-"""Оболочка: переключение режимов (F1–F9) и выход. Вся работа — в ydna.workspaces."""
+"""Оболочка: переключение режимов (F1–F10) и выход. Вся работа — в ydna.workspaces."""
 
 from __future__ import annotations
 
@@ -75,6 +75,7 @@ class YDnaApp(App):
                 "jobs": self._make_jobs,
                 "samples": self._make_samples,
                 "help": self._make_help,
+                "gwas": self._make_gwas,
             }
             for key, _ in MODE_LABELS:
                 self.add_mode(key, factories[key])
@@ -131,6 +132,10 @@ class YDnaApp(App):
         from .workspaces.help import HelpWorkspace
         return HelpWorkspace()
 
+    def _make_gwas(self) -> Any:
+        from .workspaces.gwas import GwasWorkspace
+        return GwasWorkspace(self.store)
+
     def source_changed(self, key: str) -> None:
         """Режим Data сменил путь к источнику или докачал его."""
         if key == _KEY_DISCOVER and (path := self.store.path(key)):
@@ -149,6 +154,8 @@ class YDnaApp(App):
                 self.tree_ws.ctx.drop_overlays()
         if key == "aadr" and (ws := self.screen) and getattr(ws, "mode_key", None) == "reference":
             ws.reload()
+        if key == "gwas_catalog" and (ws := self.screen) and getattr(ws, "mode_key", None) == "gwas":
+            ws.reload(force=True)
 
     async def on_click(self, event: events.Click) -> None:
         style = event.style
@@ -266,7 +273,7 @@ class YDnaApp(App):
     def action_mode(self, key: str) -> None:
         if self._quitting:
             return
-        # F8 (and other flows) push ModalScreen on the mode stack. Without popping,
+        # F9 (and other flows) push ModalScreen on the mode stack. Without popping,
         # F-keys look dead / switch_mode suspends the modal and the UI feels stuck.
         while len(self._screen_stack) > 1:
             try:
@@ -277,7 +284,7 @@ class YDnaApp(App):
         self.switch_mode(key)
 
     def open_chat_prefill(self, prompt: str, *, title: str | None = None) -> None:
-        """F3 Ask GPT → F6: новый тред с готовым промптом в поле ввода."""
+        """F3 Ask GPT → F7: новый тред с готовым промптом в поле ввода."""
         if self._quitting:
             return
         self.chat_prefill = prompt

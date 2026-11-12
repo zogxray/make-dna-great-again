@@ -1,4 +1,4 @@
-"""Режим Reference (F5): AADR по эпохам — список, карта, карточка группы; f3 в фоне."""
+"""Режим Reference (F6): AADR по эпохам — список, карта, карточка группы; f3 в фоне."""
 
 from __future__ import annotations
 
@@ -206,7 +206,7 @@ class ReferenceWorkspace(Workspace):
                       ("X", "Clear filter", "screen.score_clear()"),
                       ("C", "Cancel", "screen.cancel"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -215,7 +215,7 @@ class ReferenceWorkspace(Workspace):
         self.query_one("#card-box").border_title = "GROUP"
         self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
         self.query_one("#card-tabs", Static).update(card_tab_bar(self.card_tab))
-        # Shared F6 thread + persisted briefs (ref.summaries ↔ chat.ref-f5).
+        # Shared F7 thread + persisted briefs (ref.summaries ↔ chat.ref-f5).
         try:
             chat.ensure_reference_thread()
             self.summary_cache = ref_db.load_summaries()
@@ -1763,10 +1763,10 @@ class ReferenceWorkspace(Workspace):
         subject = key
 
         def work(job) -> str:
-            # One shared chat for all F5 asks; fresh Gemini turn (no prior group context).
+            # One shared chat for all F6 asks; fresh Gemini turn (no prior group context).
             t = chat.ensure_reference_thread()
-            # Label the turn in F6 history.
-            headed = f"[F5 · {subject}]\n\n{prompt}"
+            # Label the turn in F7 history.
+            headed = f"[F6 · {subject}]\n\n{prompt}"
             t.messages.append(chat.Message("user", headed))
             chat.save(t)
             chat.send(store, t, job, continue_chat=False)

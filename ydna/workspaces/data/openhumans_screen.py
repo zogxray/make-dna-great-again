@@ -1,4 +1,4 @@
-"""Open Humans helpers shared with F8 Samples (query dialog)."""
+"""Open Humans helpers shared with F9 Samples (query dialog)."""
 
 from __future__ import annotations
 

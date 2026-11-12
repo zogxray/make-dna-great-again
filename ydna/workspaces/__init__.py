@@ -10,13 +10,14 @@ from typing import TYPE_CHECKING
 __all__ = [
     "TreeWorkspace", "DataWorkspace", "GenomeWorkspace", "PgsWorkspace",
     "ReferenceWorkspace", "ChatWorkspace", "JobsWorkspace",
-    "SamplesWorkspace", "HelpWorkspace",
+    "SamplesWorkspace", "HelpWorkspace", "GwasWorkspace",
 ]
 
 if TYPE_CHECKING:
     from .chat import ChatWorkspace
     from .data import DataWorkspace
     from .genome import GenomeWorkspace
+    from .gwas import GwasWorkspace
     from .help import HelpWorkspace
     from .jobs import JobsWorkspace
     from .pgs import PgsWorkspace
@@ -28,6 +29,7 @@ _LAZY = {
     "ChatWorkspace": ".chat",
     "DataWorkspace": ".data",
     "GenomeWorkspace": ".genome",
+    "GwasWorkspace": ".gwas",
     "HelpWorkspace": ".help",
     "JobsWorkspace": ".jobs",
     "PgsWorkspace": ".pgs",

@@ -194,17 +194,17 @@ class DataWorkspace(Workspace):
             pass
         if s and s.key == "openhumans":
             return [("↑↓", "Source", None), ("P", "Samples folder", "screen.set_path"),
-                    ("B", "Open F8 catalog", "screen.browse_openhumans"),
+                    ("B", "Open F9 catalog", "screen.browse_openhumans"),
                     ("V", "Update new", "screen.verify"),
                     ("R", "Recheck", "screen.recheck"), ("C", "Cancel task", "screen.cancel_job"),
                     ("Del", "Forget path", "screen.clear_path"), ("Tab", "Panel", "app.focus_next"),
-                    ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")]
+                    ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")]
         return [("↑↓", "Source", None), ("P", "Set path", "screen.set_path"),
                 ("D/1–5", "Fetch stage", "screen.download"),
                 ("V", "Verify MD5", "screen.verify"),
                 ("R", "Recheck", "screen.recheck"), ("C", "Cancel task", "screen.cancel_job"),
                 ("Del", "Forget path", "screen.clear_path"), ("Tab", "Panel", "app.focus_next"),
-                ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")]
+                ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")]
 
     def _menu_options(self) -> list[Option]:
         """Опции левого меню: disabled-заголовки групп + источники."""
@@ -567,7 +567,7 @@ class DataWorkspace(Workspace):
             else:
                 tip = plan.tip or "—"
                 t.append(f"Discover fetch stages · tip {tip}\n", style="bold #D4AD72")
-                t.append("Busy slot → queue (F7). Pause/cancel in F7.\n\n", style="#8A8294")
+                t.append("Busy slot → queue (F8). Pause/cancel in F7.\n\n", style="#8A8294")
                 keys = ("1", "2", "3", "4", "5")
                 stages = ("our", "children", "genome", "all_genomes", "tree")
                 labels = {
@@ -589,7 +589,7 @@ class DataWorkspace(Workspace):
                         t.append(f"[{key}]  {label}: done\n\n", style="#8A8294")
                 t.append("[D]  same as [1] Our path\n\n", style="#8A8294")
         elif s.key == "openhumans":
-            action("B", "open F8 Samples catalog (D on a row downloads)", "browse_openhumans")
+            action("B", "open F9 Samples catalog (D on a row downloads)", "browse_openhumans")
         elif s.can_download:
             if getattr(s, "needs_genome", False) and not self.genome:
                 t.append("[D]  needs an active genome in F1 (coverage uses your SNPs)\n\n",
@@ -609,7 +609,7 @@ class DataWorkspace(Workspace):
         if job and job.active:
             action("C", "cancel the running/paused task", "cancel_job")
         elif JOBS.queued_for(s.key):
-            action("C", "cancel active slot task (queued stay — manage in F7)", "cancel_job")
+            action("C", "cancel active slot task (queued stay — manage in F8)", "cancel_job")
         if s.kind == "secret" and self.store.secret(s.key):
             action("Del", "forget the API key", "clear_path")
         elif path:
@@ -710,7 +710,7 @@ class DataWorkspace(Workspace):
             return
         job = JOBS.get(s.key)
         if job and job.active:
-            self.app.notify(f"{s.title}: a task is already running (pause/cancel in F7)",
+            self.app.notify(f"{s.title}: a task is already running (pause/cancel in F8)",
                             severity="warning")
             return
 
@@ -748,7 +748,7 @@ class DataWorkspace(Workspace):
                 self.armed = time.monotonic()
                 self.app.notify(
                     f"Press 5 or A again within 5 s to fetch {n:,} haplogroups "
-                    f"({fetch_cost(n)}). Cancel anytime from F2/F7.",
+                    f"({fetch_cost(n)}). Cancel anytime from F2/F8.",
                     severity="warning", timeout=5,
                 )
                 return

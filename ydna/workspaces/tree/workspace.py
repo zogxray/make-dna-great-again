@@ -1065,7 +1065,7 @@ class TreeWorkspace(Workspace):
             self.refresh_inspector()
 
     def action_ask_gpt(self) -> None:
-        """Компактный промпт по текущей вкладке → F6 Chat."""
+        """Компактный промпт по текущей вкладке → F7 Chat."""
         if not self.ready or not self.ctx or not self.current:
             self.app.notify("Select a haplogroup first", severity="warning")
             return

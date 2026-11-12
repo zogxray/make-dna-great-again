@@ -258,11 +258,11 @@ def banner(doc: Doc, name: str, subtitle: str = "") -> None:
 
 
 def ask_cta(doc: Doc) -> None:
-    """Клик / A → F6 с компактным промптом по активной вкладке."""
+    """Клик / A → F7 с компактным промптом по активной вкладке."""
     put(doc,
         ("Ask GPT  ", "#8A8294"),
         ("A", click("screen.ask_gpt", "bold reverse #D4AD72")),
-        ("  · short prompt for this tab → F6 Chat", "#71697A"))
+        ("  · short prompt for this tab → F7 Chat", "#71697A"))
 
 
 def norm_tmrca(d: dict) -> tuple[dict, bool]:

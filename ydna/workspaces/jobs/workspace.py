@@ -1,4 +1,4 @@
-"""Режим Jobs (F7): монитор фоновых задач — список + detail. Запуск задач пока из других F."""
+"""Режим Jobs (F8): монитор фоновых задач — список + detail. Запуск задач пока из других F."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class JobsWorkspace(Workspace):
             ("A", "Pause all", "screen.pause_all"),
             ("/|F", "Filter", "screen.cycle_filter"),
             ("Tab", "Panel", "app.focus_next"),
-            ("F1–F9", "Modes", None),
+            ("F1–F10", "Modes", None),
             ("Q", "Quit", "app.quit"),
         ], id="help")
         yield Static(id="status")
@@ -191,7 +191,7 @@ class JobsWorkspace(Workspace):
                 net += j.rate
         extra = f" · ↓ {human_size(net)}/s" if net else ""
         self.query_one("#status", Static).update(
-            f"JOBS: {' · '.join(parts)}{extra} · start tasks from F2/F3/F4/F6")
+            f"JOBS: {' · '.join(parts)}{extra} · start tasks from F2/F3/F4/F5/F7")
 
     @on(OptionList.OptionHighlighted, "#jobs")
     def _highlighted(self) -> None:

@@ -1,4 +1,4 @@
-"""Режим Chat (F6): список тредов, переписка с Gemini, заметки."""
+"""Режим Chat (F7): список тредов, переписка с Gemini, заметки."""
 
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ class ChatWorkspace(Workspace):
             with Vertical(id="chats-box"):
                 yield OptionList(id="chats")
             with Vertical(id="thread-box"):
-                # Select-mode TextArea is mounted lazily on first S — cold F6 stays lighter.
+                # Select-mode TextArea is mounted lazily on first S — cold F7 stays lighter.
                 with ContentSwitcher(initial="thread-scroll", id="thread-switch"):
                     with VerticalScroll(id="thread-scroll"):
                         yield SelectableRichStatic(id="thread-md")
@@ -133,7 +133,7 @@ class ChatWorkspace(Workspace):
                       ("Del", "Delete chat", "screen.delete_chat"),
                       ("C", "Cancel", "screen.cancel"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def _active(self) -> Path | None:
@@ -149,7 +149,7 @@ class ChatWorkspace(Workspace):
         self.query_one("#chats-box").border_title = "CHATS"
         self.query_one("#thread-box").border_title = "CHAT"
         self.query_one("#notes-box").border_title = "NOTES"
-        # Spinner first frame, then thread list + Markdown bake (cold F6).
+        # Spinner first frame, then thread list + Markdown bake (cold F7).
         show_busy(self.app, "Chat", "Loading chats…")
         self.call_after_refresh(self._first_paint)
 
@@ -161,6 +161,7 @@ class ChatWorkspace(Workspace):
         try:
             try:
                 chat.ensure_reference_thread()
+                chat.ensure_gwas_thread()
             except Exception:
                 pass
             self.reload()
@@ -267,7 +268,7 @@ class ChatWorkspace(Workspace):
         return " · ".join(bits)
 
     def _ensure_select_area(self) -> ReadOnlyClipTextArea:
-        """Mount select-mode TextArea on first use (keeps cold F6 free of a 3rd editor)."""
+        """Mount select-mode TextArea on first use (keeps cold F7 free of a 3rd editor)."""
         switch = self.query_one("#thread-switch", ContentSwitcher)
         try:
             return self.query_one("#thread-sel", ReadOnlyClipTextArea)
@@ -533,8 +534,9 @@ class ChatWorkspace(Workspace):
         if not self.current or not self.query_one("#chats").has_focus:
             return
         t = self.current
-        if chat.is_reference_thread(t.id):
-            self.app.notify("Reference · F5 is shared — open it, do not delete",
+        if chat.is_shared_thread(t.id):
+            label = chat.GWAS_THREAD_TITLE if chat.is_gwas_thread(t.id) else chat.REF_THREAD_TITLE
+            self.app.notify(f"{label} is shared — open it, do not delete",
                             severity="warning")
             return
         title = (t.title or "New chat").strip() or "New chat"

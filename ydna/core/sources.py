@@ -1135,6 +1135,189 @@ def rsid_identity_db(store: Store) -> Path | None:
     return db if db.is_file() else None
 
 
+# ───────────────────────── GWAS Catalog (EBI bulk release) ─────────────────────────
+
+GWAS_PAGE = "https://www.ebi.ac.uk/gwas/"
+GWAS_FTP = "https://ftp.ebi.ac.uk/pub/databases/gwas/releases/latest"
+GWAS_STATS = "https://www.ebi.ac.uk/gwas/api/search/stats"
+GWAS_MANIFEST = "gwas-download-manifest.json"
+# Core curated tables from the published “latest” FTP snapshot.
+GWAS_FILES: tuple[tuple[str, str], ...] = (
+    ("gwas-catalog-associations_ontology-annotated-full.zip", "associations"),
+    ("gwas-catalog-studies.tsv", "studies"),
+    ("gwas-efo-trait-mappings.tsv", "EFO mappings"),
+)
+
+
+def _gwas_line_count(path: Path, *, limit: int | None = None) -> int:
+    n = 0
+    with path.open("rb") as fh:
+        for _ in fh:
+            n += 1
+            if limit is not None and n > limit:
+                break
+    return n
+
+
+def _gwas_extract_zip(zip_path: Path, dest_dir: Path, job: Job) -> Path:
+    """Unpack the first .tsv from a GWAS zip into dest_dir; return that path."""
+    job.set_stage(f"extracting · {zip_path.name}")
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(".tsv") and not n.endswith("/")]
+        if not names:
+            raise RuntimeError(f"{zip_path.name}: no .tsv inside the archive")
+        member = names[0]
+        out = dest_dir / Path(member).name
+        if out.exists() and out.stat().st_size > 0:
+            return out
+        with zf.open(member) as src, out.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+    return out
+
+
+class GwasCatalog(Source):
+    key = "gwas_catalog"
+    title = "GWAS Catalog"
+    url = GWAS_PAGE
+    about = ("NHGRI-EBI GWAS Catalog bulk release: curated SNP–trait associations, "
+             "studies, and EFO trait mappings. Downloaded from the official FTP "
+             "“latest” snapshot (not full summary statistics). Feeds F5 genome × "
+             "catalog match. Not a scoring engine — that is F4 PGS.")
+    size_hint = "~150–200 MB (associations zip + studies + EFO tables)"
+    can_download = True
+    can_verify = True
+    download_note = ("D fetches the latest FTP snapshot here (associations, studies, "
+                     "EFO mappings) for F5. Or P to an existing GWAS Catalog folder.")
+
+    def associations_tsv(self, path: Path) -> Path | None:
+        # FTP zip member names drift (…associations…, …download-associations-alt…).
+        preferred = (
+            "gwas-catalog-associations_ontology-annotated.tsv",
+            "gwas-catalog-associations-full.tsv",
+            "gwas-catalog-associations.tsv",
+            "gwas-catalog-download-associations-alt-full.tsv",
+            "gwas-catalog-download-associations-full.tsv",
+        )
+        for name in preferred:
+            p = path / name
+            if p.is_file() and p.stat().st_size > 0:
+                return p
+        cands = [
+            p for p in path.glob("gwas-catalog*association*.tsv")
+            if p.is_file() and p.stat().st_size > 0
+        ]
+        if not cands:
+            return None
+        # Prefer the largest table (full dump over tiny stubs).
+        return max(cands, key=lambda p: p.stat().st_size)
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        assoc = self.associations_tsv(path)
+        studies = path / "gwas-catalog-studies.tsv"
+        efo = path / "gwas-efo-trait-mappings.tsv"
+        zip_assoc = path / "gwas-catalog-associations_ontology-annotated-full.zip"
+        files: list[FileRow] = []
+        for p, note in (
+            (assoc, "associations"),
+            (studies if studies.is_file() else None, "studies"),
+            (efo if efo.is_file() else None, "EFO mappings"),
+            (zip_assoc if zip_assoc.is_file() else None, "associations zip"),
+        ):
+            if p is not None:
+                files.append(FileRow(p.name, p.stat().st_size, note))
+        files.extend(leftovers(path))
+        man = path / GWAS_MANIFEST
+        release = ""
+        if man.is_file():
+            try:
+                release = str(json.loads(man.read_text(encoding="utf-8")).get("catalog_date") or "")
+            except (OSError, ValueError, TypeError):
+                release = ""
+            files.append(FileRow(GWAS_MANIFEST, man.stat().st_size, "download manifest"))
+
+        have_assoc = assoc is not None
+        have_studies = studies.is_file() and studies.stat().st_size > 0
+        have_efo = efo.is_file() and efo.stat().st_size > 0
+        facts = [
+            ("Release date", release or "— (local files only)"),
+            ("Associations", human_size(assoc.stat().st_size) if have_assoc else "missing"),
+            ("Studies", human_size(studies.stat().st_size) if have_studies else "missing"),
+            ("EFO mappings", human_size(efo.stat().st_size) if have_efo else "missing"),
+        ]
+        if not have_assoc and not have_studies and not have_efo:
+            return Status("missing", "no GWAS Catalog tables — press D to download", facts, files)
+        if not (have_assoc and have_studies and have_efo):
+            missing = [n for n, ok in (("associations", have_assoc),
+                                       ("studies", have_studies),
+                                       ("EFO", have_efo)) if not ok]
+            return Status("partial", f"incomplete · missing {', '.join(missing)}", facts, files)
+        label = f"GWAS Catalog · {release}" if release else "GWAS Catalog tables"
+        return Status("ok", label, facts, files)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / "gwas"
+
+    def _remote_stats(self, job: Job) -> dict:
+        job.set_stage("GWAS Catalog · release stats")
+        req = urllib.request.Request(
+            GWAS_STATS, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.load(resp)
+        if not isinstance(data, dict) or not data.get("date"):
+            raise RuntimeError("GWAS Catalog stats API returned no release date")
+        return data
+
+    def download(self, path: Path, job: Job) -> str:
+        stats = self._remote_stats(job)
+        path.mkdir(parents=True, exist_ok=True)
+        # ~250 MB headroom for zip + extracted tables.
+        ensure_space(path, 300 << 20)
+        results: dict[str, str] = {}
+        for name, label in GWAS_FILES:
+            url = f"{GWAS_FTP}/{name}"
+            dest = path / name
+            results[name] = fetch(url, dest, job, label)
+            if name.endswith(".zip"):
+                _gwas_extract_zip(dest, path, job)
+        (path / GWAS_MANIFEST).write_text(json.dumps({
+            "source": "NHGRI-EBI GWAS Catalog",
+            "page": GWAS_PAGE,
+            "ftp": GWAS_FTP,
+            "catalog_date": stats.get("date"),
+            "stats": {k: stats.get(k) for k in (
+                "date", "studies", "associations", "snps", "sumstats",
+                "ensemblbuild", "dbsnpbuild", "genebuild", "efoversion")},
+            "files": [name for name, _ in GWAS_FILES],
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "download_result": results,
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return (f"{st.summary} · {stats.get('studies')} studies · "
+                f"{stats.get('associations')} associations (catalog stats)")
+
+    def verify(self, path: Path, job: Job) -> str:
+        job.set_stage("checking GWAS Catalog tables")
+        st = self._check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        assoc = self.associations_tsv(path)
+        assert assoc is not None
+        with assoc.open("r", encoding="utf-8", errors="replace") as fh:
+            header = fh.readline()
+        if "SNPS" not in header.upper() and "SNP" not in header.upper():
+            # Ontology-annotated export still has an SNP / rs id column under varying names.
+            if "RSID" not in header.upper() and "VARIANT" not in header.upper():
+                raise RuntimeError(f"{assoc.name}: unexpected header (no SNP/rs column)")
+        n_assoc = _gwas_line_count(assoc) - 1
+        n_studies = _gwas_line_count(path / "gwas-catalog-studies.tsv") - 1
+        return (f"OK · {n_assoc:,} association rows · {n_studies:,} study rows · "
+                f"{human_size(assoc.stat().st_size)}")
+
+
 # ───────────────────────── PGS Catalog ─────────────────────────
 
 class PgsModels(Source):
@@ -1343,8 +1526,8 @@ class Gemini(Source):
     title = "Google Gemini API"
     kind = "secret"
     url = "https://aistudio.google.com/apikey"
-    about = ("API key for Chat (F6). Free Flash models come from the live Gemini list; "
-             "pick one with M in F6. Google Search is on. Paste the key with P. "
+    about = ("API key for Chat (F7). Free Flash models come from the live Gemini list; "
+             "pick one with M in F7. Google Search is on. Paste the key with P. "
              "GEMINI_API_KEY in the environment is used if the field is empty.")
     size_hint = "Gemini API quota (AI Studio)"
     download_note = "This is a key, not a download. Press P and paste it."
@@ -1358,7 +1541,7 @@ class Gemini(Source):
         from .chat import SETTING_MODEL, short_model
         tail = str(key).strip()[-4:]
         saved = store.setting(SETTING_MODEL) if store else None
-        model = short_model(saved) if saved else "newest Flash (F6 · M)"
+        model = short_model(saved) if saved else "newest Flash (F7 · M)"
         return Status("ok", f"key set · …{tail}",
                       [("Key", f"…{tail}"), ("Model", model),
                        ("Tools", "Google Search")])
@@ -1374,14 +1557,14 @@ class OpenHumans(Source):
              "Most rows are wearables/surveys — filter to chip raw. "
              "● READY / SUPPORTED = 23andMe / AncestryDNA original .txt (F1 parses). "
              "○ NEED / NOT YET = FTDNA CSV, Big Y, VCF, zip — labeled, still downloadable. "
-             "Catalog is F8 Samples (also B from F2). D on a row (or Space-marked set) "
+             "Catalog is F9 Samples (also B from F2). D on a row (or Space-marked set) "
              "fetches that genome → DuckDB (READY also → genome ingest). "
              "V: API new items + missing under filter. "
              "Respect OH goodwill / CC0 sharing norms — selective download, not a dump.")
     size_hint = "catalog on disk · samples vary (chip files ~5–30 MB)"
     can_download = True
     can_verify = True
-    download_note = "F8 / B → catalog; D on a row downloads that genome (any compat)."
+    download_note = "F9 / B → catalog; D on a row downloads that genome (any compat)."
 
     def suggest(self, store: Store) -> Path:
         from .openhumans import default_samples_dir
@@ -1394,11 +1577,11 @@ class OpenHumans(Source):
         rows = leftovers(path) if path.is_dir() else []
         facts: list[tuple[str, str]] = []
         # Do NOT sync 14k rows here — that locked the app DB for minutes.
-        # DuckDB sync runs on F8 V / browse update / verify job only.
+        # DuckDB sync runs on F9 V / browse update / verify job only.
         try:
             n_db, _ = ohdb.catalog_synced()
             if cat.n and n_db < cat.n:
-                facts.append(("DuckDB", f"{n_db:,}/{cat.n:,} · V / F8 to sync new"))
+                facts.append(("DuckDB", f"{n_db:,}/{cat.n:,} · V / F9 to sync new"))
         except Exception as exc:  # noqa: BLE001
             facts.append(("DuckDB", f"unavailable · {exc}"))
         if cat.n:
@@ -1474,7 +1657,7 @@ class OpenHumans(Source):
 
 SOURCES: list[Source] = [FtdnaDiscover(), FtdnaHaplotree(), YfullYtree(), Theytree(),
                          Aadr(), ThousandGenomes(), RsidIdentity(), Seshat(),
-                         OpenHumans(), PgsModels(), Gemini()]
+                         OpenHumans(), GwasCatalog(), PgsModels(), Gemini()]
 BY_KEY = {s.key: s for s in SOURCES}
 
 # Группы левого меню F2: (заголовок, ключи источников по порядку).
@@ -1483,6 +1666,6 @@ SOURCE_GROUPS: list[tuple[str, tuple[str, ...]]] = [
     ("Reference panels", ("aadr", "1000g", "rsid_identity")),
     ("History & lore", ("seshat",)),
     ("Public samples", ("openhumans",)),
-    ("Polygenic scores", ("pgs_models",)),
+    ("GWAS & polygenic", ("gwas_catalog", "pgs_models")),
     ("AI", ("gemini",)),
 ]

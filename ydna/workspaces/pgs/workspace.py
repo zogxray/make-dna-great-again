@@ -18,7 +18,9 @@ from ...core.store import Store
 from ...core.ylink import active_genome, genome_files
 from ..base import KeyBar, ModeBar, Workspace, alt_keys, busy_progress, click, hide_busy, show_busy
 from ..data.workspace import job_line
-from .view import SORTS, card, compare_view, model_prompt, overview, theme_header
+from .view import (
+    BROWSE_GATE_LABELS, SORTS, card, compare_view, model_prompt, overview, theme_header,
+)
 
 JOB = "pgs"
 TABS = (("results", "YOUR RESULTS"), ("compare", "COMPARE"))
@@ -33,7 +35,8 @@ class PgsWorkspace(Workspace):
     #over-box { width: 34%; min-width: 40; border: round $primary; }
     #models-box:focus-within, #card-box:focus-within, #over-box:focus-within { border: round $accent; }
     #models { height: 1fr; border: none; background: transparent; }
-    #list-tabs, #over-tabs { height: 1; padding: 0 1; }
+    #list-tabs { height: 2; padding: 0 1; }
+    #over-tabs { height: 1; padding: 0 1; }
     #model-search { height: 1; margin: 0 1; border: none; background: transparent; }
     #card-scroll, #over-scroll { height: 1fr; scrollbar-size-vertical: 1; }
     #card, #over { padding: 0 1; }
@@ -49,6 +52,7 @@ class PgsWorkspace(Workspace):
         Binding(alt_keys("c"), "cancel", "Cancel"),
         Binding(alt_keys("v"), "toggle_tab", "Compare"),
         Binding(alt_keys("l"), "toggle_list", "Next list"),
+        Binding(alt_keys("f"), "toggle_gate", "Gate", show=False),
         Binding(alt_keys("b"), "next_other", "Next B", show=False),
         Binding(alt_keys("s"), "sort", "Sort", show=False),
         Binding(alt_keys("d"), "toggle_big", "Only big Δ", show=False),
@@ -57,8 +61,7 @@ class PgsWorkspace(Workspace):
 
     # Полные имена для subtitle / статуса (в ряду вкладок — короткие title из DB).
     LIST_NAMES = {
-        "curated": "curated", "catalog": "catalog", "diseases": "diseases",
-        "low_coverage": "low coverage", "too_few_matched": "too few matched",
+        "curated": "curated", "browse": "all models", "hold": "hold / triage",
     }
 
     def __init__(self, store: Store) -> None:
@@ -85,11 +88,18 @@ class PgsWorkspace(Workspace):
         self.sort_mode = "theme"
         self.only_big = False
         self.search_q = ""
+        self.browse_gate = "any"
         self._first_paint_done = False
 
     @property
     def menu_models(self) -> list[pgs.Model]:
-        return self.models_by_menu.get(self.list_tab, [])
+        ms = self.models_by_menu.get(self.list_tab, [])
+        if self.list_tab != "browse":
+            return ms
+        allowed = pgs_db.BROWSE_GATES.get(self.browse_gate)
+        if allowed is None:
+            return ms
+        return [m for m in ms if (m.status or "") in allowed]
 
     @property
     def models(self) -> list[pgs.Model]:
@@ -107,7 +117,10 @@ class PgsWorkspace(Workspace):
 
     def _menu_title(self, menu_id: str | None = None) -> str:
         mid = menu_id or self.list_tab
-        return self.LIST_NAMES.get(mid) or mid.replace("_", " ")
+        base = self.LIST_NAMES.get(mid) or mid.replace("_", " ")
+        if mid == "browse" and self.browse_gate != "any":
+            return f"{base} · {self.browse_gate}"
+        return base
 
     def all_models(self) -> list[pgs.Model]:
         """Объединение всех вкладок для панели SNPs (без дублей ID)."""
@@ -119,16 +132,14 @@ class PgsWorkspace(Workspace):
 
     @staticmethod
     def _models_for_menu(menu: dict, *, folder_ok: bool) -> list[pgs.Model]:
-        """Модели вкладки: catalog=ok, diseases=подгруппы, status=по id, иначе menu_items."""
+        """Модели вкладки: browse=весь каталог, hold=триаж, иначе menu_items."""
         kind = menu.get("kind") or ""
-        if not folder_ok and kind in ("catalog", "diseases", "status"):
+        if not folder_ok and kind in ("browse", "hold"):
             return []
-        if kind == "catalog":
-            return pgs_db.load_catalog_ok()
-        if kind == "diseases":
-            return pgs_db.load_diseases()
-        if kind == "status":
-            return pgs_db.load_by_status(menu["id"])
+        if kind == "browse":
+            return pgs_db.load_browse()
+        if kind == "hold":
+            return pgs_db.load_hold()
         return pgs_db.load_menu_models(menu["id"])
 
     # — компоновка —
@@ -148,10 +159,11 @@ class PgsWorkspace(Workspace):
                     yield Static(id="over")
         yield KeyBar([("Enter", "Score", "screen.score_current"), ("G", "Score theme", "screen.score_theme"),
                       ("A", "Score all", "screen.score_all"), ("R", "Recompute", "screen.rescore"),
-                      ("L", "List", "screen.toggle_list"), ("/", "Search", "screen.focus_search"),
+                      ("L", "List", "screen.toggle_list"), ("F", "Gate", "screen.toggle_gate"),
+                      ("/", "Search", "screen.focus_search"),
                       ("C", "Cancel", "screen.cancel"), ("V", "Compare", "screen.toggle_tab"),
                       ("Tab", "Panel", "app.focus_next"),
-                      ("F1–F9", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
+                      ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -189,6 +201,15 @@ class PgsWorkspace(Workspace):
 
     def on_resize(self) -> None:
         self.refresh_over()
+        if self._first_paint_done and self.index:
+            self.refresh_prompts()
+
+    def _list_w(self) -> int:
+        """Content width for list cards — keep strip inside the panel."""
+        from .view import LIST_W
+        ol = self.query_one("#models", OptionList)
+        raw = ol.content_size.width or ol.size.width or LIST_W
+        return max(20, min(LIST_W, raw - 1))
 
     # — данные —
     def _active(self) -> Path | None:
@@ -345,6 +366,12 @@ class PgsWorkspace(Workspace):
         self.load_other()
         return True
 
+    def _group_key(self, m: pgs.Model) -> str:
+        """HOLD groups by status; CUR/ALL by theme."""
+        if self.list_tab == "hold":
+            return m.status or "unknown"
+        return m.theme
+
     def fill_list(self) -> None:
         ol = self.query_one("#models", OptionList)
         keep = self.current.pgs_id if self.current else None
@@ -352,13 +379,16 @@ class PgsWorkspace(Workspace):
         self.index = {}
         self.by_id = {m.pgs_id: m for m in self.models}
         options: list[Option] = []
-        theme = None
+        group = None
+        w = self._list_w()
         for m in self.models:
-            if m.theme != theme:
-                theme = m.theme
-                options.append(Option(self._header(theme), disabled=True))
+            g = self._group_key(m)
+            if g != group:
+                group = g
+                options.append(Option(self._header(g), disabled=True))
             self.index[m.pgs_id] = len(options)
-            options.append(Option(model_prompt(m, self.results.get(m.pgs_id)), id=m.pgs_id))
+            options.append(Option(
+                model_prompt(m, self.results.get(m.pgs_id), width=w), id=m.pgs_id))
         ol.add_options(options)
         if self.models:
             ol.highlighted = self.index.get(keep or "", self.index[self.models[0].pgs_id])
@@ -366,29 +396,39 @@ class PgsWorkspace(Workspace):
         self._list_tabs()
 
     def _list_tabs(self) -> None:
-        """Короткие ярлыки без счётчиков — иначе ряд не влезает в ширину MODELS."""
+        """CUR / ALL / HOLD; on ALL — gate chips (any/ok/low/few/dis)."""
         t = Text(no_wrap=True)
         for menu in self.menus:
             key, label = menu["id"], menu["title"]
             sty = "bold reverse #D4AD72" if key == self.list_tab else "#AEA5B8"
             t.append(f" {label} ", style=click(f"screen.list_tab({key!r})", sty))
         t.append(" L", style="#8A8294")
+        if self.list_tab == "browse":
+            t.append("\n")
+            for gate, lab in BROWSE_GATE_LABELS:
+                sty = "bold reverse #D4AD72" if gate == self.browse_gate else "#8A8294"
+                t.append(f" {lab} ", style=click(f"screen.browse_gate({gate!r})", sty))
+            t.append(" F", style="#71697A")
         self.query_one("#list-tabs", Static).update(t)
 
-    def _header(self, theme: str) -> Text:
-        ms = [m for m in self.models if m.theme == theme]
+    def _header(self, group: str) -> Text:
+        ms = [m for m in self.models if self._group_key(m) == group]
         done = sum(1 for m in ms if (r := self.results.get(m.pgs_id)) and not r.error)
-        return theme_header(theme, len(ms), done)
+        return theme_header(group, len(ms), done)
 
     def refresh_prompts(self) -> None:
         ol = self.query_one("#models", OptionList)
-        theme = None
+        group = None
+        w = self._list_w()
         for m in self.models:
-            if m.theme != theme:
-                theme = m.theme
-                ol.replace_option_prompt_at_index(self.index[m.pgs_id] - 1, self._header(theme))
-            ol.replace_option_prompt_at_index(self.index[m.pgs_id],
-                                             model_prompt(m, self.results.get(m.pgs_id)))
+            g = self._group_key(m)
+            if g != group:
+                group = g
+                ol.replace_option_prompt_at_index(self.index[m.pgs_id] - 1, self._header(g))
+            ol.replace_option_prompt_at_index(
+                self.index[m.pgs_id],
+                model_prompt(m, self.results.get(m.pgs_id), width=w),
+            )
 
     @property
     def current(self) -> pgs.Model | None:
@@ -578,6 +618,24 @@ class PgsWorkspace(Workspace):
         self.fill_list()
         self.refresh_all()
         self.query_one("#models", OptionList).focus()
+
+    def action_browse_gate(self, key: str) -> None:
+        if key not in pgs_db.BROWSE_GATES or key == self.browse_gate:
+            return
+        self.browse_gate = key
+        if self.list_tab != "browse":
+            self.list_tab = "browse"
+        self.fill_list()
+        self.refresh_all()
+        self.query_one("#models", OptionList).focus()
+
+    def action_toggle_gate(self) -> None:
+        keys = [g for g, _ in BROWSE_GATE_LABELS]
+        if self.list_tab != "browse":
+            self.action_list_tab("browse")
+            return
+        i = keys.index(self.browse_gate) if self.browse_gate in keys else -1
+        self.action_browse_gate(keys[(i + 1) % len(keys)])
 
     def action_toggle_list(self) -> None:
         if len(self.menus) < 2:
