@@ -20,7 +20,7 @@ from ..base import (ClipTextArea, KeyBar, ModeBar, ReadOnlyClipTextArea,
                     SelectableRichStatic, Workspace, alt_keys, fit, hide_busy,
                     show_busy)
 from ..data.workspace import job_line
-from .screens import ConfirmScreen, EditScreen, ModelScreen
+from .screens import ConfirmScreen, EditScreen, ModelScreen, ProviderScreen
 from .view import chat_prompt, thread_text, thread_view
 
 JOB = "chat"
@@ -85,6 +85,7 @@ class ChatWorkspace(Workspace):
         Binding(alt_keys("e"), "edit_last", "Edit last you"),
         Binding(alt_keys("s"), "toggle_select", "Select mode"),
         Binding(alt_keys("m"), "pick_model", "Model"),
+        Binding(alt_keys("u"), "pick_provider", "Provider"),
         Binding(alt_keys("c"), "cancel", "Cancel"),
         Binding(_SEND_KEYS, "send_prompt", "Send", show=False),
     ]
@@ -126,6 +127,7 @@ class ChatWorkspace(Workspace):
                                   placeholder="drag or Shift+arrows to select · Ctrl+C copy · Ctrl+V paste")
         yield KeyBar([("A", "New chat", "screen.new_chat"),
                       ("Ctrl+S", "Send", "screen.send_prompt"),
+                      ("U", "Channel", "screen.pick_provider"),
                       ("M", "Model", "screen.pick_model"),
                       ("N", "Last → notes", "screen.clip_last"),
                       ("E", "Edit last you", "screen.edit_last"),
@@ -143,6 +145,10 @@ class ChatWorkspace(Workspace):
         return active_genome()
 
     def _focus_prompt(self) -> None:
+        self._sync_prompt_lock()
+        if self.current and chat.is_shared_thread(self.current.id):
+            self.query_one("#chats", OptionList).focus()
+            return
         self.query_one("#prompt", PromptArea).focus()
 
     def on_mount(self) -> None:
@@ -160,8 +166,7 @@ class ChatWorkspace(Workspace):
         self._first_paint_done = True
         try:
             try:
-                chat.ensure_reference_thread()
-                chat.ensure_gwas_thread()
+                chat.ensure_shared_threads()
             except Exception:
                 pass
             self.reload()
@@ -202,15 +207,18 @@ class ChatWorkspace(Workspace):
         self._focus_prompt()
 
     def _apply_prefill(self) -> bool:
-        """Ask GPT: текст в prompt активного чата. Новый тред — только если чатов нет."""
+        """Legacy prefill into a normal chat. F3 Ask now uses Tree · F3 + ASK tab."""
         text = getattr(self.app, "chat_prefill", None) or ""
         if not text:
             return False
-        title = getattr(self.app, "chat_prefill_title", None) or "Ask · F3"
+        # Never dump free-form asks into pinned shared threads.
+        if self.current and chat.is_shared_thread(self.current.id):
+            self.current = None
+        title = getattr(self.app, "chat_prefill_title", None) or "Ask"
         self.app.chat_prefill = None
         self.app.chat_prefill_title = None
         self._flush_notes()
-        threads = chat.list_threads()
+        threads = [t for t in chat.list_threads() if not chat.is_shared_thread(t.id)]
         if not threads:
             t = chat.new_thread()
             if title:
@@ -219,8 +227,7 @@ class ChatWorkspace(Workspace):
             self.current = t
             self.reload(keep=t.id)
         else:
-            # Активный = текущий после reload, иначе самый свежий.
-            keep = self.current.id if self.current else threads[0].id
+            keep = self.current.id if self.current and not chat.is_shared_thread(self.current.id) else threads[0].id
             self.reload(keep=keep)
             if (self.current and self.current.title == "New chat"
                     and not self.current.messages and title):
@@ -230,8 +237,22 @@ class ChatWorkspace(Workspace):
         prompt = self.query_one("#prompt", PromptArea)
         prompt.load_text(text)
         prompt.focus()
-        self.app.notify("Ask GPT · review prompt · Ctrl+S / Alt+Enter / Send")
+        self.app.notify("Ask · review prompt · Ctrl+S / Alt+Enter / Send")
         return True
+
+    def _sync_prompt_lock(self) -> None:
+        """Pinned mode chats: read-only history — no free-form Send."""
+        prompt = self.query_one("#prompt", PromptArea)
+        btn = self.query_one("#send-btn", Button)
+        locked = bool(self.current and chat.is_shared_thread(self.current.id))
+        prompt.disabled = locked
+        btn.disabled = locked
+        if locked:
+            label = chat.shared_thread_label(self.current.id if self.current else None)
+            prompt.load_text("")
+            prompt.placeholder = f"{label} · read-only · ask from the mode tab"
+        else:
+            prompt.placeholder = "message · Ctrl+S / Alt+Enter / Send · Enter = new line"
 
     def on_screen_suspend(self) -> None:
         self._flush_notes()
@@ -254,6 +275,7 @@ class ChatWorkspace(Workspace):
         idx = next((i for i, t in enumerate(self.threads) if t.id == self.current.id), 0)
         ol.highlighted = idx
         self._show()
+        self._sync_prompt_lock()
 
     def _thread_subtitle(self) -> str:
         bits = []
@@ -304,6 +326,7 @@ class ChatWorkspace(Workspace):
         box = self.query_one("#thread-box")
         box.border_title = fit(t.title, 40) if t else "CHAT"
         box.border_subtitle = self._thread_subtitle()
+        self._sync_prompt_lock()
         self.update_status()
 
     def _flush_notes(self) -> None:
@@ -318,11 +341,8 @@ class ChatWorkspace(Workspace):
             chat.save_notes(self.current)
 
     def update_status(self) -> None:
-        key = chat.api_key(self.store)
-        if key:
-            bits = [chat.model_label(self.store), f"…{key[-4:]}"]
-        else:
-            bits = ["no key (F2 · Google Gemini · P)"]
+        ok, detail = chat.provider_ready(self.store)
+        bits = [chat.model_label(self.store), detail if ok else f"⚠ {detail}"]
         bits.append("SELECT" if self.select_mode else "Markdown")
         if self.genome:
             bits.append(f"active: {self.genome.name}")
@@ -347,36 +367,125 @@ class ChatWorkspace(Workspace):
             self._focus_prompt()
             self.app.notify("Markdown view")
 
+    def action_pick_provider(self) -> None:
+        from ...core import llm
+        from ..data.screens import GeminiConfigScreen
+
+        current = chat.provider_mode(self.store)
+        rows: list[tuple[llm.Provider, bool, str]] = []
+        for mode in llm.PROVIDERS:
+            ok, detail = llm.provider_ready(self.store, mode)
+            rows.append((mode, ok, detail))
+
+        def done(mode: str | None) -> None:
+            if mode not in ("vertex", "aistudio"):
+                return
+            llm.set_provider(self.store, mode)  # type: ignore[arg-type]
+            ok, detail = chat.provider_ready(self.store)
+            label = llm.provider_label(mode)  # type: ignore[arg-type]
+            self.update_status()
+            if ok:
+                self.app.notify(f"LLM channel · {label} · {detail}")
+                return
+            self.app.notify(f"LLM channel · {label} · {detail}", severity="warning")
+            if mode == "vertex" and llm.vertex_gaps(self.store):
+                def saved(value: dict | None) -> None:
+                    if not value:
+                        self.update_status()
+                        return
+                    if value.get("key"):
+                        self.store.set_secret("gemini", value["key"])
+                    if "project" in value:
+                        llm.set_vertex_project(self.store, value.get("project") or None)
+                    if "adc" in value:
+                        llm.set_vertex_adc(self.store, value.get("adc") or None)
+                    ok2, detail2 = chat.provider_ready(self.store)
+                    self.update_status()
+                    if ok2:
+                        self.app.notify(f"Vertex ready · {detail2}")
+                    else:
+                        self.app.notify(detail2, severity="warning")
+
+                adc = llm.vertex_adc_path(self.store) or llm.default_adc_path()
+                self.app.push_screen(
+                    GeminiConfigScreen(
+                        has_key=bool(llm.studio_api_key(self.store)),
+                        project=llm.vertex_project(self.store),
+                        adc=str(adc),
+                    ),
+                    saved,
+                )
+
+        self.app.push_screen(ProviderScreen(current, rows), done)
+
     def action_pick_model(self) -> None:
-        if not chat.api_key(self.store):
-            self.app.notify("Set the Gemini API key in F2 (Google Gemini · P)", severity="warning")
+        # Instant curated tops, then replace with live+tops when the channel is ready.
+        mode = chat.provider_mode(self.store)
+        try:
+            rows = chat._static_models(self.store, mode)  # type: ignore[attr-defined]
+        except Exception:
+            rows = []
+        self._open_models(rows)
+
+        if chat.can_send(self.store) is not None:
             return
 
         def work() -> None:
             try:
-                rows = chat.list_models(self.store, force=True)
-            except Exception as exc:
-                self.app.call_from_thread(self._models_failed, str(exc)[:200])
+                fresh = chat.list_models(self.store, force=True)
+            except Exception:
                 return
-            self.app.call_from_thread(self._open_models, rows)
+            self.app.call_from_thread(self._refresh_models_if_open, fresh)
 
-        self.app.notify("Listing Gemini models…")
+        self.app.notify(f"Refreshing {mode} model list…")
         self.run_worker(work, thread=True, exclusive=True, group="models")
+
+    def _refresh_models_if_open(self, rows: list[chat.ChatModel]) -> None:
+        """Update an open ModelScreen in place so tops from the live API appear."""
+        screen = self.app.screen
+        if not isinstance(screen, ModelScreen):
+            return
+        # Dismiss + reopen with the fuller list (same channel).
+        current = chat.chosen_model(self.store, rows)
+        mode = chat.provider_mode(self.store)
+
+        def done(mid: str | None) -> None:
+            if not mid:
+                return
+            from ...core import llm
+            wired = chat.set_saved_model(self.store, mid)
+            self.app.notify(
+                f"Chat model · {chat.short_model(wired)} · {llm.provider_label(store=self.store)}"
+            )
+            self.update_status()
+
+        screen.dismiss(None)
+        self.app.push_screen(ModelScreen(rows, current, mode=mode), done)
 
     def _models_failed(self, msg: str) -> None:
         self.app.notify(msg, severity="error")
 
     def _open_models(self, rows: list[chat.ChatModel]) -> None:
+        if not rows:
+            mode = chat.provider_mode(self.store)
+            rows = chat._static_models(self.store, mode)  # type: ignore[attr-defined]
         current = chat.chosen_model(self.store, rows)
+        mode = chat.provider_mode(self.store)
 
         def done(mid: str | None) -> None:
             if not mid:
                 return
-            self.store.set_setting(chat.SETTING_MODEL, mid)
-            self.app.notify(f"Chat model · {chat.short_model(mid)}")
+            from ...core import llm
+            wired = chat.set_saved_model(self.store, mid)
+            self.app.notify(
+                f"Chat model · {chat.short_model(wired)} · {llm.provider_label(store=self.store)}"
+            )
             self.update_status()
 
-        self.app.push_screen(ModelScreen(rows, current), done)
+        # Avoid stacking duplicate model screens if live refresh finishes while open.
+        if isinstance(self.app.screen, ModelScreen):
+            return
+        self.app.push_screen(ModelScreen(rows, current, mode=mode), done)
 
     def _tick(self) -> None:
         self._flush_notes()
@@ -433,13 +542,22 @@ class ChatWorkspace(Workspace):
         if t:
             self.current = t
             self._show()
+            self._sync_prompt_lock()
 
     def _busy(self) -> bool:
         if (job := JOBS.get(JOB)) and job.running:
             self.app.notify("Wait for the current reply, or C to cancel", severity="warning")
             return True
-        if not chat.api_key(self.store):
-            self.app.notify("Set the Gemini API key in F2 (Google Gemini · P)", severity="warning")
+        if self.current and chat.is_shared_thread(self.current.id):
+            self.app.notify(
+                f"{chat.shared_thread_label(self.current.id)} is read-only · "
+                "ask from F3 / F5 / F6",
+                severity="warning",
+            )
+            return True
+        err = chat.can_send(self.store)
+        if err:
+            self.app.notify(err, severity="warning")
             return True
         return False
 
@@ -469,6 +587,13 @@ class ChatWorkspace(Workspace):
         self.action_send_prompt()
 
     def action_send_prompt(self) -> None:
+        if self.current and chat.is_shared_thread(self.current.id):
+            self.app.notify(
+                f"{chat.shared_thread_label(self.current.id)} is read-only · "
+                "ask from F3 ASK / F5 ASK / F6 SUMMARY",
+                severity="warning",
+            )
+            return
         prompt = self.query_one("#prompt", PromptArea)
         text = prompt.text.strip()
         if not text:
@@ -478,7 +603,7 @@ class ChatWorkspace(Workspace):
             self.app.notify("Gemini is still answering · C to cancel", severity="warning")
             return
         prompt.load_text("")
-        if self.current is None:
+        if self.current is None or chat.is_shared_thread(self.current.id):
             self.current = chat.new_thread()
             self.threads.insert(0, self.current)
         self._flush_notes()
@@ -491,6 +616,12 @@ class ChatWorkspace(Workspace):
     def action_edit_last(self) -> None:
         if not self.current:
             return
+        if chat.is_shared_thread(self.current.id):
+            self.app.notify(
+                f"{chat.shared_thread_label(self.current.id)} is read-only",
+                severity="warning",
+            )
+            return
         idx = chat.last_user_index(self.current)
         if idx is None:
             self.app.notify("No message to edit")
@@ -500,6 +631,12 @@ class ChatWorkspace(Workspace):
     def action_edit_msg(self, index: int) -> None:
         t = self.current
         if t is None or index < 0 or index >= len(t.messages):
+            return
+        if chat.is_shared_thread(t.id):
+            self.app.notify(
+                f"{chat.shared_thread_label(t.id)} is read-only",
+                severity="warning",
+            )
             return
         if t.messages[index].role != "user":
             return
@@ -535,9 +672,10 @@ class ChatWorkspace(Workspace):
             return
         t = self.current
         if chat.is_shared_thread(t.id):
-            label = chat.GWAS_THREAD_TITLE if chat.is_gwas_thread(t.id) else chat.REF_THREAD_TITLE
-            self.app.notify(f"{label} is shared — open it, do not delete",
-                            severity="warning")
+            self.app.notify(
+                f"{chat.shared_thread_label(t.id)} is pinned — do not delete",
+                severity="warning",
+            )
             return
         title = (t.title or "New chat").strip() or "New chat"
         n = sum(1 for m in t.messages if m.role == "user")

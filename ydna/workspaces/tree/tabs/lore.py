@@ -177,7 +177,7 @@ def lore(ctx, doc: Doc, node: dict) -> None:
     else:
         doc.title("PANTHEON")
         put(doc, ("No curated CODEX for this horizon yet.", "#8A8294"))
-        put(doc, ("Ask GPT will still weave from anchors (HARD only if sparse).", "#71697A"))
+        put(doc, ("Ask (A) will still weave from anchors (HARD only if sparse).", "#71697A"))
 
     # GENERATE / LAST
     doc.title("GENERATE")

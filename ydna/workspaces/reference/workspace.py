@@ -1738,9 +1738,9 @@ class ReferenceWorkspace(Workspace):
         if g is None or not key:
             self.app.notify("Select a group first", severity="warning")
             return
-        if not chat.api_key(self.store):
-            self.app.notify("Set the Gemini API key in F2 (Google Gemini · P)",
-                            severity="warning")
+        err = chat.can_send(self.store)
+        if err:
+            self.app.notify(err, severity="warning")
             return
         if not refresh and key in self.summary_cache and self.summary_cache[key].get("text"):
             self.card_tab = "summary"
@@ -1769,7 +1769,7 @@ class ReferenceWorkspace(Workspace):
             headed = f"[F6 · {subject}]\n\n{prompt}"
             t.messages.append(chat.Message("user", headed))
             chat.save(t)
-            chat.send(store, t, job, continue_chat=False)
+            chat.send(store, t, job, continue_chat=False, tier="reasoning")
             text = next((m.text for m in reversed(t.messages) if m.role == "model"), "")
             return (text or job.draft or "").strip() or "(empty reply)"
 

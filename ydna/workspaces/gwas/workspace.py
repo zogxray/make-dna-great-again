@@ -425,9 +425,9 @@ class GwasWorkspace(Workspace):
             self.app.notify("No match yet — wait for GWAS scan or fix F1/F2",
                             severity="warning")
             return
-        if not chat.api_key(self.store):
-            self.app.notify("Set the Gemini API key in F2 (Google Gemini · P)",
-                            severity="warning")
+        err = chat.can_send(self.store)
+        if err:
+            self.app.notify(err, severity="warning")
             return
         a = self._current_assoc()
         key = self._ask_key(a)
@@ -461,14 +461,14 @@ class GwasWorkspace(Workspace):
         title = ask_title(a, self.trait)
         store = self.store
         subject = key
-        label = a.rsid if a else (self.trait or "trait")
+        label = self.trait or (a.rsid if a else "trait")
 
         def work(job) -> str:
             t = chat.ensure_gwas_thread()
             headed = f"[F5 · {label}]\n\n{prompt}"
             t.messages.append(chat.Message("user", headed))
             chat.save(t)
-            chat.send(store, t, job, continue_chat=False)
+            chat.send(store, t, job, continue_chat=False, tier="reasoning")
             text = next((m.text for m in reversed(t.messages) if m.role == "model"), "")
             return (text or job.draft or "").strip() or "(empty reply)"
 

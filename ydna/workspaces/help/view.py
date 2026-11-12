@@ -35,7 +35,7 @@ Technical guts exist under the hood; this page is about **what to do** and
 4. **F4 PGS** — polygenic scores when you have a models folder from F2.
 5. **F5 GWAS** — match the active F1 chip against the local GWAS Catalog (F2).
 6. **F6 Reference** — f3 / ancient & 1000 Genomes panels against AADR (or 1000G).
-7. **F7 Chat** — ask Gemini with the same context you already loaded (API key in F2).
+7. **F7 Chat** — ask Gemini (AI Studio key or Vertex ADC — F7 **U** picks channel).
 8. **F8 Jobs** — watch downloads / fetches / scores (cancel here; start them elsewhere).
 9. **F9 Samples** — Open Humans public kits (filter, get missing, DuckDB).
 10. **F10 Help** — you are here.
@@ -118,7 +118,7 @@ Useful reflexes
   ties and near-ties (same #DER nodes, sum within 2) paint forks in different
   colors; **O** cycles them. Het / odd alleles are **not** scored — shown as
   `?` uncertain; rejected `anc>der` siblings as `○` pruned.
-- **A** — Ask GPT: builds a short prompt from the current tab and opens **F7**
+- **A** — Ask: brief for the current haplogroup → **ASK** tab + pinned **Tree · F3** chat
   (into the active chat · Ctrl+S / Alt+Enter / Send). On **LORE**: skald+scientist weave
   (HARD / RECONSTRUCTED / STORY) from genome · ancient · Seshat · children geo.
 - Search `/`, filter **F**, sort **S**, rich branches **B**.
@@ -163,7 +163,7 @@ table from F2.
   allele). Right: detail **HIT** / **ASK** (**C** copy rsID, **B** PubMed).
 - **A** / ASK tab runs a **scientific** brief in-place (shared F7 thread
   «GWAS · F5»): Catalog facts, allelic concordance, population-genetic limits.
-  Cached per focal row; **Refresh** regenerates. Needs Gemini key in F2.
+  Cached per trait panel; **Refresh** regenerates. Needs LLM ready (F7 channel).
 - **/** search in **TRAITS** (trait · rsID · gene · GCST) · **R** rescan
   (ignore cache). First match can take a minute; later opens reuse an on-disk
   cache keyed by genome + catalog mtime + p-cut.
@@ -195,17 +195,14 @@ AADR ↔ 1000G. Map / tree / layers views are different lenses on the same group
 
 ## F7 · Chat
 
-**Job:** notebook-ish threads with Gemini (key + model in F2).
+**Job:** notebook-ish threads with Gemini. Mode asks use pinned chats (read-only here).
 
-- Left: chats. Center: transcript. Right: free NOTES (yours, not the model).
-- Multiline prompt; **Ctrl+S** / **Alt+Enter** / **Send** button send (Enter = new line).
-  (Plain Ctrl+Enter is unreliable in most terminals.) Replies stream and are stored locally.
-- **YOU** vs **GEMINI** are styled differently on purpose.
-- **N** copies the last model reply into NOTES; **S** select-mode for copy/paste.
+- **◆ Tree · F3 / GWAS · F5 / Reference · F6** — pinned at top; no free-form Send.
+- **U** — pick channel: **AI Studio** or **Vertex**. **M** — model for that channel.
+- Multiline prompt; **Ctrl+S** / **Alt+Enter** / **Send** (Enter = new line).
+- **YOU** vs **GEMINI**; **N** last reply → NOTES; **S** select-mode.
 
-The model does not automatically see your RAW file; talk in terms of what you
-already found in F3–F6, or paste snippets into NOTES / the prompt yourself.
-From F3, **A** prefills Ask GPT into the **active** chat (new chat only if none exist).
+Ask from F3 **ASK**, F5 **ASK**, F6 **SUMMARY** — results land in the mode tab and the pinned chat.
 
 ---
 

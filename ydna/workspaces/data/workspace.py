@@ -22,7 +22,7 @@ from ...core.ylink import (FETCH_STAGES, active_genome, fetch_cost, fetch_plan,
                            stage_fetch_names)
 from ..base import (KeyBar, ModeBar, Workspace, alt_keys, click, fit, hide_busy,
                     short_path, show_busy)
-from .screens import PathScreen, TokenScreen
+from .screens import GeminiConfigScreen, PathScreen, TokenScreen
 
 from ...theme.styles import DIM, JOB_STYLE, STATE_ICON_STYLE
 
@@ -432,9 +432,20 @@ class DataWorkspace(Workspace):
         else:
             t.append("  " + fit(st.summary if st else "checking…", PROMPT_W) + "\n", style=style)
         if s.kind == "secret":
-            key = self.store.secret(s.key) or (os.environ.get("GEMINI_API_KEY") if s.key == "gemini" else None)
-            t.append("  " + fit(f"key · …{key[-4:]}" if key else "key not set", PROMPT_W),
-                     style="#71697A")
+            if s.key == "gemini":
+                from ...core import llm
+                key = llm.studio_api_key(self.store)
+                project = llm.vertex_project(self.store)
+                adc = llm.vertex_adc_path(self.store)
+                bits = []
+                bits.append(f"key · …{key[-4:]}" if key else "key —")
+                bits.append(f"proj · {project}" if project else "proj —")
+                bits.append("adc · ok" if adc and adc.is_file() else "adc —")
+                t.append("  " + fit(" · ".join(bits), PROMPT_W), style="#71697A")
+            else:
+                key = self.store.secret(s.key)
+                t.append("  " + fit(f"key · …{key[-4:]}" if key else "key not set", PROMPT_W),
+                         style="#71697A")
         else:
             path = self.store.path(s.key)
             t.append("  " + fit(short_path(path) if path else "path not set", PROMPT_W), style="#71697A")
@@ -487,9 +498,27 @@ class DataWorkspace(Workspace):
 
         t.append("\nLOCATION\n", style="bold #D4AD72")
         if s.kind == "secret":
-            key = self.store.secret(s.key) or (os.environ.get("GEMINI_API_KEY") if s.key == "gemini" else None)
-            t.append("  Key: ", style="#AEA5B8")
-            t.append(f"set · …{key[-4:]}\n" if key else "not set\n", style="" if key else "#8A8294")
+            if s.key == "gemini":
+                from ...core import llm
+                key = llm.studio_api_key(self.store)
+                project = llm.vertex_project(self.store)
+                adc = llm.vertex_adc_path(self.store)
+                t.append("  AI Studio key: ", style="#AEA5B8")
+                t.append(f"set · …{key[-4:]}\n" if key else "not set (P)\n",
+                         style="" if key else "#8A8294")
+                t.append("  Cloud project: ", style="#AEA5B8")
+                t.append(f"{project}\n" if project else "not set (P)\n",
+                         style="" if project else "#8A8294")
+                t.append("  ADC file: ", style="#AEA5B8")
+                if adc and adc.is_file():
+                    t.append(f"{adc}\n")
+                else:
+                    t.append(f"not found · {llm.adc_hint(self.store)}\n", style="#8A8294")
+            else:
+                key = self.store.secret(s.key)
+                t.append("  Key: ", style="#AEA5B8")
+                t.append(f"set · …{key[-4:]}\n" if key else "not set\n",
+                         style="" if key else "#8A8294")
         else:
             t.append(f"  {s.kind.capitalize()}: ", style="#AEA5B8")
             t.append(f"{path}\n" if path else "not set\n", style="" if path else "#8A8294")
@@ -553,7 +582,10 @@ class DataWorkspace(Workspace):
             t.append(text + "\n\n", style=click(f"screen.{name}"))
 
         if s.kind == "secret":
-            action("P", "paste the API key", "set_path")
+            if s.key == "gemini":
+                action("P", "set AI Studio key / Cloud project / ADC file", "set_path")
+            else:
+                action("P", "paste the API key", "set_path")
         else:
             action("P", f"point to an existing {s.kind}", "set_path")
         cov = st.coverage if st else None
@@ -610,8 +642,20 @@ class DataWorkspace(Workspace):
             action("C", "cancel the running/paused task", "cancel_job")
         elif JOBS.queued_for(s.key):
             action("C", "cancel active slot task (queued stay — manage in F8)", "cancel_job")
-        if s.kind == "secret" and self.store.secret(s.key):
-            action("Del", "forget the API key", "clear_path")
+        if s.kind == "secret":
+            from ...core import llm
+            has_gemini = bool(
+                self.store.secret(s.key)
+                or (s.key == "gemini" and (
+                    llm.vertex_project(self.store)
+                    or self.store.setting(llm.SETTING_GCP_ADC)
+                ))
+            )
+            if has_gemini or self.store.secret(s.key):
+                if s.key == "gemini":
+                    action("Del", "forget key, project, and ADC path", "clear_path")
+                else:
+                    action("Del", "forget the API key", "clear_path")
         elif path:
             action("Del", "forget the path (files are untouched)", "clear_path")
         self.query_one("#actions", Static).update(t)
@@ -655,6 +699,39 @@ class DataWorkspace(Workspace):
 
     def action_set_path(self) -> None:
         s = self.source
+        if s.kind == "secret" and s.key == "gemini":
+            from ...core import llm
+
+            def done_gemini(value: dict | None) -> None:
+                if not value:
+                    return
+                notes = []
+                key = value.get("key")
+                if key:
+                    self.store.set_secret(s.key, key)
+                    notes.append("key")
+                # Always write project / ADC (may clear when user empties them).
+                if "project" in value:
+                    llm.set_vertex_project(self.store, value.get("project") or None)
+                    notes.append("project")
+                if "adc" in value:
+                    llm.set_vertex_adc(self.store, value.get("adc") or None)
+                    notes.append("ADC")
+                self.status.pop(s.key, None)
+                self.check(s)
+                self.refresh_all()
+                self.app.notify(f"{s.title}: saved ({', '.join(notes) or 'nothing'})")
+
+            adc = llm.vertex_adc_path(self.store) or llm.default_adc_path()
+            self.app.push_screen(
+                GeminiConfigScreen(
+                    has_key=bool(llm.studio_api_key(self.store)),
+                    project=llm.vertex_project(self.store),
+                    adc=str(adc),
+                ),
+                done_gemini,
+            )
+            return
         if s.kind == "secret":
             def done_key(value: str | None) -> None:
                 if value:
@@ -804,6 +881,23 @@ class DataWorkspace(Workspace):
     def action_clear_path(self) -> None:
         s = self.source
         if s.kind == "secret":
+            if s.key == "gemini":
+                from ...core import llm
+                had = bool(
+                    self.store.secret(s.key)
+                    or llm.vertex_project(self.store)
+                    or self.store.setting(llm.SETTING_GCP_ADC)
+                )
+                if not had:
+                    return
+                self.store.set_secret(s.key, None)
+                llm.set_vertex_project(self.store, None)
+                llm.set_vertex_adc(self.store, None)
+                self.status.pop(s.key, None)
+                self.check(s)
+                self.refresh_all()
+                self.app.notify(f"{s.title}: key, project, and ADC path forgotten")
+                return
             if not self.store.secret(s.key):
                 return
             self.store.set_secret(s.key, None)

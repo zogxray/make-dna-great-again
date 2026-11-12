@@ -219,3 +219,96 @@ class TokenScreen(ModalDialog):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class GeminiConfigScreen(ModalDialog):
+    """F2 · Gemini: AI Studio key + Vertex project + ADC JSON path."""
+
+    DEFAULT_CSS = """
+    GeminiConfigScreen { align: center middle; }
+    #dialog { width: 86; height: auto; border: round $accent; padding: 1 1 0 1;
+              background: $surface; }
+    #dialog Input { margin: 0 0 1 0; }
+    #lbl-key, #lbl-proj, #lbl-adc { color: $text-muted; margin-top: 0; }
+    #bottom { height: 3; }
+    #hint { width: 1fr; height: 3; content-align: left middle; color: $text-muted; }
+    #bottom Button { margin-left: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, *, has_key: bool, project: str = "", adc: str = "") -> None:
+        super().__init__()
+        self.has_key = has_key
+        self.project = (project or "").strip()
+        self.adc = (adc or "").strip()
+
+    def compose(self) -> ComposeResult:
+        key_ph = ("•••• leave blank to keep current key" if self.has_key
+                  else "AIza…  AI Studio key (DuckDB)")
+        with Vertical(id="dialog"):
+            yield Static("[b]Google Gemini[/b] · F2 credentials")
+            yield Static("AI Studio API key (optional — Studio channel only)", id="lbl-key")
+            yield Input(placeholder=key_ph, password=True, id="token")
+            yield Static("Vertex AI · Google Cloud project ID", id="lbl-proj")
+            yield Input(
+                value=self.project,
+                placeholder="e.g. project-2257f100-507e-4707-858",
+                id="project",
+            )
+            yield Static(
+                "Vertex AI · ADC JSON (gcloud application_default_credentials)",
+                id="lbl-adc",
+            )
+            yield Input(
+                value=self.adc,
+                placeholder="~/.config/gcloud/application_default_credentials.json",
+                id="adc",
+            )
+            with Horizontal(id="bottom"):
+                yield Static(
+                    "OK saves · blank key keeps old · ADC is a file path, not an API key · Esc cancel",
+                    id="hint",
+                )
+                yield Button("OK", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        focus = "#project" if self.has_key or self.project else "#token"
+        self.query_one(focus, Input).focus()
+
+    @on(Input.Submitted, "#token")
+    def _submit_token(self) -> None:
+        self.query_one("#project", Input).focus()
+
+    @on(Input.Submitted, "#project")
+    def _submit_project(self) -> None:
+        self.query_one("#adc", Input).focus()
+
+    @on(Input.Submitted, "#adc")
+    def _submit_adc(self) -> None:
+        self._confirm()
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self._confirm()
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def _confirm(self) -> None:
+        key = self.query_one("#token", Input).value.strip()
+        project = self.query_one("#project", Input).value.strip()
+        adc = self.query_one("#adc", Input).value.strip()
+        if not key and not project and not adc and not self.has_key and not self.project and not self.adc:
+            self.app.notify("Enter a key, Cloud project, and/or ADC path", severity="warning")
+            return
+        if adc:
+            path = Path(adc).expanduser()
+            if not path.is_file():
+                self.app.notify(f"ADC file not found: {path}", severity="warning")
+                return
+        self.dismiss({"key": key or None, "project": project, "adc": adc})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

@@ -115,7 +115,7 @@ Point the app at reference datasets; download or verify in the background.
 | Open Humans | **F9** (or F2 **B**) is the catalog; **D on a row** downloads that genome (any compat) → DuckDB (+ READY → genome). **V**: API new + missing under filter. |
 | GWAS Catalog | **D** in F2 — latest FTP snapshot (associations, studies, EFO). Or **P** to a folder. Used by **F5**. |
 | PGS models | **D** in F2 (needs F1 genome for coverage), or **P** to an existing catalog folder. |
-| Gemini | **P** (key in DuckDB) or `GEMINI_API_KEY`. |
+| Gemini | F2 **P**: AI Studio key, Vertex Cloud project, ADC JSON path. F7 **U** channel; **M** model. F7 / F6 SUMMARY / F5 ASK. |
 
 **Discover fetch stages** (on the Discover source; already-downloaded JSON skipped):
 
@@ -136,7 +136,8 @@ flash without you. Our Y tip is scored on the **haplotree** (named SNPs + hg38
 position); Discover cards are content, not the tip picker.
 
 - **O** — Our Y tip (cycles tied / near-tie forks; `?` uncertain, `○` pruned) · `/` search · **F** filter · **S** sort · **B** rich branches  
-- Card tabs: overview, variants, ancient, map… Discover pages load on demand  
+- Card tabs: overview … LORE · **ASK** · raw JSON. Discover pages load on demand  
+- **A** — Ask → **ASK** tab + pinned F7 chat **Tree · F3** (read-only there)  
 - **D** / Shift+D — fetch missing Discover JSON (needs F2 path)  
 
 YFull / TheYtree overlays (if set in F2) are read-only extras; they do not rewrite FTDNA topology.

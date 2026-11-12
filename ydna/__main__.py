@@ -8,6 +8,13 @@ from pathlib import Path
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Optional repo/.env — does not override real environment variables.
+    try:
+        from .core.llm import load_dotenv
+        load_dotenv()
+    except Exception:  # noqa: BLE001
+        pass
+
     parser = argparse.ArgumentParser(
         description="Make DNA Great Again: local TUI for your genotype.",
     )

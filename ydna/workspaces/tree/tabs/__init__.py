@@ -134,6 +134,11 @@ class Ctx:
         self.lore_cache: dict[str, Any] = {}  # name → {text, meta} last weave
         # Активный fetch Discover: {title, stage, done, total, fraction} или None.
         self.fetch: dict[str, Any] | None = None
+        # F3 ASK tab state (workspace fills these).
+        self.workspace: Any = None
+        self.ask_cache: dict[str, dict] = {}
+        self.ask_ground_tab: str = "Overview"
+        self.ask_job: Any = None
         # YFull / TheYtree overlay: None = ещё не грузили, False = нет данных.
         self._overlays: Any = None
         # Discover-on-disk index (scandir once). Avoids Path.is_file per node.
@@ -487,9 +492,10 @@ class Ctx:
 
 from . import node as _node_tabs  # noqa: E402,F401  (регистрирует вкладки узла)
 from . import lore as _lore_tab  # noqa: E402,F401  (LORE)
+from . import ask_tab as _ask_tab  # noqa: E402,F401  (ASK)
 
 # Порядок для пользователя: кто узел → путь вверх → мутации → где люди/древние
-# → матчи → маршруты → лор → сырьё. Блоки внутри вкладок не трогаем.
+# → матчи → маршруты → лор → ASK → сырьё. Блоки внутри вкладок не трогаем.
 _TAB_ORDER = (
     "Overview",
     "Ancestors",
@@ -501,6 +507,7 @@ _TAB_ORDER = (
     "Famous",
     "Projects",
     "LORE",
+    "ASK",
     "Raw JSON",
 )
 _by_title = {t.title: t for t in TABS}

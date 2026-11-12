@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 from ...core.gwas_match import (
@@ -14,11 +15,24 @@ from ...core.gwas_match import (
 from ...core.store import cache_dir
 from .view import concordance_line, fmt_p, p_cut_label
 
-_MAX_CHARS = 3800
+# Trait-panel briefs need room for the full dosage table.
+_MAX_CHARS = 7200
+_PROMPT_REV = "v5"
 
 
 def ask_subject(a: Assoc | None, trait: str | None, result: MatchResult) -> str:
-    """Stable cache / job key for the focused Catalog row (or trait overview)."""
+    """Cache key: trait panel when a trait is focused; else single Catalog row."""
+    focus = (trait or (a.trait if a else "") or "").strip()
+    if focus:
+        # One brief per trait×genome×p-cut — Oracle synthesizes the whole panel.
+        return "|".join((
+            "trait-panel",
+            focus,
+            str(result.p_max),
+            Path(result.genome).name,
+            result.catalog_date or "",
+            _PROMPT_REV,
+        ))
     if a:
         return "|".join((
             a.rsid,
@@ -31,23 +45,23 @@ def ask_subject(a: Assoc | None, trait: str | None, result: MatchResult) -> str:
             Path(result.genome).name,
             result.catalog_date or "",
             f"d{dose_label(effect_dose(a.you, a.risk))}",
-            "v2",  # prompt revision — bump to invalidate old briefs
+            _PROMPT_REV,
         ))
     return "|".join((
         "trait",
-        trait or "",
+        "",
         str(result.p_max),
         Path(result.genome).name,
         result.catalog_date or "",
-        "v2",
+        _PROMPT_REV,
     ))
 
 
 def ask_title(a: Assoc | None, trait: str | None) -> str:
-    if a:
-        return f"GWAS · {a.rsid}"[:48]
     if trait:
         return f"GWAS · {trait[:40]}"[:48]
+    if a:
+        return f"GWAS · {a.rsid}"[:48]
     return "GWAS · ask"
 
 
@@ -114,6 +128,26 @@ def _dose_block(a: Assoc) -> list[str]:
     return lines
 
 
+def _panel_rows(result: MatchResult, focus_trait: str) -> list[Assoc]:
+    return sort_assocs_by_dose(assocs_for_trait(result, focus_trait))
+
+
+def _dose_histogram(rows: list[Assoc]) -> Counter:
+    c: Counter = Counter()
+    for a in rows:
+        c[dose_label(effect_dose(a.you, a.risk))] += 1
+    return c
+
+
+def _compact_row(a: Assoc) -> str:
+    d = effect_dose(a.you, a.risk)
+    return (
+        f"{a.rsid}\tgenome={a.you or '—'}\teffect={a.risk or '—'}\t"
+        f"dose=×{dose_label(d)}\tp={fmt_p(a.p)}\tOR/β={a.or_beta or '—'}\t"
+        f"gene={a.gene or '—'}"
+    )
+
+
 def build_ask_prompt(
     result: MatchResult,
     *,
@@ -121,39 +155,73 @@ def build_ask_prompt(
     assoc: Assoc | None,
     genome_name: str | None = None,
 ) -> str:
-    """Scientific brief: Catalog stats + computed dosage + forced gene explanation."""
+    """Trait-panel scientific brief: all retained Catalog×genome rows for the trait."""
     del genome_name  # never put the file path/name in the model prompt
+    focus_trait = (trait or (assoc.trait if assoc else None) or "").strip() or None
+    panel = _panel_rows(result, focus_trait) if focus_trait else []
+    hist = _dose_histogram(panel) if panel else Counter()
+    n_panel = len(panel)
+
     lines = [
-        "Task: scientific note on one NHGRI-EBI GWAS Catalog association versus the "
-        "diploid genotype in the investigated genome at the same rsID.",
+        "Task: write a scientific brief on how the INVESTIGATED GENOME sits on a TRAIT "
+        "PANEL — every retained NHGRI-EBI GWAS Catalog association row for one trait that "
+        "also has a genotype call (or missing call) in the investigated genome.",
+        "",
+        "Unit of analysis = the whole trait panel (all rows in TRAIT PANEL TABLE below). "
+        "A single rsID is NEVER enough when the panel has more than one row.",
         "",
         "Sources (keep distinct):",
-        "- GWAS Catalog = published association row (trait, effect allele, OR/β, p, gene, study).",
-        "- Investigated genome = observed genotype + the precomputed effect-allele dosage below.",
-        "Use the computed dosage as given — do not re-derive or flip strand.",
+        "- GWAS Catalog = published association rows (trait, effect allele, OR/β, p, gene, study).",
+        "- Investigated genome = observed genotypes + precomputed effect-allele dosages in the table.",
+        "Use computed dosages as given — do not re-derive or flip strand.",
+        "",
+        "How to read dosage vs Catalog effect:",
+        "- ×N = copies (0/1/2) of the Catalog effect/risk allele in the investigated genome.",
+        "- When OR>1 or β>0 is listed for that row: more copies → trait in the direction "
+        "the study coded (higher continuous value / higher odds of the reported outcome).",
+        "- When OR<1 or β<0 is listed: more copies → opposite direction.",
+        "- When OR/β is missing: state dosage only; do not invent direction.",
+        "- Rows can disagree (LD, ancestry, coding). Report the pattern; do not hide conflicts.",
         "",
         "Output: Markdown (## headings, bullets, **bold** key terms). Third person. "
         "Researchers’ note — no clinical framing, no file names, no apologies.",
-        "Spend ~90% of the text on numbers and gene biology; Limits = one sentence at the end.",
         "",
-        "Required sections (in order):",
-        "1) ## Catalog association — trait, effect allele, OR/β, p-value, locus, "
-        "study accession / PMID. Quote the numbers from the data block.",
-        "2) ## Gene — mandatory if a mapped gene is listed. Name the symbol; state "
-        "chromosomal locus from the data; explain what this gene product does "
-        "(established molecular / developmental / physiological role). Then tie it "
-        "to the Catalog trait: how variation at this locus is discussed for that "
-        "phenotype in the GWAS literature (mechanism hypotheses OK if labelled as "
-        "such; do not invent p-values or OR/β). If gene is missing, say so in one line "
-        "and skip mechanism.",
-        "3) ## Investigated genome — restate observed genotype and the computed "
-        "dosage (×0/×1/×2/×?); interpret effect direction using Catalog OR/β when present.",
-        "4) ## Limits — exactly one sentence (LD / chip / ancestry). No other caveats.",
+        "Length budget (strict — count words roughly):",
+        "- ## Oracle — short (≈3–5 sentences). Not part of the 75%.",
+        "- ~75% ## Investigated genome — detailed panel synthesis.",
+        "- ~20% ## Catalog & gene — compact biology for the main loci.",
+        "- ~5% ## Limits — one short sentence.",
+        "",
+        "Required sections (in this order):",
+        "1) ## Oracle — plain human «so what?» for THIS TRAIT across THE ENTIRE PANEL. "
+        "Must use the dose histogram (counts of ×2 / ×1 / ×0 / ×?). Must state a net "
+        "tilt for the trait (toward / against / mixed relative to Catalog effect alleles "
+        "where OR/β allows). Name the strongest locus cluster(s) by p-value AND by dose "
+        "(gene symbols from the table). "
+        f"HARD FAIL: if the panel has N>1 rows and Oracle discusses only one rsID — "
+        f"rewrite. HARD FAIL: hedges, apologies, «not medical advice», «more research "
+        f"needed», «cannot conclude». Commit. Heading text exactly: Oracle.",
+        "2) ## Investigated genome (~75%) — longest section. Walk the PANEL, not one SNP:",
+        "   (a) Restate histogram: n×2, n×1, n×0, n×? out of N.",
+        "   (b) Group rows by mapped gene / locus when genes repeat; for each group give "
+        "       dosages and the best p / OR/β from the table.",
+        "   (c) Call out concordance and conflicts across rows (same trait, opposite tilt).",
+        "   (d) Quantify: cite concrete rsIDs, dosages, OR/β, p from the table — many of them.",
+        "   (e) If a CURSOR ROW is marked below, you may note it as the UI focus, but it must "
+        "       not dominate; the panel does.",
+        "3) ## Catalog & gene (~20%) — biology for the 2–4 most important loci in the panel "
+        "(by p-value and by dose burden), not a novel for one SNP. Gene-product role vs "
+        "the Catalog trait; hypotheses labelled as such. Stats only from the table.",
+        "4) ## Limits (~5%) — exactly one sentence (LD / chip / ancestry / missing ×?). "
+        "Nothing else.",
         "",
         "Hard rules:",
         "- Do not invent statistics, alleles, sample sizes, PMIDs, or study accessions.",
-        "- Gene function may use standard biology; association stats only from the block.",
-        "- Do not pad with generic GWAS sermons; every paragraph must use a fact from below "
+        "- Gene function may use standard biology; association stats only from the blocks.",
+        "- Do not let Catalog & gene outgrow Investigated genome.",
+        "- Oracle must not apologize or refuse; Investigated genome must not merely restate Oracle.",
+        "- Do not collapse a multi-row panel into a single-rs essay.",
+        "- Do not pad with generic GWAS sermons; every paragraph uses a fact from below "
         "or a concrete gene-function statement.",
         "",
         "Match context:",
@@ -165,57 +233,61 @@ def build_ask_prompt(
          f"- Catalog SNPs also typed in the investigated genome: {result.matched_rs:,} "
          f"/ {result.genome_rs:,} chip rsIDs"),
         f"- Traits with ≥1 retained Catalog row: {result.traits_hit:,}",
-        f"- Retained Catalog association rows: {len(result.assocs):,}",
+        f"- Retained Catalog association rows (all traits): {len(result.assocs):,}",
     ]
 
-    focus_trait = trait or (assoc.trait if assoc else None)
     if focus_trait:
-        n = result.trait_counts.get(focus_trait, 0)
-        lines.append(f"- Focused trait label: {focus_trait} ({n} retained Catalog rows)")
+        lines.append(
+            f"- FOCUSED TRAIT: {focus_trait} — panel size N={n_panel} retained rows"
+        )
+        lines.append(
+            f"- DOSE HISTOGRAM (mandatory for Oracle + Investigated genome): "
+            f"×2={hist.get('2', 0)}  ×1={hist.get('1', 0)}  "
+            f"×0={hist.get('0', 0)}  ×?={hist.get('?', 0)}  (of {n_panel})"
+        )
 
-    if assoc:
-        lines.extend([
-            "",
-            "A) GWAS Catalog (published association):",
-            f"- rsID: {assoc.rsid}",
-            f"- DISEASE/TRAIT: {assoc.trait}",
-        ])
-        if assoc.mapped_trait and assoc.mapped_trait.lower() != assoc.trait.lower():
-            lines.append(f"- MAPPED_TRAIT: {assoc.mapped_trait}")
-        lines.extend([
-            f"- Reported effect/risk allele: {assoc.risk or '—'}",
-            f"- P-value: {fmt_p(assoc.p)}",
-            f"- OR or β: {assoc.or_beta or '—'}",
-            f"- Mapped gene (explain this gene in section 2): {assoc.gene or '—'}",
-            (f"- Locus: chr{assoc.chrom}:{assoc.pos}"
-             if assoc.chrom or assoc.pos else "- Locus: —"),
-        ])
+    if assoc and focus_trait:
+        lines.append("")
+        lines.append(
+            "CURSOR ROW (UI selection only — optional footnote, NOT the unit of analysis):"
+        )
+        lines.append(f"- rsID: {assoc.rsid}")
+        lines.extend(_dose_block(assoc))
+        if assoc.or_beta:
+            lines.append(f"- Catalog OR/β: {assoc.or_beta}")
+        lines.append(f"- Catalog p-value: {fmt_p(assoc.p)}")
+        lines.append(f"- Mapped gene: {assoc.gene or '—'}")
         bits = [x for x in (assoc.study, assoc.author, assoc.date) if x]
         if bits:
             lines.append(f"- Study: {' · '.join(bits)}")
         if assoc.pubmed:
             lines.append(f"- PubMed: {assoc.pubmed}")
+    elif assoc and not focus_trait:
+        # Fallback: no trait panel — single-row brief.
         lines.append("")
-        lines.append("B) Investigated genome (observed call + computed dosage):")
+        lines.append("PRIMARY DATA (single Catalog row — no trait panel available):")
         lines.append(f"- rsID: {assoc.rsid}")
         lines.extend(_dose_block(assoc))
+        if assoc.or_beta:
+            lines.append(f"- Catalog OR/β: {assoc.or_beta}")
+        lines.append(f"- Catalog p-value: {fmt_p(assoc.p)}")
+        lines.extend([
+            f"- DISEASE/TRAIT: {assoc.trait}",
+            f"- Reported effect/risk allele: {assoc.risk or '—'}",
+            f"- Mapped gene: {assoc.gene or '—'}",
+        ])
 
-    if focus_trait:
-        rows = sort_assocs_by_dose(assocs_for_trait(result, focus_trait))[:8]
-        extras = []
-        for a in rows:
-            if assoc and a.rsid == assoc.rsid and a.study == assoc.study and a.p == assoc.p:
-                continue
-            d = effect_dose(a.you, a.risk)
-            extras.append(
-                f"- {a.rsid} Catalog effect={a.risk or '—'} p={fmt_p(a.p)} "
-                f"OR/β={a.or_beta or '—'} gene={a.gene or '—'} {a.study or ''} · "
-                f"genome={a.you or '—'} dose=×{dose_label(d)}"
-            )
-        if extras:
-            lines.append("")
-            lines.append("Additional retained rows (sorted by dosage, high→low):")
-            lines.extend(extras)
+    if panel:
+        lines.append("")
+        lines.append(
+            f"TRAIT PANEL TABLE — ALL {n_panel} retained rows for this trait "
+            f"(sorted dosage high→low). THIS IS THE PRIMARY DATA. Cite many rows."
+        )
+        lines.append(
+            "columns: rsID, genome genotype, Catalog effect allele, dose, p, OR/β, gene"
+        )
+        for a in panel:
+            lines.append(_compact_row(a))
 
     if not focus_trait and result.trait_counts:
         lines.append("")

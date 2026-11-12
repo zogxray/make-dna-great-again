@@ -12,7 +12,8 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
-from ...core.chat import GWAS_THREAD_ID, REF_THREAD_ID, Thread
+from ...core.chat import (GWAS_THREAD_ID, REF_THREAD_ID, TREE_THREAD_ID, Thread,
+                          is_shared_thread)
 from ...theme.styles import (BAD, BAD_BOLD, DIM, FAINT, HI, HI_BOLD, HI_REV, MUTED,
                              OK_BOLD, WARN, WARN_BOLD)
 from ..base import click, fit
@@ -21,6 +22,11 @@ LIST_W = 22
 ROLE_STYLE = {"user": HI_REV, "model": OK_BOLD, "error": BAD_BOLD}
 ROLE_LABEL = {"user": "YOU", "model": "GEMINI", "error": "ERROR"}
 BODY_STYLE = {"user": HI, "model": "", "error": BAD}
+_PIN_EXTRA = {
+    TREE_THREAD_ID: " · F3 · pinned",
+    GWAS_THREAD_ID: " · F5 · pinned",
+    REF_THREAD_ID: " · F6 · pinned",
+}
 
 # Live Markdown is re-measured/re-rendered on every Textual layout pass (F6 mount).
 # Bake model bodies to Text once per (text, width) — same look, cheap Static height.
@@ -36,8 +42,10 @@ def clear_md_cache() -> None:
 def chat_prompt(t: Thread) -> Text:
     out = Text()
     title = t.title or "New chat"
-    if t.id in (REF_THREAD_ID, GWAS_THREAD_ID):
-        out.append(fit(title, LIST_W) + "\n", style="bold #D4AD72")
+    pinned = is_shared_thread(t.id)
+    if pinned:
+        out.append("◆ ", style="#D4AD72")
+        out.append(fit(title, LIST_W - 2) + "\n", style="bold #D4AD72")
     else:
         out.append(fit(title, LIST_W) + "\n", style="bold")
     if t.user_turns is not None:
@@ -45,10 +53,7 @@ def chat_prompt(t: Thread) -> Text:
     else:
         n = sum(1 for m in t.messages if m.role == "user")
     extra = " · notes" if t.notes.strip() else ""
-    if t.id == REF_THREAD_ID:
-        extra = " · F6" + extra
-    elif t.id == GWAS_THREAD_ID:
-        extra = " · F5" + extra
+    extra = _PIN_EXTRA.get(t.id, "") + extra
     out.append(f"  {n} turn{'s' if n != 1 else ''}{extra}\n", style=MUTED)
     out.append("  " + (t.updated.replace("T", " ")[5:16] if t.updated else ""), style=FAINT)
     return out

@@ -1,14 +1,20 @@
-"""Компактные промпты Ask GPT для F3 → F7 (лимит контекста)."""
+"""Компактные промпты + кэш Ask для F3 (вкладка ASK · чат Tree · F3)."""
 
 from __future__ import annotations
 
+import gzip
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
+from ...core.store import cache_dir
 from .data import pick, year_label
 from .tabs import TABS
 
 # Жёсткий потолок символов на весь user-prompt (не токены, но держит пакет коротким).
 _MAX_CHARS = 3500
+_PROMPT_REV = "v1"
 
 
 def _dv(value: Any) -> str:
@@ -363,5 +369,57 @@ def _build_lore_prompt(ctx, node: dict, question: str) -> str:
 
 def tab_title_at(section: int) -> str:
     if 0 <= section < len(TABS):
-        return TABS[section].title
+        title = TABS[section].title
+        # ASK tab itself should ground on Overview facts.
+        return "Overview" if title == "ASK" else title
     return "Overview"
+
+
+def ask_subject(node_name: str, tab: str) -> str:
+    return "|".join(("tree", node_name or "", tab or "", _PROMPT_REV))
+
+
+def ask_job_title(node_name: str, tab: str) -> str:
+    return f"Tree · {(node_name or '?')[:24]} · {tab}"[:48]
+
+
+def _cache_path(subject: str) -> Path:
+    digest = hashlib.sha1(subject.encode()).hexdigest()[:20]
+    d = cache_dir() / "tree_ask"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{digest}.json.gz"
+
+
+def load_cached(subject: str) -> dict | None:
+    path = _cache_path(subject)
+    if not path.is_file():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            raw = json.load(fh)
+        text = (raw.get("text") or "").strip()
+        if not text:
+            return None
+        return {
+            "text": text,
+            "model": raw.get("model") or "",
+            "ts": raw.get("ts") or "",
+            "subject": raw.get("subject") or subject,
+            "tab": raw.get("tab") or "",
+            "node": raw.get("node") or "",
+        }
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_cached(subject: str, *, text: str, model: str, ts: str,
+                node: str = "", tab: str = "") -> None:
+    path = _cache_path(subject)
+    payload = {
+        "subject": subject, "text": text, "model": model, "ts": ts,
+        "node": node, "tab": tab,
+    }
+    tmp = path.with_suffix(path.suffix + ".part")
+    with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    tmp.replace(path)

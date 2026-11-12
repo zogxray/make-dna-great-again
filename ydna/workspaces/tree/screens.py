@@ -97,7 +97,7 @@ class HelpScreen(ModalDialog):
                 ("S", "sort children: oldest first → richest first → deepest first"),
                 ("B", "jump to the next rich branch (rich node without rich children)"),
                 ("O", "Our Y tip; tied/near-tie cycle · ? uncertain · ○ pruned"),
-                ("A", "Ask GPT: compact prompt for this tab → F7 Chat"),
+                ("A", "Ask: brief for this haplogroup → ASK tab + Tree · F3 chat"),
                 ("FIND", None),
                 ("/", "search haplogroup name, SNP or alias (list of matches)"),
                 ("N", "next match"),

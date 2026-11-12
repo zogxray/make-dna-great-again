@@ -12,12 +12,14 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Input, Static
 
-from ...core import genome_db
+from ...core import chat, genome_db
 from ...core.jobs import JOBS
 from ...core.store import Store
 from ...core.ylink import (YBranch, YLink, active_genome, fetch_cost, fetch_resources,
                            link_genome, load_haplotree, our_branch, safe_stem)
 from ..base import KeyBar, ModeBar, Workspace, busy_progress, click, hide_busy, show_busy  # KeyBar used for updates
+from .ask import (ask_job_title, ask_subject, build_ask_prompt, load_cached, save_cached,
+                  tab_title_at)
 from .data import (STAGES, _apply_discover, graft_path, hydrate_node, load_or_build,
                    load_resource, node_codes, relink_children, search_text)
 from .screens import FilterScreen, HelpScreen, IssuesScreen, SearchResults
@@ -26,6 +28,7 @@ from .view import (SHORT_CLASS, SORT_LABELS, SORT_MODES, BranchView, glyph_legen
                    legend_text, no_haplotree_guide, our_y_styles)
 
 FETCH_JOB = "tree_discover_fetch"  # отдельно от F2 ftdna_discover, иначе джобы блокируют друг друга
+ASK_JOB = "tree-ask"
 
 
 SECTION_KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "minus", "equals_sign"]
@@ -93,7 +96,7 @@ class TreeWorkspace(Workspace):
         Binding("l", "apply_local", "Apply local", show=False),
         Binding("c", "cancel_fetch", "Cancel fetch", show=False),
         Binding("m", "map_fullscreen", "Map fullscreen", show=False),
-        Binding("a", "ask_gpt", "Ask GPT", show=False),
+        Binding("a", "ask_gpt", "Ask", show=False),
         *[Binding(k, f"section({i})", t.title, show=False)
           for i, (k, t) in enumerate(zip(SECTION_KEYS, TABS))],
         Binding("left_square_bracket", "section_step(-1)", "Prev section", show=False),
@@ -130,6 +133,11 @@ class TreeWorkspace(Workspace):
         # Inspector re-paint during fetch only when stage changes (status carries %).
         self._fetch_paint_sig: str | None = None
         self._insp_timer = None  # debounce ↑↓ inspector (hydrate + Migration Map)
+        self.ask_cache: dict[str, dict] = {}
+        self.ask_job_key: str | None = None
+        self.ask_ground_tab: str = "Overview"
+        self._ask_seen: set[int] = set()
+        self._ask_section: int | None = None
 
     @property
     def view(self) -> BranchView:
@@ -293,8 +301,15 @@ class TreeWorkspace(Workspace):
         self.folder = folder if folder != Path(".") else self.folder
         self.ctx = Ctx(self.hg_nodes, self.hg_children, folder, self.hg_stats,
                        store=self.store)
+        self.ctx.workspace = self
+        self.ctx.ask_cache = self.ask_cache
+        self.ctx.ask_ground_tab = self.ask_ground_tab
         self.view.set_source(self.hg_nodes, self.hg_children, self.hg_roots,
                              self.hg_stats.get("max_desc", 0))
+        try:
+            chat.ensure_tree_thread()
+        except Exception:
+            pass
         self.query_one("#tree-box").border_title = "PHYLOGENETIC TREE"
         self.ready = True
         # BusyModal держим до Our Y — иначе дерево мигает без подсветки ветки.
@@ -659,7 +674,7 @@ class TreeWorkspace(Workspace):
             ("B", "Rich", "screen.next_rich"),
             ("O", "Our Y" + (" · cycle" if self.branch and self.branch.n_candidates > 1 else ""),
              "screen.our_y"),
-            ("A", "Ask GPT", "screen.ask_gpt"),
+            ("A", "Ask", "screen.ask_gpt"),
             ("E", "Expand all", "screen.tree('expand_all')"),
             ("Z", "Collapse all", "screen.tree('collapse_all')"), ("Tab", "Panel", "screen.toggle_panel"),
             ("[", "Prev", "screen.section_step(-1)"), ("]", "Next section", "screen.section_step(1)"),
@@ -706,6 +721,7 @@ class TreeWorkspace(Workspace):
         if node and node.get("placeholder") and self.section != 0:
             self.section = 0
         self._sync_fetch_ctx()
+        self._sync_ask_ctx()
         # Ширина инспектора для Map / Geography (иначе fallback ~60).
         try:
             self.ctx.panel_width = max(0, int(self.query_one("#insp-box").size.width) - 4)
@@ -849,7 +865,36 @@ class TreeWorkspace(Workspace):
         job.cancel()
         self.app.notify("Cancelling Discover fetch…")
 
+    def _ask_section_index(self) -> int:
+        if self._ask_section is not None:
+            return self._ask_section
+        idx = next((i for i, t in enumerate(TABS) if t.title == "ASK"), -1)
+        self._ask_section = idx if idx >= 0 else 0
+        return self._ask_section
+
+    def _sync_ask_ctx(self) -> None:
+        if not self.ctx:
+            return
+        self.ctx.workspace = self
+        self.ctx.ask_cache = self.ask_cache
+        self.ctx.ask_ground_tab = self.ask_ground_tab
+        self.ctx.ask_job = JOBS.get(ASK_JOB)
+
     def _tick_fetch(self) -> None:
+        ask = JOBS.get(ASK_JOB)
+        if ask:
+            if ask.active:
+                if self.ask_job_key and self.section == self._ask_section_index():
+                    self._sync_ask_ctx()
+                    if self.current and self.ctx:
+                        self.query_one("#inspector", Static).update(
+                            self.ctx.render(self.current, self.section))
+                self.update_status()
+            elif id(ask) not in self._ask_seen:
+                self._ask_seen.add(id(ask))
+                if self.ask_job_key:
+                    self._finish_ask_job(ask)
+
         job = JOBS.get(FETCH_JOB)
         if self._fetch_names and job and job.running:
             self._sync_fetch_ctx()
@@ -1064,8 +1109,11 @@ class TreeWorkspace(Workspace):
             handler(self.ctx)
             self.refresh_inspector()
 
-    def action_ask_gpt(self) -> None:
-        """Компактный промпт по текущей вкладке → F7 Chat."""
+    def action_ask_gpt_refresh(self) -> None:
+        self.action_ask_gpt(refresh=True)
+
+    def action_ask_gpt(self, refresh: bool = False) -> None:
+        """ASK tab: brief via pinned Tree · F3 chat; show inline."""
         if not self.ready or not self.ctx or not self.current:
             self.app.notify("Select a haplogroup first", severity="warning")
             return
@@ -1073,21 +1121,106 @@ class TreeWorkspace(Workspace):
         if not node:
             self.app.notify("No node loaded", severity="warning")
             return
-        # Подтянуть Discover-поля, как в инспекторе — иначе промпт будет скелетом.
+        err = chat.can_send(self.store)
+        if err:
+            self.app.notify(err, severity="warning")
+            return
+        # Ground on the tab we came from (not ASK itself).
+        if TABS[self.section].title != "ASK":
+            self.ask_ground_tab = tab_title_at(self.section)
+        ground = self.ask_ground_tab or "Overview"
+        # Pull Discover fields so the prompt is not a skeleton.
         if self.folder:
             try:
                 hydrate_node(node, self.folder)
             except Exception:  # noqa: BLE001
                 pass
-        from .ask import build_ask_prompt, tab_title_at
-        tab = tab_title_at(self.section)
-        prompt = build_ask_prompt(self.ctx, node, tab)
-        title = f"Ask · {node.get('name') or '?'} · {tab}"
-        open_fn = getattr(self.app, "open_chat_prefill", None)
-        if callable(open_fn):
-            open_fn(prompt, title=title)
+        name = str(node.get("name") or self.current)
+        key = ask_subject(name, ground)
+        ask_i = self._ask_section_index()
+        if self.section != ask_i:
+            self.section = ask_i
+        if not refresh:
+            hit = self.ask_cache.get(key) or load_cached(key)
+            if hit:
+                self.ask_cache[key] = hit
+                self._sync_ask_ctx()
+                self.refresh_inspector()
+                return
+        if (old := JOBS.get(ASK_JOB)) and old.active:
+            old.cancel()
+            import time
+            for _ in range(40):
+                j = JOBS.get(ASK_JOB)
+                if not j or not j.active:
+                    break
+                time.sleep(0.05)
+            if (j := JOBS.get(ASK_JOB)) and j.active:
+                self.app.notify("Ask still stopping · try again", severity="warning")
+                self.refresh_inspector()
+                return
+
+        prompt = build_ask_prompt(self.ctx, node, ground)
+        title = ask_job_title(name, ground)
+        store = self.store
+        subject = key
+        label = f"{name} · {ground}"
+
+        def work(job) -> str:
+            t = chat.ensure_tree_thread()
+            headed = f"[F3 · {label}]\n\n{prompt}"
+            t.messages.append(chat.Message("user", headed))
+            chat.save(t)
+            chat.send(store, t, job, continue_chat=False, tier="reasoning")
+            text = next((m.text for m in reversed(t.messages) if m.role == "model"), "")
+            return (text or job.draft or "").strip() or "(empty reply)"
+
+        self.ask_job_key = subject
+        self._sync_ask_ctx()
+        try:
+            JOBS.start(ASK_JOB, title, work)
+        except RuntimeError as exc:
+            self.ask_job_key = None
+            self.app.notify(str(exc), severity="warning")
+            self.refresh_inspector()
+            return
+        self.refresh_inspector()
+        self.update_status()
+
+    def _finish_ask_job(self, job) -> None:
+        key = self.ask_job_key
+        self.ask_job_key = None
+        if not key:
+            self.refresh_inspector()
+            return
+        if job.status == "done":
+            text = (job.message or job.draft or "").strip()
+            if text in ("done",):
+                text = (job.draft or "").strip()
+            model = chat.model_label(self.store)
+            ts = chat.now()
+            parts = key.split("|")
+            node = parts[1] if len(parts) > 1 else ""
+            tab = parts[2] if len(parts) > 2 else ""
+            entry = {"text": text or "(empty reply)", "model": model, "ts": ts,
+                     "node": node, "tab": tab}
+            self.ask_cache[key] = entry
+            try:
+                save_cached(key, text=entry["text"], model=model, ts=ts,
+                            node=node, tab=tab)
+            except OSError:
+                pass
+            self.app.notify(f"Tree note · {node or key}", timeout=5)
+        elif job.status == "failed":
+            self.app.notify(f"Tree ask failed: {job.message}", severity="error",
+                            timeout=10)
         else:
-            self.app.notify("Chat mode unavailable", severity="error")
+            self.app.notify(f"Tree ask: {job.message or job.status}",
+                            severity="warning", timeout=8)
+        self.section = self._ask_section_index()
+        self._sync_ask_ctx()
+        self.refresh_inspector()
+        self.update_status()
 
     def action_map_fullscreen(self) -> None:
         """M — полноэкранная Migration Map: карта + Contact log / Migration справа."""

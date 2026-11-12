@@ -11,17 +11,48 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from .jobs import Cancelled, Job
+from . import llm
 from .store import Store
 
 TOOLS = [{"type": "google_search"}]
 # gemini-2.5-flash: только low|high (medium даёт 400 invalid_request).
 GEN_CFG = {"max_output_tokens": 65536, "thinking_level": "low"}
+# Legacy single key — migrated into per-provider settings on read.
 SETTING_MODEL = "gemini_model"
-# 3.8-flash на free-tier без Search ок, но медленный; 2.5 + Search — лучший дефолт.
+SETTING_MODEL_AISTUDIO = "gemini_model_aistudio"
+SETTING_MODEL_VERTEX = "gemini_model_vertex"
+SETTING_PROVIDER = llm.SETTING_PROVIDER
+# Studio free-tier: 2.5-flash + Search is the safe default; Vertex can use newer tops.
 DEFAULT_MODEL = "models/gemini-2.5-flash"
+DEFAULT_MODEL_VERTEX = "gemini-4-argon"
+# Curated tops per channel (merged with live list; used alone if list fails).
+_STATIC_AISTUDIO = (
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+)
+_STATIC_VERTEX = (
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gemini-3.1-pro-preview",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+)
 # Network: without these, a stalled SSE blocks forever (no progress, C useless).
 CONNECT_S = 15.0
-READ_IDLE_S = 90.0          # no bytes from the wire → fail
+READ_IDLE_S = 90.0          # no bytes from the wire → fail (Studio)
+READ_IDLE_VERTEX_S = 240.0  # argon/pro think a long time before first text delta
 WRITE_S = 60.0
 WALL_S = 600.0              # whole Interactions call ceiling
 WALL_MS = int(WALL_S * 1000)
@@ -30,10 +61,21 @@ REF_THREAD_ID = "ref-f5"
 REF_THREAD_TITLE = "Reference · F6"
 GWAS_THREAD_ID = "gwas-f5"
 GWAS_THREAD_TITLE = "GWAS · F5"
-_SHARED_THREAD_IDS = frozenset({REF_THREAD_ID, GWAS_THREAD_ID})
+TREE_THREAD_ID = "tree-f3"
+TREE_THREAD_TITLE = "Tree · F3"
+# Pinned special chats (mode-embedded asks). No free-form Send from F7.
+_SHARED_THREAD_ORDER = (TREE_THREAD_ID, GWAS_THREAD_ID, REF_THREAD_ID)
+_SHARED_THREAD_IDS = frozenset(_SHARED_THREAD_ORDER)
+_SHARED_TITLES = {
+    REF_THREAD_ID: REF_THREAD_TITLE,
+    GWAS_THREAD_ID: GWAS_THREAD_TITLE,
+    TREE_THREAD_ID: TREE_THREAD_TITLE,
+}
 _SKIP = ("image", "embedding", "banana", "omni", "antigravity", "deep-research",
-         "tts", "veo", "aqa", "robotics", "native-audio", "live")
-_models_cache: tuple[float, list["ChatModel"]] | None = None
+         "tts", "veo", "aqa", "robotics", "native-audio", "live", "imagen", "gemma",
+         "transcribe", "translate")
+# Per-provider model list cache: mode → (monotonic_ts, rows)
+_models_cache: dict[str, tuple[float, list["ChatModel"]]] = {}
 
 
 def now() -> str:
@@ -209,8 +251,8 @@ def delete(tid: str) -> None:
     from . import db
 
     if tid in _SHARED_THREAD_IDS:
-        title = REF_THREAD_TITLE if tid == REF_THREAD_ID else GWAS_THREAD_TITLE
-        raise RuntimeError(f"{title} is shared — clear messages in NOTES, do not delete")
+        title = _SHARED_TITLES.get(tid, "Shared chat")
+        raise RuntimeError(f"{title} is pinned — do not delete")
 
     def _once() -> None:
         with db.locked():
@@ -233,30 +275,37 @@ def new_thread() -> Thread:
     return t
 
 
-def ensure_reference_thread() -> Thread:
-    """Load or create the single Reference SUMMARY chat."""
-    t = load(REF_THREAD_ID)
+def _ensure_shared(tid: str, title: str) -> Thread:
+    t = load(tid)
     if t is not None:
-        if t.title != REF_THREAD_TITLE:
-            t.title = REF_THREAD_TITLE
+        if t.title != title:
+            t.title = title
             save(t)
         return t
-    t = Thread(id=REF_THREAD_ID, title=REF_THREAD_TITLE)
+    t = Thread(id=tid, title=title)
     save(t)
     return t
+
+
+def ensure_reference_thread() -> Thread:
+    """Load or create the single Reference SUMMARY chat."""
+    return _ensure_shared(REF_THREAD_ID, REF_THREAD_TITLE)
 
 
 def ensure_gwas_thread() -> Thread:
     """Load or create the single F5 GWAS ASK chat."""
-    t = load(GWAS_THREAD_ID)
-    if t is not None:
-        if t.title != GWAS_THREAD_TITLE:
-            t.title = GWAS_THREAD_TITLE
-            save(t)
-        return t
-    t = Thread(id=GWAS_THREAD_ID, title=GWAS_THREAD_TITLE)
-    save(t)
-    return t
+    return _ensure_shared(GWAS_THREAD_ID, GWAS_THREAD_TITLE)
+
+
+def ensure_tree_thread() -> Thread:
+    """Load or create the single F3 Tree ASK chat."""
+    return _ensure_shared(TREE_THREAD_ID, TREE_THREAD_TITLE)
+
+
+def ensure_shared_threads() -> None:
+    ensure_tree_thread()
+    ensure_gwas_thread()
+    ensure_reference_thread()
 
 
 def is_reference_thread(tid: str | None) -> bool:
@@ -267,8 +316,18 @@ def is_gwas_thread(tid: str | None) -> bool:
     return bool(tid) and tid == GWAS_THREAD_ID
 
 
+def is_tree_thread(tid: str | None) -> bool:
+    return bool(tid) and tid == TREE_THREAD_ID
+
+
 def is_shared_thread(tid: str | None) -> bool:
     return bool(tid) and tid in _SHARED_THREAD_IDS
+
+
+def shared_thread_label(tid: str | None) -> str:
+    if not tid:
+        return "Shared chat"
+    return _SHARED_TITLES.get(tid, "Shared chat")
 
 
 def last_user_index(thread: Thread) -> int | None:
@@ -313,7 +372,7 @@ def fork_at(src: Thread, index: int, text: str) -> Thread:
 
 
 def list_threads() -> list[Thread]:
-    """Сайдбар: метаданные + user_turns, без тел сообщений."""
+    """Сайдбар: pinned shared chats first, then others by updated DESC."""
     from . import db
 
     rows = db.fetchall(
@@ -322,11 +381,33 @@ def list_threads() -> list[Thread]:
         "FROM chat.threads "
         "ORDER BY updated DESC"
     )
-    return [_row_thread(r[:6], user_turns=int(r[6] or 0)) for r in rows]
+    threads = [_row_thread(r[:6], user_turns=int(r[6] or 0)) for r in rows]
+    by_id = {t.id: t for t in threads}
+    pinned = [by_id[tid] for tid in _SHARED_THREAD_ORDER if tid in by_id]
+    rest = [t for t in threads if t.id not in _SHARED_THREAD_IDS]
+    return pinned + rest
 
 
 def api_key(store: Store) -> str | None:
-    return store.secret("gemini") or (os.environ.get("GEMINI_API_KEY") or "").strip() or None
+    """AI Studio key only (F2 / GEMINI_API_KEY). Vertex does not use a key."""
+    return llm.studio_api_key(store)
+
+
+def provider_mode(store: Store) -> llm.Provider:
+    return llm.provider_mode(store)
+
+
+def provider_ready(store: Store) -> tuple[bool, str]:
+    return llm.provider_ready(store)
+
+
+def can_send(store: Store) -> str | None:
+    """None if the chosen provider is ready; else a short error for notify()."""
+    return llm.can_send(store)
+
+
+def cycle_provider(store: Store) -> llm.Provider:
+    return llm.cycle_provider(store)
 
 
 def _http_timeout():
@@ -337,17 +418,16 @@ def _http_timeout():
     )
 
 
-def _client(key: str):
-    """google-genai 3.x по умолчанию api_version=v1 — там нет Search и thinking; нужен v1beta."""
-    from google import genai
-    from google.genai import types
-    return genai.Client(
-        api_key=key,
-        http_options=types.HttpOptions(
-            api_version="v1beta",
-            timeout=WALL_MS,
-            client_args={"timeout": _http_timeout()},
-        ),
+def _client(store: Store):
+    """Client for the explicitly chosen provider (Vertex ADC or AI Studio key)."""
+    mode = provider_mode(store)
+    read_s = READ_IDLE_VERTEX_S if mode == "vertex" else READ_IDLE_S
+    return llm.make_client(
+        store,
+        connect_s=CONNECT_S,
+        read_idle_s=read_s,
+        write_s=WRITE_S,
+        wall_ms=WALL_MS,
     )
 
 
@@ -419,25 +499,31 @@ def _is_timeout(exc: BaseException) -> bool:
     )
 
 
-def _friendly(exc: BaseException, model: str = "") -> str:
+def _friendly(exc: BaseException, model: str = "", *,
+              mode: llm.Provider | None = None) -> str:
     code = getattr(exc, "code", None)
     status = str(getattr(exc, "status", "") or "").upper()
     msg = (getattr(exc, "message", None) or "").strip() or str(exc).strip()
     who = f" · {short_model(model)}" if model else ""
+    channel = llm.provider_label(mode) if mode else "Gemini"
     if _is_timeout(exc):
-        return (f"Gemini timed out{who} "
+        return (f"{channel} timed out{who} "
                 f"(idle {int(READ_IDLE_S)}s / wall {int(WALL_S)}s). Try again or M → another model.")
     if _is_rate(exc):
         tip = " Try M → gemini-2.5-flash (3.8 often hits free-tier quota)."
         bit = msg.split("For more information")[0].strip().rstrip(".")
         if bit and "429" not in bit and "quota" in bit.lower():
-            return f"Gemini quota (429){who}: {bit[:180]}.{tip}"
-        return f"Gemini rate limit / quota (429){who}.{tip}"
+            return f"{channel} quota (429){who}: {bit[:180]}.{tip}"
+        return f"{channel} rate limit / quota (429){who}.{tip}"
     if code in (401, 403) or status in ("UNAUTHENTICATED", "PERMISSION_DENIED"):
-        return "Gemini key rejected. Check the key in F2 (Google Gemini · P)."
+        if mode == "vertex" or "quota project" in msg.lower() or "ADC" in msg:
+            return (f"Vertex auth/permission failed{who}. "
+                    f"ADC at {llm.adc_hint()}; set GOOGLE_CLOUD_PROJECT / "
+                    f"GOOGLE_CLOUD_QUOTA_PROJECT. No API key on this channel.")
+        return "AI Studio key rejected. Check the key in F2 (Google Gemini · P)."
     if code:
         bit = (msg.split(".")[0] if msg else status)[:160]
-        return f"Gemini HTTP {code}{who}" + (f": {bit}" if bit else "")
+        return f"{channel} HTTP {code}{who}" + (f": {bit}" if bit else "")
     return str(exc)[:400]
 
 
@@ -454,14 +540,52 @@ def short_model(mid: str) -> str:
 
 
 def api_model(mid: str) -> str:
-    """Interactions API ждёт models/<id>, как в примере Google."""
+    """AI Studio / Interactions: models/<id>."""
     name = short_model(mid) or short_model(DEFAULT_MODEL)
     return f"models/{name}"
 
 
-def tools_for(mid: str) -> list[dict]:
-    """Google Search: на free tier у Gemini 3+ Flash grounding Not available (см. pricing).
-    Playground без Search работает; наш чат раньше слал tools всегда → 429 на 3.8."""
+def wire_model(mid: str, mode: llm.Provider) -> str:
+    """Model id as the chosen API expects it."""
+    name = short_model(mid) or (
+        short_model(DEFAULT_MODEL_VERTEX) if mode == "vertex" else short_model(DEFAULT_MODEL)
+    )
+    return name if mode == "vertex" else api_model(name)
+
+
+def model_setting_key(mode: llm.Provider | None = None,
+                      store: Store | None = None) -> str:
+    m = mode or provider_mode(store)
+    return SETTING_MODEL_VERTEX if m == "vertex" else SETTING_MODEL_AISTUDIO
+
+
+def get_saved_model(store: Store, mode: llm.Provider | None = None) -> str:
+    """Per-channel saved model. Migrates legacy gemini_model once."""
+    m = mode or provider_mode(store)
+    key = model_setting_key(m)
+    saved = (store.setting(key) or "").strip()
+    if saved:
+        return saved
+    legacy = (store.setting(SETTING_MODEL) or "").strip()
+    if legacy:
+        store.set_setting(key, legacy)
+        return legacy
+    return ""
+
+
+def set_saved_model(store: Store, mid: str, mode: llm.Provider | None = None) -> str:
+    m = mode or provider_mode(store)
+    wired = wire_model(mid, m)
+    store.set_setting(model_setting_key(m), wired)
+    # Keep legacy key in sync for older UI bits.
+    store.set_setting(SETTING_MODEL, wired)
+    return wired
+
+
+def tools_for(mid: str, mode: llm.Provider | None = None) -> list[dict]:
+    """Google Search: Studio only; Gemini 3+ free tier often rejects grounding."""
+    if mode == "vertex":
+        return []
     name = short_model(mid).lower()
     if name.startswith("gemini-3"):
         return []
@@ -469,113 +593,201 @@ def tools_for(mid: str) -> list[dict]:
 
 
 def _version_key(name: str) -> tuple:
-    """Новее — больше. Flash без lite выше lite той же версии."""
+    """Новее / «топ» выше: major.minor → reasoning/pro → flash → not-lite → GA."""
     n = short_model(name).lower()
     nums = [int(x) for x in re.findall(r"\d+", n)]
     nums += [0, 0, 0]
-    return (nums[0], nums[1], nums[2], 0 if "lite" in n else 1)
+    if any(tag in n for tag in ("argon", "carbon", "ultra")):
+        kind = 4
+    elif "pro" in n.split("-"):
+        kind = 3
+    elif "flash" in n:
+        kind = 2
+    else:
+        kind = 1
+    lite = 0 if "lite" in n else 1
+    ga = 0 if ("preview" in n or "exp" in n) else 1
+    return (nums[0], nums[1], nums[2], kind, lite, ga)
 
 
-def _keep_model(name: str, actions: list[str]) -> bool:
+def _keep_model(name: str, actions: list[str] | None) -> bool:
+    """Accept gemini chat models (flash/pro/argon/…). Skip media / embeddings."""
     n = short_model(name).lower()
-    if "generateContent" not in actions:
-        return False
     if not n.startswith("gemini-"):
         return False
     if any(tag in n for tag in _SKIP):
         return False
-    if "pro" in n.split("-"):
-        return False
-    return "flash" in n
+    if actions:
+        # Prefer generateContent; also allow empty-action Vertex rows that look like chat.
+        if "generateContent" not in actions and "predict" not in actions:
+            return False
+    return True
 
 
-def list_models(store: Store, force: bool = False) -> list[ChatModel]:
-    """Flash / Flash-Lite с generateContent. Свежий список с API, без зашитой версии."""
-    global _models_cache
-    if not force and _models_cache and time.monotonic() - _models_cache[0] < 600:
-        return _models_cache[1]
-    key = api_key(store)
-    if not key:
-        raise RuntimeError("set the Gemini API key in F2 (Google Gemini · P)")
-    try:
-        client = _client(key)
-    except ImportError as exc:
-        raise RuntimeError("pip install google-genai") from exc
-    rows: list[ChatModel] = []
-    try:
-        listed = list(client.models.list())
-    except Exception as exc:
-        raise RuntimeError(_friendly(exc)) from exc
-    for m in listed:
-        mid = api_model(m.name or "")
-        name = short_model(mid)
-        if not _keep_model(name, list(m.supported_actions or [])):
-            continue
-        rows.append(ChatModel(
-            id=mid, name=name,
-            label=(m.display_name or name).strip(),
-            thinking=bool(getattr(m, "thinking", False)),
-        ))
+def _static_models(store: Store, mode: llm.Provider) -> list[ChatModel]:
+    """Channel-local curated tops — never mix Studio ids into Vertex or vice versa."""
+    base = _STATIC_VERTEX if mode == "vertex" else _STATIC_AISTUDIO
+    names: list[str] = []
+    for n in (llm.default_model_for(mode, tier="reasoning"),
+              llm.default_model_for(mode, tier="fast"),
+              *base):
+        sn = short_model(n)
+        if sn and sn not in names:
+            names.append(sn)
+    saved = short_model(get_saved_model(store, mode))
+    if saved and saved not in names:
+        names.insert(0, saved)
+    rows = [
+        ChatModel(
+            id=wire_model(n, mode),
+            name=short_model(n),
+            label=short_model(n),
+            thinking=("pro" in short_model(n).lower().split("-")
+                      or "argon" in short_model(n).lower()
+                      or "carbon" in short_model(n).lower()),
+        )
+        for n in names
+    ]
     rows.sort(key=lambda m: _version_key(m.name), reverse=True)
-    if not rows:
-        raise RuntimeError("Gemini API returned no free Flash models")
-    _models_cache = (time.monotonic(), rows)
     return rows
 
 
-def default_model(models: list[ChatModel]) -> ChatModel | None:
-    want = short_model(DEFAULT_MODEL).lower()
+def _merge_models(live: list[ChatModel], static: list[ChatModel]) -> list[ChatModel]:
+    """Live API rows plus curated tops (so flagship ids never disappear)."""
+    by_name: dict[str, ChatModel] = {}
+    for m in static + live:
+        by_name[m.name.lower()] = m
+    rows = list(by_name.values())
+    rows.sort(key=lambda m: _version_key(m.name), reverse=True)
+    return rows
+
+
+def _list_client(store: Store, mode: llm.Provider):
+    """Lighter client for models.list — separate from the send/Interactions client."""
+    from google import genai
+    if mode == "aistudio":
+        key = llm.studio_api_key(store)
+        if not key:
+            raise RuntimeError("AI Studio: set key in F2 · Google Gemini · P")
+        # Default api_version for list — v1beta Interactions options can 400 on list.
+        return genai.Client(api_key=key)
+    llm.apply_vertex_adc(store)
+    project = llm.vertex_project(store)
+    if not project:
+        raise RuntimeError("Vertex: set Cloud project in F2 · Google Gemini · P")
+    return genai.Client(
+        vertexai=True,
+        project=project,
+        location=llm.vertex_location(store),
+    )
+
+
+def list_models(store: Store, force: bool = False) -> list[ChatModel]:
+    """Live model list for the *current* channel only. Falls back to curated static.
+
+    Always returns a list for the channel (so M can open even if credentials are incomplete).
+    """
+    global _models_cache
+    mode = provider_mode(store)
+    if not force:
+        hit = _models_cache.get(mode)
+        if hit and time.monotonic() - hit[0] < 600:
+            return hit[1]
+    static = _static_models(store, mode)
+    # Incomplete credentials → curated tops only (still lets the user pick a model id).
+    if can_send(store) is not None:
+        _models_cache[mode] = (time.monotonic(), static)
+        return static
+    rows: list[ChatModel] = []
+    try:
+        client = _list_client(store, mode)
+        listed = list(client.models.list())
+    except ImportError as exc:
+        raise RuntimeError("pip install google-genai") from exc
+    except Exception:
+        # Live list is best-effort. Never poison the other channel; use static for this one.
+        _models_cache[mode] = (time.monotonic(), static)
+        return static
+    for m in listed:
+        name = short_model(m.name or "")
+        actions = list(m.supported_actions or []) or None
+        if not _keep_model(name, actions):
+            continue
+        rows.append(ChatModel(
+            id=wire_model(name, mode),
+            name=name,
+            label=(m.display_name or name).strip(),
+            thinking=bool(getattr(m, "thinking", False)) or (
+                "pro" in name.split("-") or "argon" in name or "carbon" in name
+            ),
+        ))
+    rows = _merge_models(rows, static)
+    _models_cache[mode] = (time.monotonic(), rows)
+    return rows
+
+
+def default_model(models: list[ChatModel],
+                  mode: llm.Provider | None = None) -> ChatModel | None:
+    want = short_model(
+        DEFAULT_MODEL_VERTEX if mode == "vertex" else DEFAULT_MODEL
+    ).lower()
     for m in models:
         if m.name.lower() == want:
             return m
-    # Иначе предпочитаем 2.5-flash (не lite): у 3.x на free key часто quota 429.
-    for prefer in ("gemini-2.5-flash", "gemini-2.0-flash"):
+    prefer = (
+        ("gemini-4-argon", "gemini-3.1-pro-preview", "gemini-2.5-pro",
+         "gemini-3.8-flash", "gemini-2.5-flash")
+        if mode == "vertex" else
+        ("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash")
+    )
+    for name in prefer:
         for m in models:
-            if m.name.lower() == prefer:
+            if m.name.lower() == name:
                 return m
-    full = [m for m in models if "lite" not in m.name.lower() and not m.name.lower().startswith("gemini-3")]
-    if not full:
-        full = [m for m in models if "lite" not in m.name.lower()]
+    full = [m for m in models if "lite" not in m.name.lower()]
     return (full or models)[0] if (full or models) else None
 
 
 def chosen_model(store: Store, models: list[ChatModel] | None = None) -> str | None:
-    saved = store.setting(SETTING_MODEL)
+    mode = provider_mode(store)
+    saved = get_saved_model(store, mode)
     if models is None:
         try:
             models = list_models(store)
         except Exception:
-            return api_model(saved) if saved else None
+            return wire_model(saved or DEFAULT_MODEL, mode) if saved else None
     by_id = {m.id: m for m in models}
     by_name = {m.name: m for m in models}
     if saved in by_id:
         return saved
     if saved and short_model(saved) in by_name:
         return by_name[short_model(saved)].id
-    pick = default_model(models)
-    return pick.id if pick else (api_model(saved) if saved else None)
+    pick = default_model(models, mode)
+    return pick.id if pick else (wire_model(saved, mode) if saved else None)
 
 
 def resolve_model(store: Store) -> tuple[str, ChatModel | None]:
-    """Модель для send: сохранённая, если ещё в списке, иначе дефолт Google. Пишет в Store."""
-    saved = store.setting(SETTING_MODEL)
+    """Модель для send: сохранённая для текущего канала, иначе дефолт."""
+    mode = provider_mode(store)
+    saved = get_saved_model(store, mode)
     try:
         models = list_models(store)
     except Exception:
-        mid = api_model(saved or DEFAULT_MODEL)
+        mid = wire_model(saved or DEFAULT_MODEL, mode)
         return mid, None
-    mid = chosen_model(store, models) or DEFAULT_MODEL
-    mid = api_model(mid)
+    mid = chosen_model(store, models) or wire_model(DEFAULT_MODEL, mode)
+    mid = wire_model(mid, mode)
     if saved != mid:
-        store.set_setting(SETTING_MODEL, mid)
+        set_saved_model(store, mid, mode)
     info = next((m for m in models if m.id == mid or m.name == short_model(mid)), None)
     return mid, info
 
 
 def model_label(store: Store) -> str:
-    saved = store.setting(SETTING_MODEL)
-    return short_model(saved) if saved else short_model(DEFAULT_MODEL)
-
+    mode = provider_mode(store)
+    saved = get_saved_model(store, mode)
+    base = short_model(saved) if saved else short_model(llm.default_model_for(mode))
+    return f"{base} · {llm.provider_label(mode)}"
 
 def _piece(item: object) -> str:
     if isinstance(item, str):
@@ -586,6 +798,16 @@ def _piece(item: object) -> str:
     if isinstance(item, dict):
         return str(item.get("text") or "")
     return ""
+
+
+def _delta_kind(delta: object) -> str:
+    raw = getattr(delta, "type", None)
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    # Enum / Literal wrappers
+    return str(getattr(raw, "value", raw) or "")
 
 
 def _output_text(interaction: object) -> str:
@@ -610,33 +832,68 @@ def _output_text(interaction: object) -> str:
     return "\n".join(c for c in chunks if c).strip()
 
 
+def _generate_content_text(client, mid: str, text: str, job: Job,
+                           *, label: str) -> str:
+    """Vertex fallback when Interactions yields no text (common on argon/pro)."""
+    job.stage = f"{label} · generateContent"
+    job.check()
+    resp = client.models.generate_content(model=short_model(mid), contents=text)
+    out = (getattr(resp, "text", None) or "").strip()
+    if out:
+        job.draft = out
+        return out
+    # Walk candidates/parts if .text is empty.
+    bits: list[str] = []
+    for cand in getattr(resp, "candidates", None) or []:
+        content = getattr(cand, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+        if not parts:
+            continue
+        for part in parts:
+            t = getattr(part, "text", None)
+            if t:
+                bits.append(str(t))
+    out = "".join(bits).strip()
+    if out:
+        job.draft = out
+    return out
+
+
 def send(store: Store, thread: Thread, job: Job, *,
-         continue_chat: bool = True) -> str:
+         continue_chat: bool = True,
+         tier: str = "fast") -> str:
     """Отправляет последний user-текст через Interactions API, как в примере Google.
 
     continue_chat=False: do not pass previous_interaction_id (fresh ask; still
-    appends to the same thread for F6 history — used by F5 SUMMARY).
+    appends to the same thread for F6 history — used by F5 SUMMARY / F5 ASK).
+    tier: fast | reasoning — picks env default model when Store has none.
+    Provider is an explicit choice (Store / LLM_PROVIDER_MODE); no failover.
     """
-    key = api_key(store)
-    if not key:
-        raise RuntimeError("set the Gemini API key in F2 (Google Gemini · P)")
+    mode = provider_mode(store)
+    err = can_send(store)
+    if err:
+        raise RuntimeError(err)
     try:
-        client = _client(key)
+        client = _client(store)
     except ImportError as exc:
         raise RuntimeError("pip install google-genai") from exc
+    except RuntimeError:
+        raise
     job._gemini_client = client  # type: ignore[attr-defined]
     text = next((m.text for m in reversed(thread.messages) if m.role == "user"), "")
     if not text.strip():
         raise RuntimeError("empty message")
-    saved = store.setting(SETTING_MODEL) or ""
-    # прошлый generateContent-alias; Interactions + Search требуют v1beta
+    saved = get_saved_model(store, mode)
+    # Legacy aliases / empty → channel default for this tier.
     if short_model(saved) in ("", "gemini-flash-latest", "gemini-flash-lite-latest"):
-        mid = DEFAULT_MODEL
+        want = llm.default_model_for(mode, tier="reasoning" if tier == "reasoning" else "fast")
+        mid = wire_model(want, mode)
     else:
-        mid = api_model(saved)
+        mid = wire_model(saved, mode)
     if saved != mid:
-        store.set_setting(SETTING_MODEL, mid)
-    label = short_model(mid)
+        set_saved_model(store, mid, mode)
+    label = f"{short_model(mid)} · {llm.provider_label(mode)}"
+    idle_s = READ_IDLE_VERTEX_S if mode == "vertex" else READ_IDLE_S
     t0 = time.time()
 
     def _beat(note: str) -> None:
@@ -647,7 +904,8 @@ def send(store: Store, thread: Thread, job: Job, *,
     job.check()
     gen = dict(GEN_CFG)
     name = short_model(mid).lower()
-    if "lite" in name:
+    if "lite" in name or mode == "vertex":
+        # Vertex Interactions often rejects thinking_level from Studio configs.
         gen.pop("thinking_level", None)
     # 3.x Flash: official thinking levels differ; medium/high ok on 3.8, low safest
     if name.startswith("gemini-3") and "thinking_level" in gen:
@@ -658,10 +916,11 @@ def send(store: Store, thread: Thread, job: Job, *,
         "generation_config": gen,
         "timeout": _http_timeout(),
     }
-    tools = tools_for(mid)
+    tools = tools_for(mid, mode)
     if tools:
         kw["tools"] = tools
-    if continue_chat:
+    # Studio↔Vertex interaction ids are not interchangeable — never cross-continue.
+    if continue_chat and mode == "aistudio":
         prev = context_id(thread)
         if prev:
             kw["previous_interaction_id"] = prev
@@ -674,8 +933,29 @@ def send(store: Store, thread: Thread, job: Job, *,
         abort_send(job)
         raise
     except Exception as exc:
+        # Vertex: Interactions may reject some tops — fall straight to generateContent.
+        if mode == "vertex":
+            try:
+                out = _generate_content_text(client, mid, text, job, label=label)
+            except Cancelled:
+                abort_send(job)
+                raise
+            except Exception as exc2:
+                abort_send(job)
+                raise RuntimeError(_friendly(exc2, mid, mode=mode)) from exc2
+            abort_send(job)
+            if not out:
+                raise RuntimeError(
+                    f"{llm.provider_label(mode)} · {short_model(mid)} returned empty reply"
+                ) from exc
+            thread.interaction_id = None
+            thread.messages.append(Message("model", out))
+            if thread.title == "New chat":
+                thread.title = text.strip().splitlines()[0][:48]
+            save(thread)
+            return out[:80]
         abort_send(job)
-        raise RuntimeError(_friendly(exc, mid)) from exc
+        raise RuntimeError(_friendly(exc, mid, mode=mode)) from exc
     job._gemini_stream = stream  # type: ignore[attr-defined]
     chunks: list[str] = []
     iid: str | None = None
@@ -686,54 +966,77 @@ def send(store: Store, thread: Thread, job: Job, *,
             now = time.time()
             if now - t0 > WALL_S:
                 raise TimeoutError(
-                    f"wall clock {int(WALL_S)}s exceeded while waiting for Gemini"
+                    f"wall clock {int(WALL_S)}s exceeded while waiting for {llm.provider_label(mode)}"
                 )
-            if now - last_data > READ_IDLE_S and not chunks:
+            if now - last_data > idle_s and not chunks:
                 raise TimeoutError(
-                    f"no reply for {int(READ_IDLE_S)}s (still waiting for first token)"
+                    f"no reply for {int(idle_s)}s (still waiting for first token)"
                 )
             et = getattr(event, "event_type", None) or ""
-            if et in ("interaction.created", "interaction.completed"):
+            # Any SSE traffic counts as keepalive (argon emits thought_signature for a long time).
+            if et:
                 last_data = now
+            if et in ("interaction.created", "interaction.completed"):
                 inter = getattr(event, "interaction", None)
                 if inter is not None and getattr(inter, "id", None):
                     iid = str(inter.id)
-                _beat("created" if et.endswith("created") else "done")
-                if et == "interaction.completed" and not chunks and inter is not None:
-                    fallback = _output_text(inter)
-                    if fallback:
-                        chunks.append(fallback)
-                        job.draft = fallback
+                status = str(getattr(inter, "status", "") or "") if inter is not None else ""
+                _beat("created" if et.endswith("created") else (status or "done"))
+                if et == "interaction.completed" and inter is not None:
+                    if status in ("failed", "cancelled", "incomplete", "budget_exceeded"):
+                        raise RuntimeError(
+                            f"{llm.provider_label(mode)} · {short_model(mid)} "
+                            f"ended with status={status or 'unknown'}"
+                        )
+                    if not chunks:
+                        fallback = _output_text(inter)
+                        if fallback:
+                            chunks.append(fallback)
+                            job.draft = fallback
             elif et == "step.delta":
                 delta = getattr(event, "delta", None)
-                if delta is None or (getattr(delta, "type", None) or "") != "text":
-                    _beat(et or "event")
+                kind = _delta_kind(delta) if delta is not None else ""
+                if delta is None or kind != "text":
+                    _beat("thinking" if kind in ("thought_signature", "thought") else (et or "event"))
                     continue
                 piece = getattr(delta, "text", None) or ""
                 if not piece:
                     _beat("delta")
                     continue
-                last_data = now
                 chunks.append(piece)
                 job.draft = "".join(chunks)
                 _beat(f"{len(job.draft):,} chars")
             else:
                 # Search / thinking / unknown — keep stage alive so UI is not frozen.
-                _beat(et or "event")
+                _beat("thinking" if "status" in et or "step" in et else (et or "event"))
     except Cancelled:
         abort_send(job)
         raise
     except Exception as exc:
         abort_send(job)
-        raise RuntimeError(_friendly(exc, mid)) from exc
+        raise RuntimeError(_friendly(exc, mid, mode=mode)) from exc
     abort_send(job)
     job.check()
-    out = "".join(chunks).strip() or "(empty reply)"
+    out = "".join(chunks).strip()
+    if not out and mode == "vertex":
+        try:
+            out = _generate_content_text(client, mid, text, job, label=label)
+        except Cancelled:
+            raise
+        except Exception as exc:
+            raise RuntimeError(_friendly(exc, mid, mode=mode)) from exc
+    if not out:
+        raise RuntimeError(
+            f"{llm.provider_label(mode)} · {short_model(mid)} returned empty reply"
+        )
     job.draft = out
-    if iid:
+    if iid and mode == "aistudio":
         thread.interaction_id = iid
         thread.messages.append(Message("model", out, interaction_id=iid))
     else:
+        # Vertex ids are not reused for Studio continue_chat.
+        if mode == "vertex":
+            thread.interaction_id = None
         thread.messages.append(Message("model", out))
     if thread.title == "New chat":
         thread.title = text.strip().splitlines()[0][:48]

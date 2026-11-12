@@ -1526,25 +1526,48 @@ class Gemini(Source):
     title = "Google Gemini API"
     kind = "secret"
     url = "https://aistudio.google.com/apikey"
-    about = ("API key for Chat (F7). Free Flash models come from the live Gemini list; "
-             "pick one with M in F7. Google Search is on. Paste the key with P. "
-             "GEMINI_API_KEY in the environment is used if the field is empty.")
-    size_hint = "Gemini API quota (AI Studio)"
-    download_note = "This is a key, not a download. Press P and paste it."
+    about = ("LLM for F7 Chat, F3 Tree ASK, F5 GWAS ASK, F6 Reference SUMMARY. "
+             "Press P: AI Studio API key (optional), Vertex Cloud project, "
+             "and path to ADC JSON (application_default_credentials.json). "
+             "Channel: F7 · U. Vertex uses the ADC file — not an API key.")
+    size_hint = "AI Studio quota · or Vertex grant via ADC"
+    download_note = "Press P — key (Studio) / project + ADC file (Vertex)."
 
     def check(self, path: Path | None, store: Store | None = None,
               *, enrich: bool = True) -> Status:
         del enrich  # secrets have no Discover/Haplotree enrich step
-        key = (store.secret(self.key) if store else None) or os.environ.get("GEMINI_API_KEY")
-        if not key or not str(key).strip():
-            return Status("unset", "API key not set")
-        from .chat import SETTING_MODEL, short_model
-        tail = str(key).strip()[-4:]
-        saved = store.setting(SETTING_MODEL) if store else None
-        model = short_model(saved) if saved else "newest Flash (F7 · M)"
-        return Status("ok", f"key set · …{tail}",
-                      [("Key", f"…{tail}"), ("Model", model),
-                       ("Tools", "Google Search")])
+        from . import llm
+        from . import chat as chat_mod
+        mode = llm.provider_mode(store)
+        ok, detail = llm.provider_ready(store)
+        key = llm.studio_api_key(store)
+        project = llm.vertex_project(store)
+        adc = llm.vertex_adc_path(store)
+        saved = chat_mod.get_saved_model(store, mode) if store else ""
+        model = chat_mod.short_model(saved) if saved else chat_mod.short_model(
+            llm.default_model_for(mode)
+        )
+        if adc and adc.is_file():
+            adc_note = str(adc)
+        elif adc:
+            adc_note = f"missing · {adc}"
+        else:
+            adc_note = f"not set · default {llm.default_adc_path()}"
+        facts = [
+            ("Channel", llm.provider_label(mode)),
+            ("Status", detail),
+            ("AI Studio key", f"…{key[-4:]}" if key else "not set (F2 · P)"),
+            ("Cloud project", project or "not set (F2 · P)"),
+            ("ADC file", adc_note),
+            ("Model", model),
+        ]
+        if mode == "aistudio":
+            facts.append(("Tools", "Google Search"))
+        else:
+            facts.append(("Auth", "ADC file (no API key)"))
+        if key or project or (adc and adc.is_file()):
+            return Status("ok" if ok else "partial", detail, facts)
+        return Status("unset", "set key / project / ADC path with P", facts)
 
 
 # ───────────────────────── Open Humans (public samples) ─────────────────────────
