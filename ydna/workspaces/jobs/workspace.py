@@ -45,6 +45,7 @@ class JobsWorkspace(Workspace):
         self.filter = "all"
         self._keys: list[str] = []  # порядок в OptionList
         self._selected: str | None = None
+        self._list_sig: tuple | None = None  # skip idle full rebuilds
 
     def compose(self) -> ComposeResult:
         yield ModeBar(self.mode_key)
@@ -80,8 +81,27 @@ class JobsWorkspace(Workspace):
 
     def _tick(self) -> None:
         live = any(j.active or j.status == "queued" for j in JOBS.items.values())
-        if live or self._keys:
-            self.reload(keep=True)
+        sig = self._jobs_sig(live=live)
+        if sig == self._list_sig:
+            return
+        self.reload(keep=True)
+
+    def _jobs_sig(self, *, live: bool) -> tuple:
+        """Stable while idle; includes progress fields only for active/queued rows."""
+        rows: list[tuple] = []
+        for key, j in JOBS.items.items():
+            st = status_of(j)
+            if live and (j.active or st == "queued"):
+                rows.append((
+                    key, st, j.stage or "",
+                    int(round((j.fraction or 0.0) * 100)),
+                    int(round(j.rate or 0.0)),
+                    (j.message or "")[:48],
+                ))
+            else:
+                rows.append((key, st))
+        rows.sort()
+        return (self.filter, tuple(rows))
 
     def _filtered(self) -> list[Job]:
         items = list(JOBS.items.values())
@@ -144,6 +164,8 @@ class JobsWorkspace(Workspace):
         self.query_one("#list-box").border_subtitle = (
             f"{len(jobs)} shown · filter {self.filter} · {' · '.join(bits)}"
         )
+        self._list_sig = self._jobs_sig(
+            live=any(j.active or j.status == "queued" for j in JOBS.items.values()))
         self.refresh_detail()
         self.update_status()
 

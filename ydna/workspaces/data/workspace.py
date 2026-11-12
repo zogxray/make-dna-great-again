@@ -20,7 +20,8 @@ from ...core.sources import BY_KEY, SOURCE_GROUPS, SOURCES, Source, Status, huma
 from ...core.store import Store
 from ...core.ylink import (FETCH_STAGES, active_genome, fetch_cost, fetch_plan,
                            stage_fetch_names)
-from ..base import KeyBar, ModeBar, Workspace, alt_keys, click, fit, short_path
+from ..base import (KeyBar, ModeBar, Workspace, alt_keys, click, fit, hide_busy,
+                    short_path, show_busy)
 from .screens import PathScreen, TokenScreen
 
 from ...theme.styles import DIM, JOB_STYLE, STATE_ICON_STYLE
@@ -161,6 +162,7 @@ class DataWorkspace(Workspace):
         self._enriching: set[str] = set()
         # LINKED keys that must recompute coverage (genome/path change). Empty = reuse DB facts.
         self._enrich_dirty: set[str] = set()
+        self._first_paint_done = False
 
     def _active(self) -> Path | None:
         """Активный файл F1: из GenomeWorkspace, иначе genome.files."""
@@ -234,20 +236,36 @@ class DataWorkspace(Workspace):
         self.query_one("#det-box").border_title = "DETAILS"
         self.query_one("#act-box").border_title = "ACTIONS"
         self.query_one("#act-box").border_subtitle = "click or key"
-        # Instant paint from DuckDB; heavy disk checks run in the background.
+        # Spinner first frame, then DuckDB hydrate + list/details (bench: ~2s sync).
+        show_busy(self.app, "Data", "Loading sources…")
+        self.call_after_refresh(self._first_paint)
+
+    def _first_paint(self) -> None:
+        """Hydrate from DB, build OptionList once, kick light checks — then drop modal."""
+        if self._first_paint_done or not self.is_mounted:
+            hide_busy(self.app)
+            return
+        self._first_paint_done = True
         try:
-            self.store.warm_paths()
-            self._hydrate_status_from_db()
-        except Exception:  # noqa: BLE001
-            pass
-        ol = self.query_one("#sources", OptionList)
-        ol.add_options(self._menu_options())
-        ol.highlighted = self._first_source_index(ol)
-        ol.focus()
-        self.refresh_all()
-        for s in _grouped_sources():
-            self.check(s, enrich=False)
-        self.set_interval(0.5, self._tick)
+            try:
+                self.store.warm_paths()
+                self._hydrate_status_from_db()
+            except Exception:  # noqa: BLE001
+                pass
+            ol = self.query_one("#sources", OptionList)
+            # _menu_options already builds prompts — skip refresh_all's full rewrite.
+            ol.add_options(self._menu_options())
+            ol.highlighted = self._first_source_index(ol)
+            ol.focus()
+            self.query_one("#help", KeyBar).set_items(self._key_items())
+            self.refresh_details()
+            self.refresh_actions()
+            self.update_status()
+            for s in _grouped_sources():
+                self.check(s, enrich=False)
+            self.set_interval(0.5, self._tick)
+        finally:
+            hide_busy(self.app)
 
     @property
     def source(self) -> Source:

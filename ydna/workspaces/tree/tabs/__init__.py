@@ -138,6 +138,8 @@ class Ctx:
         self._overlays: Any = None
         # Discover-on-disk index (scandir once). Avoids Path.is_file per node.
         self._discover_stems: set[str] | None = None
+        # name → (n_miss, n_local, self_miss, self_local); drop on ingest/fetch.
+        self._subtree_stats_cache: dict[str, tuple[int, int, bool, bool]] = {}
 
     def overlays(self):
         """Ленивый индекс YFull+TheYtree (ages / SNP / crosswalk)."""
@@ -183,6 +185,7 @@ class Ctx:
     def invalidate_discover_index(self) -> None:
         """Call after fetch / ingest writes or deletes Discover JSON files."""
         self._discover_stems = None
+        self._subtree_stats_cache.clear()
 
     def _ensure_discover_stems(self) -> set[str]:
         if self._discover_stems is not None:
@@ -209,6 +212,9 @@ class Ctx:
 
     def discover_subtree_stats(self, name: str) -> tuple[int, int, bool, bool]:
         """One subtree walk: (n_missing, n_local, self_missing, self_local)."""
+        hit = self._subtree_stats_cache.get(name)
+        if hit is not None:
+            return hit
         self._ensure_discover_stems()
         n_miss = n_local = 0
         self_miss = self_local = False
@@ -231,7 +237,9 @@ class Ctx:
                         self_miss = True
             for k in reversed(self.children.get(n, [])):
                 stack.append(k)
-        return n_miss, n_local, self_miss, self_local
+        out = (n_miss, n_local, self_miss, self_local)
+        self._subtree_stats_cache[name] = out
+        return out
 
     def missing_discover(self, name: str) -> list[str]:
         """Узел и потомки: haplotree-скелет БЕЗ файла Discover на диске (нужен сетевой fetch)."""

@@ -85,6 +85,7 @@ class PgsWorkspace(Workspace):
         self.sort_mode = "theme"
         self.only_big = False
         self.search_q = ""
+        self._first_paint_done = False
 
     @property
     def menu_models(self) -> list[pgs.Model]:
@@ -157,11 +158,30 @@ class PgsWorkspace(Workspace):
         self.query_one("#models-box").border_title = "MODELS"
         self.query_one("#card-box").border_title = "MODEL"
         self.query_one("#over-box").border_title = "OVERVIEW"
-        self.reload()
-        self.query_one("#models", OptionList).focus()
-        self.set_interval(0.5, self._tick)
+        # Spinner first frame; warm SELECT + OptionList after paint (cold stays in worker).
+        g = self._active()
+        show_busy(self.app, "PGS models",
+                  f"Results for {g.name}" if g else "Loading models…")
+        self.call_after_refresh(self._first_paint)
+
+    def _first_paint(self) -> None:
+        if self._first_paint_done or not self.is_mounted:
+            hide_busy(self.app)
+            return
+        self._first_paint_done = True
+        try:
+            self.reload()
+            self.query_one("#models", OptionList).focus()
+            self.set_interval(0.5, self._tick)
+        finally:
+            # Cold path keeps BusyModal until _reload_done.
+            if self.refreshing:
+                return
+            hide_busy(self.app)
 
     def on_screen_resume(self) -> None:
+        if not self._first_paint_done:
+            return
         if self.store.path("pgs_models") != self.folder or self._active() != self.genome:
             self.reload()
         elif self.pick_other():

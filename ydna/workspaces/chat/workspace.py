@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from textual import on
@@ -16,7 +17,8 @@ from ...core.jobs import JOBS
 from ...core.store import Store
 from ...core.ylink import active_genome
 from ..base import (ClipTextArea, KeyBar, ModeBar, ReadOnlyClipTextArea,
-                    SelectableRichStatic, Workspace, alt_keys, fit)
+                    SelectableRichStatic, Workspace, alt_keys, fit, hide_busy,
+                    show_busy)
 from ..data.workspace import job_line
 from .screens import ConfirmScreen, EditScreen, ModelScreen
 from .view import chat_prompt, thread_text, thread_view
@@ -95,6 +97,10 @@ class ChatWorkspace(Workspace):
         self.seen_job: tuple | None = None
         self.genome: Path | None = None
         self.select_mode = False
+        self._first_paint_done = False
+        # Streaming body paint throttle (status bar owns the live seconds clock).
+        self._stream_shown_draft = 0
+        self._stream_show_at = 0.0
 
     def compose(self) -> ComposeResult:
         yield ModeBar(self.mode_key)
@@ -143,10 +149,26 @@ class ChatWorkspace(Workspace):
         self.query_one("#chats-box").border_title = "CHATS"
         self.query_one("#thread-box").border_title = "CHAT"
         self.query_one("#notes-box").border_title = "NOTES"
-        self.reload()
-        if not self._apply_prefill():
-            self._focus_prompt()
-        self.set_interval(0.15, self._tick)
+        # Spinner first frame, then thread list + Markdown bake (cold F6).
+        show_busy(self.app, "Chat", "Loading chats…")
+        self.call_after_refresh(self._first_paint)
+
+    def _first_paint(self) -> None:
+        if self._first_paint_done or not self.is_mounted:
+            hide_busy(self.app)
+            return
+        self._first_paint_done = True
+        try:
+            try:
+                chat.ensure_reference_thread()
+            except Exception:
+                pass
+            self.reload()
+            if not self._apply_prefill():
+                self._focus_prompt()
+            self.set_interval(0.15, self._tick)
+        finally:
+            hide_busy(self.app)
 
     def on_screen_resume(self) -> None:
         if self._apply_prefill():
@@ -257,7 +279,7 @@ class ChatWorkspace(Workspace):
     def _show(self) -> None:
         t = self.current
         job = JOBS.get(JOB)
-        waiting = bool(job and job.running)
+        waiting = bool(job and job.active)
         draft = job.draft if waiting and job else ""
         switch = self.query_one("#thread-switch", ContentSwitcher)
         if self.select_mode:
@@ -306,8 +328,8 @@ class ChatWorkspace(Workspace):
         else:
             bits.append("active: — (F1)")
         job = JOBS.get(JOB)
-        if job and job.running:
-            bits.append(f"⚙ {job_line(job)}")
+        if job and job.active:
+            bits.append(f"⚙ {chat.wait_line(job)}")
         elif job and job.status == "failed":
             bits.append(f"failed: {job.message}")
         n = len(self.current.messages) if self.current else 0
@@ -359,10 +381,11 @@ class ChatWorkspace(Workspace):
         self._flush_notes()
         job = JOBS.get(JOB)
         draft_n = len(job.draft) if job else 0
-        sig = (id(job), job.status if job else None, job.finished if job else None, draft_n)
+        # Identity only — draft length is handled below (avoids full rebuild every char).
+        sig = (id(job), job.status if job else None, job.finished if job else None)
         if sig != self.seen_job:
             self.seen_job = sig
-            if job and not job.running and self.current:
+            if job and not job.active and self.current:
                 fresh = chat.load(self.current.id)
                 if fresh:
                     self.current = fresh
@@ -374,8 +397,26 @@ class ChatWorkspace(Workspace):
                     if idx is not None:
                         ol.replace_option_prompt_at_index(idx, chat_prompt(fresh))
             self._show()
-        elif job and job.running:
-            self._show()
+            self._stream_shown_draft = draft_n
+            self._stream_show_at = time.monotonic()
+            return
+
+        if not (job and job.active):
+            return
+
+        # Live wait_line() seconds → status bar only (no Markdown rebuild).
+        self.update_status()
+
+        if draft_n == self._stream_shown_draft:
+            return
+        now = time.monotonic()
+        first_token = self._stream_shown_draft == 0 and draft_n > 0
+        grew = draft_n - self._stream_shown_draft
+        if not first_token and grew < 80 and now - self._stream_show_at < 0.4:
+            return
+        self._stream_shown_draft = draft_n
+        self._stream_show_at = now
+        self._show()
 
     @on(OptionList.OptionHighlighted, "#chats")
     def _highlighted(self) -> None:
@@ -492,6 +533,10 @@ class ChatWorkspace(Workspace):
         if not self.current or not self.query_one("#chats").has_focus:
             return
         t = self.current
+        if chat.is_reference_thread(t.id):
+            self.app.notify("Reference · F5 is shared — open it, do not delete",
+                            severity="warning")
+            return
         title = (t.title or "New chat").strip() or "New chat"
         n = sum(1 for m in t.messages if m.role == "user")
 
@@ -533,7 +578,8 @@ class ChatWorkspace(Workspace):
 
     def action_cancel(self) -> None:
         job = JOBS.get(JOB)
-        if job and job.running:
+        if job and job.active:
+            chat.abort_send(job)
             job.cancel()
             self.app.notify("Cancelling Gemini")
         else:

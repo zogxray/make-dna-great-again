@@ -49,12 +49,15 @@ class Store:
     """Пути к источникам, секреты и settings — только DuckDB (data.*)."""
 
     def __init__(self) -> None:
-        # Гарантируем schema + seed каталога F2.
-        from . import db
-        db.connect()
         # path() hits DuckDB under the global lock — cache so F2 refresh_all
         # does not serialize behind haplotree/coverage workers.
+        # Connect is lazy (ensure / first query) so App can paint BusyModal first.
         self._path_cache: dict[str, Path | None] = {}
+
+    def ensure(self) -> None:
+        """Open DuckDB + schema/seed (idempotent). Call once under BusyModal at boot."""
+        from . import db
+        db.connect()
 
     def path(self, key: str) -> Path | None:
         if key in self._path_cache:

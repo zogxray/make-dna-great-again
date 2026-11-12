@@ -13,6 +13,7 @@ import zlib
 from typing import Any, Callable
 
 from ....theme.styles import MAP
+from ...base import click as click_style
 
 _DATA = (
     "eNplXQmSJDkK/JDCTOjWW8b2/99YgTtIlW3d01OVGRmHDnAch/zvP0n/1brTJznVlb4iSdI3kjR96X//S//lc8Au6Wszff28WHDA"
@@ -151,6 +152,9 @@ COL = {k: MAP[k] for k in ("coast", "border", "ring", "grid", "route")}
 _BITS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
 _PRIO = ("route", "coast", "border", "ring", "grid")
 _cache: list | None = None
+# Framing → (cells, color) for grid+coast+border. Filters/blink reuse the same box.
+_BASE_CACHE: dict[tuple, tuple[dict, dict]] = {}
+_BASE_CACHE_MAX = 8
 
 
 def _polys() -> list[tuple[int, list[tuple[float, float]]]]:
@@ -169,6 +173,55 @@ def _polys() -> list[tuple[int, list[tuple[float, float]]]]:
     return _cache
 
 
+def _base_frame_key(cols: int, rows: int, lon_c: float, lat_c: float,
+                    scale: float, gstep: int) -> tuple:
+    return (cols, rows, round(lon_c, 5), round(lat_c, 5), round(scale, 5), gstep)
+
+
+def _paint_base(cv: "_Canvas", *, lon_c: float, lat_c: float, scale: float,
+                gstep: int) -> None:
+    """Grid + Natural Earth coast/borders. Cached by map framing."""
+    key = _base_frame_key(cv.cols, cv.rows, lon_c, lat_c, scale, gstep)
+    hit = _BASE_CACHE.get(key)
+    if hit is not None:
+        cells, color = hit
+        cv.cells = {k: dict(v) for k, v in cells.items()}
+        cv.color = dict(color)
+        return
+
+    px = lambda lon, lat: ((lon - lon_c) * scale + cv.W / 2, (lat_c - lat) * scale + cv.H / 2)
+    vis_lon0, vis_lon1 = lon_c - cv.W / 2 / scale, lon_c + cv.W / 2 / scale
+    vis_lat0, vis_lat1 = lat_c - cv.H / 2 / scale, lat_c + cv.H / 2 / scale
+    m = math.ceil(vis_lon0 / gstep) * gstep
+    while m <= vis_lon1:
+        x = round(px(m, 0)[0])
+        for y in range(0, cv.H, 4):
+            cv.dot(x, y, "grid")
+        m += gstep
+    m = math.ceil(vis_lat0 / gstep) * gstep
+    while m <= vis_lat1:
+        y = round(px(0, m)[1])
+        for x in range(0, cv.W, 4):
+            cv.dot(x, y, "grid")
+        m += gstep
+    shifts = [sh for sh in (-360, 0, 360) if -180 + sh <= vis_lon1 and 180 + sh >= vis_lon0]
+    for kind, pl in _polys():
+        layer = "border" if kind else "coast"
+        for sh in shifts:
+            for a, b in zip(pl, pl[1:]):
+                if abs(a[0] - b[0]) > 100:
+                    continue
+                (x0, y0), (x1, y1) = px(a[0] + sh, a[1]), px(b[0] + sh, b[1])
+                cv.line(x0, y0, x1, y1, layer)
+
+    _BASE_CACHE[key] = (
+        {k: dict(v) for k, v in cv.cells.items()},
+        dict(cv.color),
+    )
+    while len(_BASE_CACHE) > _BASE_CACHE_MAX:
+        _BASE_CACHE.pop(next(iter(_BASE_CACHE)))
+
+
 def _d(x: Any) -> dict:
     return x if isinstance(x, dict) else {}
 
@@ -180,6 +233,7 @@ class _Canvas:
         self.cells: dict[tuple[int, int], dict[str, int]] = {}
         self.color: dict[tuple[int, int], str] = {}
         self.over: dict[tuple[int, int], tuple[str, str]] = {}
+        self.hot: dict[tuple[int, int], str] = {}  # cell → screen.action(…)
         self.taken: set[tuple[int, int]] = set()
 
     def dot(self, x: int, y: int, layer: str, color: str | None = None) -> None:
@@ -213,10 +267,13 @@ class _Canvas:
                 err += dx
                 y0 += sy
 
-    def mark(self, cx: int, cy: int, ch: str, style: str) -> None:
+    def mark(self, cx: int, cy: int, ch: str, style: str,
+             action: str | None = None) -> None:
         if 0 <= cx < self.cols and 0 <= cy < self.rows:
             self.over[(cx, cy)] = (ch, f"{style} on {BG}")
             self.taken.add((cx, cy))
+            if action:
+                self.hot[(cx, cy)] = action
 
     def label(self, cx: int, cy: int, text: str, style: str) -> bool:
         for dy in (0, -1, 1, -2, 2):
@@ -713,12 +770,30 @@ def _geo_ocean_score(lon: float, lat: float) -> int:
     return score
 
 
-def _ocean_legend(cv: "_Canvas", lines: list[tuple[str, str]], *,
+def _radar_rings(cv: "_Canvas", ox: float, oy: float, radii: list[float],
+                 color: str | None = None) -> None:
+    """DEFCON radar rings in canvas pixels (same trick as Y-theater origin rings)."""
+    for rad in radii:
+        if rad < 2:
+            continue
+        step = max(2, int(3 * 360 / (2 * math.pi * max(rad, 1))))
+        for k in range(0, 360, step):
+            a = math.radians(k)
+            cv.dot(round(ox + rad * math.cos(a)),
+                   round(oy + rad * math.sin(a)),
+                   "ring", color)
+
+
+def _ocean_legend(cv: "_Canvas",
+                  lines: list[tuple[str, str] | tuple[str, str, str | None]], *,
                   lon_c: float, lat_c: float, scale: float) -> None:
-    """Paint group/Seshat summary in the corner with the most ocean."""
+    """Paint group/Seshat summary in the corner with the most ocean.
+
+    lines: (text, style) or (text, style, click_action).
+    """
     if not lines:
         return
-    width = min(22, max(12, max((len(t) for t, _ in lines), default=12) + 1))
+    width = min(22, max(12, max((len(row[0]) for row in lines), default=12) + 1))
     width = min(width, max(8, cv.cols // 3))
     height = min(len(lines), max(1, cv.rows - 2))
     if width > cv.cols or height > cv.rows:
@@ -793,7 +868,9 @@ def _ocean_legend(cv: "_Canvas", lines: list[tuple[str, str]], *,
         x0, y0 = best_pos
 
     for dy in range(height):
-        text, style = lines[dy]
+        row = lines[dy]
+        text, style = row[0], row[1]
+        action = row[2] if len(row) > 2 else None
         body = (" " + text)[: width - 1].ljust(width - 1)
         for dx, ch in enumerate(body):
             cx, cy = x0 + dx, y0 + dy
@@ -801,16 +878,36 @@ def _ocean_legend(cv: "_Canvas", lines: list[tuple[str, str]], *,
                 sty = f"{style} on {BG}" if ch != " " else f"#5A5361 on {BG}"
                 cv.over[(cx, cy)] = (ch if ch != " " else " ", sty)
                 cv.taken.add((cx, cy))
+                if action and ch != " ":
+                    cv.hot[(cx, cy)] = action
+
+
+def _focus_radii(px_xy: list[tuple[float, float]], *, scale: float,
+                 rank: float = -1.0) -> tuple[float, float, list[float]]:
+    """Centroid + DEFCON ring radii (canvas px) from cluster spread / rank."""
+    ox = sum(x for x, _ in px_xy) / len(px_xy)
+    oy = sum(y for _, y in px_xy) / len(px_xy)
+    spread = max((math.hypot(x - ox, y - oy) for x, y in px_xy), default=0.0)
+    # Floor ~3–5° so a single site still gets a readable radar.
+    floor = max(10.0, 3.5 * scale)
+    # Higher f3 percentile → slightly wider rings (data, not decoration).
+    boost = 1.0 + max(0.0, min(100.0, rank)) / 200.0  # 1.00 … 1.50
+    outer = max(spread * 1.2, floor) * boost
+    return ox, oy, [outer * 0.35, outer * 0.65, outer]
 
 
 def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
                 cols: int = 96, max_rows: int = 28, selected: str | None = None,
+                selected_blink: bool = True,
                 culture_labels: bool = False,
-                anchors: list[dict] | None = None) -> None:
+                anchors: list[dict] | None = None,
+                map_focus: str | None = None) -> None:
     """Точки на брайлевской карте. Подписи культур/Seshat — сводка в океане.
 
     culture_labels: ocean legend of cultures (count · name), not over land/points.
     anchors: Seshat names in the same ocean summary (not labeled on the map).
+    selected_blink: when False, hide ◆ / triangle highlight (pulse off-phase).
+    map_focus: 'c:Culture' or 's:SeshatLabel' — DEFCON rings around that cluster.
     """
     cols = max(30, cols)
     pts = [(float(p["lon"]), float(p["lat"]), p) for p in points
@@ -845,31 +942,42 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
     vis_lat0, vis_lat1 = lat_c - cv.H / 2 / scale, lat_c + cv.H / 2 / scale
     gstep = 10 if scale >= 1.2 else 30
     astep = 20 if scale >= 1.2 else 60
-    m = math.ceil(vis_lon0 / gstep) * gstep
-    while m <= vis_lon1:
-        x = round(px(m, 0)[0])
-        for y in range(0, cv.H, 4):
-            cv.dot(x, y, "grid")
-        m += gstep
-    m = math.ceil(vis_lat0 / gstep) * gstep
-    while m <= vis_lat1:
-        y = round(px(0, m)[1])
-        for x in range(0, cv.W, 4):
-            cv.dot(x, y, "grid")
-        m += gstep
-    shifts = [sh for sh in (-360, 0, 360) if -180 + sh <= vis_lon1 and 180 + sh >= vis_lon0]
-    for kind, pl in _polys():
-        layer = "border" if kind else "coast"
-        for sh in shifts:
-            for a, b in zip(pl, pl[1:]):
-                if abs(a[0] - b[0]) > 100:
-                    continue
-                (x0, y0), (x1, y1) = px(a[0] + sh, a[1]), px(b[0] + sh, b[1])
-                cv.line(x0, y0, x1, y1, layer)
+    _paint_base(cv, lon_c=lon_c, lat_c=lat_c, scale=scale, gstep=gstep)
 
     selected_cell = None
     # culture → (count, best_rank, color)
     cult_sum: dict[str, tuple[int, float, str]] = {}
+    focus_cult = map_focus[2:] if map_focus and map_focus.startswith("c:") else None
+    focus_sesh = map_focus[2:] if map_focus and map_focus.startswith("s:") else None
+    focus_xy: list[tuple[float, float]] = []
+    focus_rank = -1.0
+    focus_color = COL["ring"]
+
+    # Radar first (under points) — same layer order as Y-theater.
+    if focus_cult:
+        for lon, lat, p in pts:
+            if (p.get("culture") or "").strip() != focus_cult:
+                continue
+            focus_xy.append(px(lon, lat))
+            rnk = float(p.get("rank") if p.get("rank") is not None else -1.0)
+            if rnk >= focus_rank:
+                focus_rank = rnk
+                focus_color = p.get("color") or focus_color
+    elif focus_sesh:
+        for lon, lat, a in anchor_pts:
+            lab = (a.get("label") or a.get("id") or "").strip()
+            aid = str(a.get("id") or "").strip()
+            if lab != focus_sesh and aid != focus_sesh:
+                continue
+            focus_xy.append(px(lon, lat))
+            focus_rank = float(a.get("rank") if a.get("rank") is not None else 50.0)
+            focus_color = a.get("color") or "#AEA5B8"
+    focus_hub: tuple[float, float] | None = None
+    if focus_xy:
+        ox, oy, radii = _focus_radii(focus_xy, scale=scale, rank=focus_rank)
+        focus_hub = (ox, oy)
+        _radar_rings(cv, ox, oy, radii, focus_color)
+
     for lon, lat, p in pts:
         cx, cy = cell(lon, lat)
         color = p.get("color") or COL["coast"]
@@ -877,13 +985,12 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
         is_sel = bool(selected) and (p.get("id") == selected or p.get("label") == selected)
         if is_sel:
             selected_cell = (cx, cy, p)
+        cult = (p.get("culture") or "").strip()
+        in_focus = bool(focus_cult and cult == focus_cult)
         if glyph:
             cv.mark(cx, cy, _SMALL_GLYPH.get(glyph, glyph), color)
         else:
             cv.dot(*map(round, px(lon, lat)), "route", color)
-            if is_sel:
-                cv.mark(cx, cy, "◆", f"bold {color}")
-        cult = (p.get("culture") or "").strip()
         if cult and culture_labels:
             rank = float(p.get("rank") if p.get("rank") is not None else -1.0)
             prev = cult_sum.get(cult)
@@ -892,27 +999,43 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
             else:
                 n, pr, pc = prev
                 cult_sum[cult] = (n + 1, max(pr, rank), pc if pr >= rank else str(color))
+        # Focused culture sites get a steady ◆ (selection still blinks separately).
+        if in_focus and not is_sel:
+            cv.mark(cx, cy, "◆", f"bold {color}")
 
-    if selected_cell:
+    # Selection pulse: ◆ / big ▲ only while blink is on (off-phase = plain point).
+    if selected_cell and selected_blink:
         cx, cy, p = selected_cell
         if p.get("glyph"):
             _big_triangle(cv, cx, cy, p.get("color") or "#5882C7")
+        else:
+            cv.mark(cx, cy, "◆", f"bold {p.get('color') or '#FBF6F0'}")
         # No text label on the map — selection is ◆ only; name lives in the corner.
 
-    legend: list[tuple[str, str]] = []
+    # Centroid hub for the active radar.
+    if focus_hub is not None:
+        ox, oy = focus_hub
+        cv.mark(int(ox) >> 1, int(oy) >> 2, "◉", f"bold {focus_color}")
+
+    legend: list[tuple[str, str] | tuple[str, str, str | None]] = []
     if culture_labels and cult_sum:
         ranked = sorted(cult_sum.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
-        sel_cult = ""
-        if selected_cell:
+        sel_cult = focus_cult or ""
+        if not sel_cult and selected_cell:
             sel_cult = (selected_cell[2].get("culture")
                         or selected_cell[2].get("label") or "")
         budget = max(6, min(12, rows - 3))
         for cult, (n, _rank, color) in ranked[:budget]:
             mark = "◆" if cult and cult == sel_cult else "·"
-            legend.append((f"{mark}{n:>3} {cult}"[:20], f"bold {color}"))
+            key = f"c:{cult}"
+            legend.append((
+                f"{mark}{n:>3} {cult}"[:20],
+                f"bold {color}",
+                f"screen.map_focus({key!r})",
+            ))
     if culture_labels and anchor_pts:
         if legend:
-            legend.append(("§ Seshat", "#8A8294"))
+            legend.append(("§ Seshat", "#8A8294", None))
         seshat_budget = max(2, min(5, rows // 4))
         ranked_a = sorted(
             anchor_pts,
@@ -920,7 +1043,14 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
         )
         for _lon, _lat, a in ranked_a[:seshat_budget]:
             lab = (a.get("label") or a.get("id") or "§").strip()
-            legend.append((f"§ {lab}"[:20], a.get("color") or "#AEA5B8"))
+            key = f"s:{lab}"
+            mark = "◆" if focus_sesh and (lab == focus_sesh
+                                          or str(a.get("id") or "") == focus_sesh) else "§"
+            legend.append((
+                f"{mark} {lab}"[:20],
+                a.get("color") or "#AEA5B8",
+                f"screen.map_focus({key!r})",
+            ))
     if legend:
         _ocean_legend(cv, legend, lon_c=lon_c, lat_c=lat_c, scale=scale)
 
@@ -938,7 +1068,11 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
         doc.t.append("\n")
 
     head = f" {title} "
-    tail = f" {len(pts)} pts "
+    if map_focus:
+        tag = map_focus[2:] if map_focus[:2] in ("c:", "s:") else map_focus
+        tail = f" ◉ {tag} · {len(pts)} pts "
+    else:
+        tail = f" {len(pts)} pts "
     pad_line([(head, "bold #5882C7"),
               (" " * max(1, total_w - len(head) - len(tail)), "#FBF6F0"),
               (tail, "#5A7CB3")])
@@ -966,10 +1100,12 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
                 ch, sty = chr(0x2800 + mask), f"{fg} on {BG}"
             else:
                 ch, sty = " ", f"white on {BG}"
-            if sty != st:
+            action = cv.hot.get((cx, r))
+            out = click_style(action, sty) if action else sty
+            if out != st:
                 if run:
                     doc.t.append(run, st)
-                run, st = "", sty
+                run, st = "", out
             run += ch
         if run:
             doc.t.append(run, st)

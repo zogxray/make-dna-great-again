@@ -17,7 +17,8 @@ from ...core import openhumans_db as ohdb
 from ...core.jobs import JOBS
 from ...core.sources import BY_KEY, human_size
 from ...core.store import Store
-from ..base import KeyBar, ModeBar, Workspace, alt_keys, click, fit
+from ..base import (KeyBar, ModeBar, Workspace, alt_keys, click, fit, hide_busy,
+                    show_busy)
 from ..data.openhumans_screen import QueryScreen
 
 _DB_GLYPH = {
@@ -79,6 +80,7 @@ class SamplesWorkspace(Workspace):
         self.shown: list[oh.OhFile] = []
         self.marked: set[int] = set()
         self._building = False
+        self._first_paint_done = False
 
     def _key_items(self) -> list[tuple[str, str, str | None]]:
         return [
@@ -116,15 +118,27 @@ class SamplesWorkspace(Workspace):
     def on_mount(self) -> None:
         self.query_one("#oh-list-box").border_title = "CATALOG"
         self.query_one("#oh-file-box").border_title = "FILE"
-        folder = self._folder()
-        if self.store.path("openhumans") is None:
-            self.store.set_path("openhumans", folder)
-            folder.mkdir(parents=True, exist_ok=True)
-        self.reload_catalog()
-        self.query_one("#oh-files", OptionList).focus()
+        # Spinner first frame, then catalog + OptionList (can be large).
+        show_busy(self.app, "Samples", "Loading Open Humans…")
+        self.call_after_refresh(self._first_paint)
+
+    def _first_paint(self) -> None:
+        if self._first_paint_done or not self.is_mounted:
+            hide_busy(self.app)
+            return
+        self._first_paint_done = True
+        try:
+            folder = self._folder()
+            if self.store.path("openhumans") is None:
+                self.store.set_path("openhumans", folder)
+                folder.mkdir(parents=True, exist_ok=True)
+            self.reload_catalog()
+            self.query_one("#oh-files", OptionList).focus()
+        finally:
+            hide_busy(self.app)
 
     def on_screen_resume(self) -> None:
-        if self.is_mounted:
+        if self.is_mounted and self._first_paint_done:
             self.refresh_status()
 
     def _folder(self) -> Path:

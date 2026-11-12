@@ -1,4 +1,4 @@
-"""F5 в DuckDB (schema ref): runs / f3 / run_blobs + кэш AADR-каталога + Y badges."""
+"""F5 в DuckDB (schema ref): runs / f3 / run_blobs + кэш AADR-каталога + Y badges + summaries."""
 
 from __future__ import annotations
 
@@ -14,6 +14,62 @@ from typing import Any
 from . import db
 
 KEEP = object()  # не трогать blob / people при save
+
+
+# ─── F5 SUMMARY briefs (linked to chat.REF_THREAD_ID) ───
+
+def load_summaries() -> dict[str, dict]:
+    """subject → {text, model, ts} for the GROUP card cache."""
+    rows = db.fetchall(
+        "SELECT subject, text, model, updated FROM ref.summaries"
+    )
+    out: dict[str, dict] = {}
+    for subject, text, model, updated in rows:
+        out[str(subject)] = {
+            "text": str(text or ""),
+            "model": str(model or ""),
+            "ts": str(updated or ""),
+        }
+    return out
+
+
+def load_summary(subject: str) -> dict | None:
+    row = db.fetchone(
+        "SELECT text, model, updated FROM ref.summaries WHERE subject = ?",
+        [subject],
+    )
+    if not row:
+        return None
+    text, model, updated = row
+    return {"text": str(text or ""), "model": str(model or ""), "ts": str(updated or "")}
+
+
+def save_summary(subject: str, *, text: str, model: str, thread_id: str,
+                 ts: str | None = None) -> None:
+    """Upsert brief and point it at the shared Reference chat thread."""
+    from .chat import REF_THREAD_ID, now as chat_now
+
+    tid = thread_id or REF_THREAD_ID
+    stamp = ts or chat_now()
+    with db.locked():
+        con = db.connect()
+        prev = con.execute(
+            "SELECT created FROM ref.summaries WHERE subject = ?", [subject]
+        ).fetchone()
+        created = str(prev[0]) if prev and prev[0] else stamp
+        con.execute(
+            """
+            INSERT INTO ref.summaries
+                (subject, thread_id, text, model, created, updated)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (subject) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                text = excluded.text,
+                model = excluded.model,
+                updated = excluded.updated
+            """,
+            [subject, tid, text, model or "", created, stamp],
+        )
 
 
 # ─── AADR catalog cache ───
@@ -224,22 +280,47 @@ def results_stamp(genome: Path, panel: str, kind: str = "",
     return int(row[0])
 
 
+def genome_run_stamps(
+    genome: Path, questionable: bool = False,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int, int, int]]:
+    """One DuckDB round-trip: aadr panel, kg panel, and layers stamps.
+
+    Returns ((aadr_chip, aadr_imp), (kg_chip, kg_imp),
+             (aadr_chip, aadr_imp, kg_chip, kg_imp)).
+    """
+    genome = Path(genome).expanduser().resolve()
+    rows = db.fetchall("""
+        SELECT panel, kind, CAST(epoch_ns(updated_at) AS BIGINT)
+        FROM ref.runs
+        WHERE genome_path = ?
+          AND kind IN ('', 'imp')
+          AND (
+            (panel = 'aadr' AND questionable = ?)
+            OR (panel = 'kg' AND questionable = FALSE)
+          )
+    """, [str(genome), bool(questionable)]) or []
+    got: dict[tuple[str, str], int] = {}
+    for panel, kind, ts in rows:
+        got[(str(panel), str(kind or ""))] = int(ts or 0)
+
+    def g(panel: str, kind: str) -> int:
+        return got.get((panel, kind), 0)
+
+    aadr_p = (g("aadr", ""), g("aadr", "imp"))
+    kg_p = (g("kg", ""), g("kg", "imp"))
+    return aadr_p, kg_p, (*aadr_p, *kg_p)
+
+
 def panel_stamps(genome: Path, panel: str, questionable: bool = False) -> tuple[int, int]:
     """(chip, imp) stamps для UI polling."""
-    return (
-        results_stamp(genome, panel, "", questionable),
-        results_stamp(genome, panel, "imp", questionable),
-    )
+    aadr_p, kg_p, _ = genome_run_stamps(genome, questionable)
+    return aadr_p if panel == "aadr" else kg_p
 
 
 def layer_stamps(genome: Path, questionable: bool = False) -> tuple[int, int, int, int]:
     """aadr chip, aadr imp, kg chip, kg imp."""
-    return (
-        results_stamp(genome, "aadr", "", questionable),
-        results_stamp(genome, "aadr", "imp", questionable),
-        results_stamp(genome, "kg", "", False),
-        results_stamp(genome, "kg", "imp", False),
-    )
+    _, _, layers = genome_run_stamps(genome, questionable)
+    return layers
 
 
 def load_bundle(genome: Path, panel: str, kind: str = "",

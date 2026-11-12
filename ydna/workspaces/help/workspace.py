@@ -7,7 +7,8 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Static
 
-from ..base import KeyBar, ModeBar, SelectableRichStatic, Workspace
+from ..base import (KeyBar, ModeBar, SelectableRichStatic, Workspace, hide_busy,
+                    show_busy)
 from .view import help_view
 
 
@@ -30,6 +31,11 @@ class HelpWorkspace(Workspace):
         Binding("end", "scroll_end", "End", show=False),
     ]
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._first_paint_done = False
+        self._help_w = 0
+
     def compose(self) -> ComposeResult:
         yield ModeBar(self.mode_key)
         with Vertical(id="help-box"):
@@ -41,12 +47,26 @@ class HelpWorkspace(Workspace):
 
     def on_mount(self) -> None:
         self.query_one("#help-box").border_title = "HELP · flow & screens"
-        self._paint_help()
-        self.query_one("#status", Static).update(
-            "Advanced-amateur guide · not an R/admixture2 manual · F1–F9 switch modes")
-        self.query_one("#help-scroll").focus()
+        # Spinner first frame; Markdown bake after paint (~100 ms).
+        show_busy(self.app, "Help", "Loading guide…")
+        self.call_after_refresh(self._first_paint)
+
+    def _first_paint(self) -> None:
+        if self._first_paint_done or not self.is_mounted:
+            hide_busy(self.app)
+            return
+        self._first_paint_done = True
+        try:
+            self._paint_help()
+            self.query_one("#status", Static).update(
+                "Advanced-amateur guide · not an R/admixture2 manual · F1–F9 switch modes")
+            self.query_one("#help-scroll").focus()
+        finally:
+            hide_busy(self.app)
 
     def on_resize(self) -> None:
+        if not self._first_paint_done:
+            return
         # Re-bake only when width jumps a lot (wrap changes); cheap Text otherwise.
         body = self.query_one("#help-body", SelectableRichStatic)
         w = body.content_size.width or body.size.width

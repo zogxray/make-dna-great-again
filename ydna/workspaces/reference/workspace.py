@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import webbrowser
 from pathlib import Path
+from typing import Any
 
 from rich.text import Text
 from textual import on
@@ -14,7 +15,8 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
-from ...core import aadr, admix, chat, fstats, genome_db, kg, ref_db
+# kg / admix / fstats pull numpy — import lazily on 1000G / Layers / score paths.
+from ...core import aadr, chat, genome_db, ref_db
 from ...core.jobs import JOBS
 from ...core.pgs import SUPERPOPS
 from ...core.store import Store
@@ -25,6 +27,21 @@ from .view import (CARD_TABS, FILTER_TABS, REGIONS, card, card_tab_bar, decide_k
                    epoch_bar, group_prompt, layers_view, ranks_of, region_bar, region_of,
                    score_filter_panel, seshat_layer_for_groups, sort_tuple, source_bar,
                    summary_prompt, tab_bar, tree_view)
+
+
+def _kg():
+    from ...core import kg
+    return kg
+
+
+def _admix():
+    from ...core import admix
+    return admix
+
+
+def _fstats():
+    from ...core import fstats
+    return fstats
 
 JOB = "aadr-f3"
 JOB_KG = "kg-f3"
@@ -108,8 +125,8 @@ class ReferenceWorkspace(Workspace):
         self.layer_stamp: tuple | None = None
         self.layer_aadr: aadr.Bundle | None = None
         self.layer_aadr_imp: aadr.Bundle | None = None
-        self.layer_kg: kg.Bundle | None = None
-        self.layer_kg_imp: kg.Bundle | None = None
+        self.layer_kg: Any = None
+        self.layer_kg_imp: Any = None
         self.seen_job: set[int] = {id(j) for k in JOBS_ALL if (j := JOBS.get(k))}
         self._play = None
         self._meta_by_name: dict[str, dict] = {}
@@ -137,6 +154,26 @@ class ReferenceWorkspace(Workspace):
         # name → {text, model, ts}; same lifetime as lore_cache (session)
         self.summary_cache: dict[str, dict] = {}
         self.summary_job_key: str | None = None  # subject currently generating
+        self._sel_blink: bool = True  # ◆ pulse on selected map point
+        # Ocean-legend focus: 'c:Culture' / 's:Seshat' → DEFCON rings on map.
+        self.map_focus: str | None = None
+        # Seshat anchors: recompute only when epoch / visible set changes.
+        self._seshat_cache_key: tuple | None = None
+        self._seshat_cache: list[dict] = []
+        # Last GROUPS rows — blink / highlight redraw without re-running visible().
+        self._last_vis: list[aadr.Group] | None = None
+        # LAYERS panel: skip tick repaint when stamps + job stages unchanged.
+        self._layers_shown_sig: tuple | None = None
+        # name → kept sample count (invalidated with catalog / Q).
+        self._gcount_cache: dict[str, int] = {}
+        self._gcount_q: bool | None = None
+        # gid → Group for people mode (built once per catalog; Q only filters).
+        self._people_by_gid: dict[str, aadr.Group] = {}
+        # Blink phases for map/Y: swap Text instead of redrawing scatter.
+        self._map_blink_key: tuple | None = None
+        self._map_blink_frames: dict[bool, Text] = {}
+        # Idle stamp poll: every N ticks (~2s); every tick while jobs active.
+        self._stamp_tick: int = 0
 
         self._load_gen = 0
 
@@ -178,9 +215,16 @@ class ReferenceWorkspace(Workspace):
         self.query_one("#card-box").border_title = "GROUP"
         self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
         self.query_one("#card-tabs", Static).update(card_tab_bar(self.card_tab))
+        # Shared F6 thread + persisted briefs (ref.summaries ↔ chat.ref-f5).
+        try:
+            chat.ensure_reference_thread()
+            self.summary_cache = ref_db.load_summaries()
+        except Exception:
+            self.summary_cache = {}
         self.reload()
         self.query_one("#groups", OptionList).focus()
         self.set_interval(0.5, self._tick)
+        self.set_interval(0.4, self._sel_blink_tick)
         self._play = self.set_interval(2.4, self._play_tick, pause=True)
 
     def on_screen_resume(self) -> None:
@@ -219,6 +263,12 @@ class ReferenceWorkspace(Workspace):
         self.last_fill_list_s = 0.0
         self.last_refresh_map_s = 0.0
         self.last_refresh_card_s = 0.0
+        self._last_vis = None
+        self._gcount_cache = {}
+        self._gcount_q = None
+        self._people_by_gid = {}
+        self._map_blink_key = None
+        self._map_blink_frames = {}
         self.loading_msg = msg
         self.genome = self._active()
         self._set_groups_title()
@@ -288,17 +338,20 @@ class ReferenceWorkspace(Workspace):
                 cat = aadr.load_catalog(folder)
             except (OSError, RuntimeError, ValueError) as exc:
                 aadr_problem = str(exc)
+        # Skip 1000G/numpy until user is on kg (G) — AADR map does not need it.
         kg_groups, kg_people, kg_problem = [], [], ""
-        try:
-            kg_groups = kg.groups(store)
-            kg_people = kg.person_groups(store)
-        except (OSError, RuntimeError, ValueError) as exc:
-            kg_problem = str(exc)
-        if not kg_groups and not kg_problem:
+        if source == "kg":
+            kg = _kg()
             try:
-                kg.ref_path(store)
-            except RuntimeError as exc:
+                kg_groups = kg.groups(store)
+                kg_people = kg.person_groups(store)
+            except (OSError, RuntimeError, ValueError) as exc:
                 kg_problem = str(exc)
+            if not kg_groups and not kg_problem:
+                try:
+                    kg.ref_path(store)
+                except RuntimeError as exc:
+                    kg_problem = str(exc)
         if genome:
             self.app.call_from_thread(self._load_progress, gen,
                                       f"Updating Y for {genome.name}…", 0.45)
@@ -353,6 +406,8 @@ class ReferenceWorkspace(Workspace):
             self.kg_groups = data["kg_groups"]
             self.kg_people_groups = data["kg_people_groups"]
             self.kg_problem = data["kg_problem"]
+            self._rebuild_gcount_cache()
+            self._rebuild_people_cache()
             busy_progress(self.app, "apply · layers…", frac=0.88, title="Reference",
                           subtitle="apply · layers…")
             t = time.perf_counter()
@@ -412,27 +467,47 @@ class ReferenceWorkspace(Workspace):
     def _panel_stamp(self, genome: Path | None, source: str, questionable: bool) -> tuple[int, int]:
         if not genome:
             return (0, 0)
-        panel = "aadr" if source == "aadr" else "kg"
         q = questionable if source == "aadr" else False
-        return ref_db.panel_stamps(genome, panel, q)
+        aadr_p, kg_p, _ = ref_db.genome_run_stamps(genome, q)
+        return aadr_p if source == "aadr" else kg_p
+
+    def _poll_db_stamps(self) -> None:
+        """Compare panel + layer stamps in one DuckDB round-trip; reload if changed."""
+        genome = self.genome
+        if not genome:
+            return
+        q = self.questionable if self.source == "aadr" else False
+        aadr_p, kg_p, layer_stamp = ref_db.genome_run_stamps(genome, q)
+        stamp = aadr_p if self.source == "aadr" else kg_p
+        if stamp != self.stamp or layer_stamp != self.layer_stamp:
+            self.load_results()
+            self._refresh_list_views(bars=False)
 
     def _load_layer_bundles(self, genome: Path | None, questionable: bool,
                             reuse: dict | None = None) -> None:
-        """Четыре бандла для LAYERS — один раз; tick только сверяет stamp."""
+        """Бандлы для LAYERS — AADR всегда; 1000G/numpy только на Layers или source=kg."""
         if not genome:
             self.layer_aadr = self.layer_aadr_imp = None
             self.layer_kg = self.layer_kg_imp = None
             self.layer_stamp = (0, 0, 0, 0)
             return
         stamp = ref_db.layer_stamps(genome, questionable)
-        if stamp == self.layer_stamp and self.layer_aadr is not None:
+        need_kg = self.tab == "layers" or self.source == "kg"
+        if (stamp == self.layer_stamp and self.layer_aadr is not None
+                and (not need_kg or self.layer_kg is not None)):
             return
         reuse = reuse or {}
-        self.layer_aadr = reuse.get("aadr") or aadr.load_bundle(genome, questionable)
-        self.layer_aadr_imp = (reuse.get("aadr_imp")
-                               or aadr.load_bundle(genome, questionable, kind="imp"))
-        self.layer_kg = reuse.get("kg") or kg.load_bundle(genome)
-        self.layer_kg_imp = reuse.get("kg_imp") or kg.load_bundle(genome, kind="imp")
+        if self.layer_aadr is None or stamp != self.layer_stamp:
+            self.layer_aadr = reuse.get("aadr") or aadr.load_bundle(genome, questionable)
+            self.layer_aadr_imp = (reuse.get("aadr_imp")
+                                   or aadr.load_bundle(genome, questionable, kind="imp"))
+        if need_kg:
+            kg = _kg()
+            if self.layer_kg is None or stamp != self.layer_stamp:
+                self.layer_kg = reuse.get("kg") or kg.load_bundle(genome)
+                self.layer_kg_imp = reuse.get("kg_imp") or kg.load_bundle(genome, kind="imp")
+        elif stamp != self.layer_stamp:
+            self.layer_kg = self.layer_kg_imp = None
         self.layer_stamp = stamp
 
     def _read_results(self, genome: Path | None, source: str, questionable: bool) -> dict:
@@ -453,6 +528,7 @@ class ReferenceWorkspace(Workspace):
             out["imputed"] = imp.groups
             out["reuse_layers"] = {"aadr": bundle, "aadr_imp": imp}
         else:
+            kg = _kg()
             bundle = kg.load_bundle(genome)
             out["results"], out["pca"] = bundle.groups, bundle.pca
             out["people"] = bundle.people
@@ -593,10 +669,48 @@ class ReferenceWorkspace(Workspace):
     def _kept(self, s: aadr.Sample) -> bool:
         return s.keep or (self.questionable and s.questionable)
 
+    def _rebuild_gcount_cache(self) -> None:
+        """One pass over the catalog: kept samples per group for current Q flag."""
+        self._gcount_cache = {}
+        self._gcount_q = self.questionable
+        if not self.cat:
+            return
+        samples = self.cat.samples
+        q = self.questionable
+        for name, g in self.cat.groups.items():
+            if not g.samples:
+                self._gcount_cache[name] = g.n
+                continue
+            n = 0
+            for i in g.samples:
+                s = samples[i]
+                if s.keep or (q and s.questionable):
+                    n += 1
+            self._gcount_cache[name] = n
+
+    def _rebuild_people_cache(self) -> None:
+        """gid → as_group(sample); once per catalog (Q only filters later)."""
+        self._people_by_gid = {}
+        if not self.cat:
+            return
+        self._people_by_gid = {
+            s.gid: aadr.as_group(s) for s in self.cat.samples
+        }
+
+    def _person_group(self, s: aadr.Sample) -> aadr.Group:
+        g = self._people_by_gid.get(s.gid)
+        if g is not None:
+            return g
+        g = aadr.as_group(s)
+        self._people_by_gid[s.gid] = g
+        return g
+
     def _gcount(self, g: aadr.Group) -> int:
         if not self.cat or not g.samples:
             return g.n
-        return sum(1 for i in g.samples if self._kept(self.cat.samples[i]))
+        if self._gcount_q != self.questionable or not self._gcount_cache:
+            self._rebuild_gcount_cache()
+        return self._gcount_cache.get(g.name, g.n)
 
     def _scores(self) -> dict[str, aadr.F3]:
         return self.people if self.people_mode else self.results
@@ -622,8 +736,13 @@ class ReferenceWorkspace(Workspace):
         if not self.cat:
             return None
         if self.people_mode:
+            g = self._people_by_gid.get(name)
+            if g is not None:
+                return g
             i = self.cat.by_gid.get(name)
-            return aadr.as_group(self.cat.samples[i]) if i is not None else None
+            if i is None:
+                return None
+            return self._person_group(self.cat.samples[i])
         return self.cat.groups.get(name)
 
     def _passes_score_filter(self, name: str, scores: dict[str, aadr.F3]) -> bool:
@@ -697,10 +816,12 @@ class ReferenceWorkspace(Workspace):
         scores = self._scores()
         rows: list[aadr.Group] = []
         if self.people_mode:
+            if not self._people_by_gid:
+                self._rebuild_people_cache()
             for s in self.cat.samples:
                 if not self._kept(s) or s.group == self.cat.outgroup:
                     continue
-                g = aadr.as_group(s)
+                g = self._person_group(s)
                 if self.epoch != "all" and g.epoch != self.epoch:
                     continue
                 if not self._in_region(g):
@@ -728,37 +849,6 @@ class ReferenceWorkspace(Workspace):
         if (self.epoch == "all" and self.area == "all" and not self.y_only
                 and len(rows) > 250):
             rows = self._cap_rows(rows, scores)
-        return rows
-
-    def _y_map_groups(self) -> list[aadr.Group]:
-        if not self.cat:
-            return []
-        hits = self.hits_people if self.people_mode else self.hits
-        rows: list[aadr.Group] = []
-        scores = self._scores()
-        if self.people_mode:
-            for s in self.cat.samples:
-                if not self._kept(s) or s.gid not in hits:
-                    continue
-                g = aadr.as_group(s)
-                if self.epoch != "all" and g.epoch != self.epoch:
-                    continue
-                if not self._in_region(g):
-                    continue
-                if not self._passes_score_filter(s.gid, scores):
-                    continue
-                rows.append(g)
-        else:
-            for g in self.cat.groups.values():
-                if g.name not in hits or self._gcount(g) <= 0:
-                    continue
-                if self.epoch != "all" and g.epoch != self.epoch:
-                    continue
-                if not self._in_region(g):
-                    continue
-                if not self._passes_score_filter(g.name, scores):
-                    continue
-                rows.append(g)
         return rows
 
     def _cap_rows(self, rows: list[aadr.Group], scores: dict[str, aadr.F3]) -> list[aadr.Group]:
@@ -811,10 +901,54 @@ class ReferenceWorkspace(Workspace):
                          "place": pl, "ok_total": ok_total, "outside_head": head})
         return meta
 
-    def fill_list(self) -> None:
+    def _sel_blink_tick(self) -> None:
+        if self.loading_msg or self.tab not in ("map", "y"):
+            return
+        if not self.current:
+            return
+        self._sel_blink = not self._sel_blink
+        cached = self._map_blink_frames.get(self._sel_blink)
+        key = self._map_blink_key
+        if cached is not None and key is not None:
+            # key: (tab, source, epoch, world, people, focus, sel, cols, rows, …)
+            box = self.query_one("#map-box")
+            inner = self.query_one("#map-scroll")
+            w = inner.size.width or box.size.width
+            h = inner.size.height or box.size.height
+            cols = max(40, (w or 80) - 6)
+            rows_n = max(12, (h or 24) - 4)
+            sel = self.current.name if self.current else None
+            if (key[0] == self.tab and key[7] == cols and key[8] == rows_n
+                    and key[6] == sel):
+                self.query_one("#map", Static).update(cached)
+                return
+        # First off-phase (or size/selection change): draw once and keep the frame.
+        self.refresh_map(vis=self._last_vis)
+
+    def _map_blink_content_key(
+        self, *, cols: int, rows_n: int, title: str, sel: str | None,
+        vis: list[aadr.Group],
+    ) -> tuple:
+        return (
+            self.tab, self.source, self.epoch, self.world, self.people_mode,
+            self.map_focus, sel, cols, rows_n, title,
+            tuple(g.name for g in vis),
+            id(self._scores()), id(self._ranks()),
+        )
+
+    def _store_map_blink_frame(self, key: tuple, text: Text) -> None:
+        if key != self._map_blink_key:
+            self._map_blink_key = key
+            self._map_blink_frames = {}
+        self._map_blink_frames[self._sel_blink] = text
+
+    def fill_list(self, rows: list[aadr.Group] | None = None,
+                  *, update_filter: bool = True) -> list[aadr.Group]:
         ol = self.query_one("#groups", OptionList)
         keep = self.current.name if self.current else None
-        rows = self.visible()
+        if rows is None:
+            rows = self.visible()
+        self._last_vis = rows
         ranks = self._ranks()
         meta = self._list_meta(rows)
         self._meta_by_name = {m["g"].name: m for m in meta}
@@ -838,7 +972,35 @@ class ReferenceWorkspace(Workspace):
             bits.append("Q")
         self.query_one("#groups-box").border_subtitle = " · ".join(bits)
         self._set_groups_title()
+        if update_filter:
+            self.refresh_score_filter(shown=len(rows))
+        return rows
+
+    def _refresh_bars(self) -> None:
+        """Source / epoch / region / tab chrome (no list or map)."""
+        self.query_one("#source", Static).update(source_bar(self.source))
+        self.query_one("#epochs", Static).update(
+            epoch_bar(self.epoch, self.present_epochs(), self.playing, self._epoch_labels()))
+        self.query_one("#regions", Static).update(
+            region_bar(self.area, self.present_regions()))
+        self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
+        title = {"map": "MAP", "y": "Y", "tree": "TREE", "layers": "LAYERS"}.get(self.tab, "MAP")
+        self.query_one("#map-box").border_title = title
+
+    def _refresh_list_views(self, *, bars: bool = False) -> None:
+        """One visible() → list + map + card + filter. Optional chrome bars."""
+        rows = self.visible()
+        self.fill_list(rows, update_filter=False)
+        if bars:
+            self._refresh_bars()
+        self.refresh_map(vis=rows)
+        self.refresh_card()
         self.refresh_score_filter(shown=len(rows))
+        self.update_status()
+
+    def _refresh_score_views(self) -> None:
+        """Score-filter axes changed — same as list refresh, chrome untouched."""
+        self._refresh_list_views(bars=False)
 
     def refresh_score_filter(self, shown: int | None = None) -> None:
         scores = self._scores()
@@ -884,14 +1046,21 @@ class ReferenceWorkspace(Workspace):
         opt = ol.get_option_at_index(ol.highlighted)
         if not opt.id:
             return None
+        # Prefer the row object already built for the list (no as_group / scan).
+        meta = self._meta_by_name.get(opt.id)
+        if meta is not None:
+            return meta["g"]
         if self.source == "kg":
             pool = self.kg_people_groups if self.people_mode else self.kg_groups
             return next((g for g in pool if g.name == opt.id), None)
         if not self.cat:
             return None
         if self.people_mode:
+            g = self._people_by_gid.get(opt.id)
+            if g is not None:
+                return g
             i = self.cat.by_gid.get(opt.id)
-            return aadr.as_group(self.cat.samples[i]) if i is not None else None
+            return self._person_group(self.cat.samples[i]) if i is not None else None
         return self.cat.groups.get(opt.id)
 
     def present_epochs(self) -> list[str]:
@@ -921,21 +1090,15 @@ class ReferenceWorkspace(Workspace):
         return dict(SUPERPOPS) if self.source == "kg" else aadr.EPOCH_LABEL
 
     def refresh_all(self) -> None:
-        src = source_bar(self.source)
-        self.query_one("#source", Static).update(src)
-        self.query_one("#epochs", Static).update(
-            epoch_bar(self.epoch, self.present_epochs(), self.playing, self._epoch_labels()))
-        self.query_one("#regions", Static).update(
-            region_bar(self.area, self.present_regions()))
-        self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
-        title = {"map": "MAP", "y": "Y", "tree": "TREE", "layers": "LAYERS"}.get(self.tab, "MAP")
-        self.query_one("#map-box").border_title = title
-        self.refresh_map()
+        """Full chrome + map/card/filter. Prefer _refresh_list_views when the list changes."""
+        self._refresh_bars()
+        self.refresh_map(vis=self._last_vis)
         self.refresh_card()
-        self.refresh_score_filter()
+        shown = len(self._last_vis) if self._last_vis is not None else None
+        self.refresh_score_filter(shown=shown)
         self.update_status()
 
-    def refresh_map(self) -> None:
+    def refresh_map(self, vis: list[aadr.Group] | None = None) -> None:
         body = self.query_one("#map", Static)
         if self.loading_msg and self.tab != "layers":
             body.update(Text(self.loading_msg, style="#B04A4A"))
@@ -943,11 +1106,15 @@ class ReferenceWorkspace(Workspace):
         if self.problem and self.tab != "layers":
             body.update(Text(self.problem, style="#B04A4A"))
             return
-        vis = self.visible()
+        if vis is None:
+            vis = self._last_vis if self._last_vis is not None else self.visible()
+        self._last_vis = vis
         labels = self._epoch_labels()
         if self.tab == "y":
             self.query_one("#map-scroll").styles.overflow_y = "hidden"
             if self.source != "aadr":
+                self._map_blink_key = None
+                self._map_blink_frames = {}
                 body.update(Text("Y map is AADR-only. Switch to AADR with G.", style="#AEA5B8"))
                 return
             box = self.query_one("#map-box")
@@ -964,13 +1131,22 @@ class ReferenceWorkspace(Workspace):
                 title += " · people"
             if self.y_branch:
                 title += f" · {self.y_branch.tip}"
+            sel = self.current.name if self.current else None
+            key = self._map_blink_content_key(
+                cols=cols, rows_n=rows_n, title=title, sel=sel, vis=vis)
             hits = self.hits_people if self.people_mode else self.hits
-            body.update(draw_y_map(
-                self._y_map_groups(), self._scores(), self._ranks(), hits,
-                self.y_ours_other, self.current.name if self.current else None,
-                title, self.world, cols, rows_n))
+            # Same GROUPS rows as the list — draw_y_map drops non-hits / no coords.
+            text = draw_y_map(
+                vis, self._scores(), self._ranks(), hits,
+                self.y_ours_other, sel,
+                title, self.world, cols, rows_n,
+                selected_blink=self._sel_blink)
+            self._store_map_blink_frame(key, text)
+            body.update(text)
             return
         if self.tab == "tree":
+            self._map_blink_key = None
+            self._map_blink_frames = {}
             self.query_one("#map-scroll").styles.overflow_y = "auto"
             body.update(tree_view(
                 vis, self._scores(), self._ranks(),
@@ -980,12 +1156,14 @@ class ReferenceWorkspace(Workspace):
                 paint=self.paint))
             return
         if self.tab == "layers":
+            self._map_blink_key = None
+            self._map_blink_frames = {}
             self.query_one("#map-scroll").styles.overflow_y = "auto"
             self._load_layer_bundles(self.genome, self.questionable)
             aadr_b, aadr_imp = self.layer_aadr, self.layer_aadr_imp
             kg_b, kg_imp = self.layer_kg, self.layer_kg_imp
-            rows = admix.layer_state(self.store, self.genome, self.source,
-                                     aadr_b, kg_b, aadr_imp, kg_imp)
+            rows = _admix().layer_state(self.store, self.genome, self.source,
+                                        aadr_b, kg_b, aadr_imp, kg_imp)
             if self.source == "aadr":
                 chip = aadr_b.groups if aadr_b else {}
                 imp = aadr_imp.groups if aadr_imp else {}
@@ -993,6 +1171,7 @@ class ReferenceWorkspace(Workspace):
                 chip = kg_b.groups if kg_b else {}
                 imp = kg_imp.groups if kg_imp else {}
             body.update(layers_view(rows, chip, imp))
+            self._layers_shown_sig = self._layers_paint_sig()
             return
         box = self.query_one("#map-box")
         inner = self.query_one("#map-scroll")
@@ -1008,16 +1187,28 @@ class ReferenceWorkspace(Workspace):
             title = labels.get(self.epoch, self.epoch)
         if self.people_mode:
             title += " · people"
-        seshat = []
+        seshat: list[dict] = []
         if self.epoch != "all" and self.source == "aadr":
-            seshat = seshat_layer_for_groups(vis, epoch=self.epoch, store=self.store)
+            skey = (self.epoch, tuple(g.name for g in vis))
+            if skey != self._seshat_cache_key:
+                self._seshat_cache_key = skey
+                self._seshat_cache = seshat_layer_for_groups(
+                    vis, epoch=self.epoch, store=self.store)
+            seshat = self._seshat_cache
             if seshat:
                 title += f" · §{len(seshat)}"
-        body.update(draw_map(vis, self._scores(), self._ranks(),
-                             self.current.name if self.current else None, title,
-                             self.world, cols, rows_n,
-                             culture_labels=(self.epoch != "all"),
-                             seshat_anchors=seshat or None))
+        sel = self.current.name if self.current else None
+        key = self._map_blink_content_key(
+            cols=cols, rows_n=rows_n, title=title, sel=sel, vis=vis)
+        text = draw_map(vis, self._scores(), self._ranks(),
+                        sel, title,
+                        self.world, cols, rows_n,
+                        culture_labels=(self.epoch != "all"),
+                        seshat_anchors=seshat or None,
+                        selected_blink=self._sel_blink,
+                        map_focus=self.map_focus)
+        self._store_map_blink_frame(key, text)
+        body.update(text)
 
     def _card_subject(self) -> tuple[aadr.Group | None, aadr.Sample | None, str | None]:
         """Current GROUP/PERSON selection + cache key for SUMMARY."""
@@ -1042,12 +1233,14 @@ class ReferenceWorkspace(Workspace):
         info = self._meta_by_name.get(g.name) if g else None
         ranks = self._ranks()
         busy = bool(key and self.summary_job_key == key
-                    and (job := JOBS.get(JOB_SUMMARY)) and job.running)
+                    and (job := JOBS.get(JOB_SUMMARY)) and job.active)
         draft = ""
         model_hint = ""
         if busy and (job := JOBS.get(JOB_SUMMARY)):
             draft = job.draft or ""
-            model_hint = job.stage or ""
+            model_hint = chat.wait_line(job)
+        card_box = self.query_one("#card")
+        md_w = max(36, (card_box.size.width or 52) - 2)
         t = card(g, sample=sample,
                  cat=self.cat if self.source == "aadr" else None,
                  hit=self._hit_of(g.name) if g else None,
@@ -1065,8 +1258,9 @@ class ReferenceWorkspace(Workspace):
                  summary_busy=busy,
                  summary_draft=draft,
                  summary_model=model_hint,
+                 summary_width=md_w,
                  y_hits=self.hits_people)
-        self.query_one("#card", Static).update(t)
+        card_box.update(t)
 
     def update_status(self) -> None:
         if self.loading_msg:
@@ -1100,38 +1294,66 @@ class ReferenceWorkspace(Workspace):
             line += f"    GENOME: {self.genome.name}"
         else:
             line += "    GENOME: — (F1)"
-        running = [j for k in JOBS_ALL if (j := JOBS.get(k)) and j.running]
-        if running:
-            job = running[0]
-            line += f"    ⚙ {job.title}: {job.stage} · {job_line(job)}"
+        active = [j for k in JOBS_ALL if (j := JOBS.get(k)) and j.active]
+        if active:
+            job = active[0]
+            if job.key == JOB_SUMMARY or (job.slot or "") == JOB_SUMMARY:
+                detail = chat.wait_line(job)
+            else:
+                detail = f"{job.stage} · {job_line(job)}" if job.stage else job_line(job)
+            line += f"    ⚙ {job.title}: {detail}"
         self.query_one("#status", Static).update(line)
 
+    def _layers_paint_sig(self) -> tuple:
+        """LAYERS content identity — DB stamps + live job stages (not wall-clock)."""
+        job_bits: list[tuple] = []
+        for k in (JOB, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT):
+            j = JOBS.get(k)
+            if j and j.active:
+                job_bits.append((
+                    k, "active", j.stage or "",
+                    int(round((j.fraction or 0.0) * 100)),
+                ))
+            elif j:
+                job_bits.append((k, j.status, j.finished))
+        return (
+            self.source,
+            str(self.genome) if self.genome else None,
+            self.questionable,
+            self.layer_stamp,
+            tuple(job_bits),
+        )
+
     def _tick(self) -> None:
-        running = [j for k in JOBS_ALL if (j := JOBS.get(k)) and j.running]
-        if running or self.tab == "layers" or self.loading_msg:
+        active = [j for k in JOBS_ALL if (j := JOBS.get(k)) and j.active]
+        summary = JOBS.get(JOB_SUMMARY)
+        if active or self.loading_msg:
             self.update_status()
-            if self.tab == "layers" and not self.loading_msg:
+        # LAYERS: repaint only when stamps / job stages change (not every 0.5s).
+        if self.tab == "layers" and not self.loading_msg:
+            sig = self._layers_paint_sig()
+            if sig != self._layers_shown_sig:
                 self.refresh_map()
-            # Stream SUMMARY draft into the card while Gemini answers.
-            if self.card_tab == "summary" and JOBS.get(JOB_SUMMARY) and JOBS.get(JOB_SUMMARY).running:
-                self.refresh_card()
+        # Stream SUMMARY draft + live wait_line into the card while Gemini answers.
+        if self.card_tab == "summary" and summary and summary.active:
+            self.refresh_card()
         if self.genome and not self.loading_msg:
-            stamp = self._panel_stamp(self.genome, self.source, self.questionable)
-            layer_stamp = ref_db.layer_stamps(self.genome, self.questionable)
-            if stamp != self.stamp or layer_stamp != self.layer_stamp:
-                self.load_results()
-                self.fill_list()
-                self.refresh_all()
+            self._stamp_tick += 1
+            # ~2s idle; every 0.5s while a ref job is running (results land soon).
+            if active or self._stamp_tick % 4 == 0:
+                self._poll_db_stamps()
         for k in JOBS_ALL:
             job = JOBS.get(k)
-            if job and not job.running and id(job) not in self.seen_job:
+            if job and not job.active and id(job) not in self.seen_job:
                 self.seen_job.add(id(job))
                 if k == JOB_SUMMARY:
                     self._finish_summary_job(job)
                     continue
                 sev = {"done": "information", "failed": "error"}.get(job.status, "warning")
                 self.app.notify(f"{job.title}: {job.message}", severity=sev, timeout=8)
-                self.refresh_all()
+                # Job wrote DuckDB — pull stamps/results now, don't wait for idle poll.
+                self.load_results()
+                self._refresh_list_views(bars=True)
 
     def _play_tick(self) -> None:
         if self.playing:
@@ -1139,8 +1361,10 @@ class ReferenceWorkspace(Workspace):
 
     @on(OptionList.OptionHighlighted, "#groups")
     def _highlighted(self) -> None:
+        self._sel_blink = True
         self.refresh_card()
-        self.refresh_map()
+        # Same visible set — only selection glyph / card change.
+        self.refresh_map(vis=self._last_vis)
 
     def action_score_set(self, axis: str, value: float) -> None:
         """Click a band cell: floor (≥) or ceiling (≤) depending on axis."""
@@ -1158,8 +1382,7 @@ class ReferenceWorkspace(Workspace):
             self.score_bp_max = float(value)
         else:
             return
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_score_views()
 
     def _score_axis_values(self, axis: str) -> list[float]:
         """Sorted unique observed values for one filter axis (for edge/step)."""
@@ -1297,20 +1520,17 @@ class ReferenceWorkspace(Workspace):
             self.score_bp_max = None
         else:
             return
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_score_views()
 
     def action_score_y(self, mode: str) -> None:
         if mode not in ("all", "line", "same"):
             mode = "all"
         self.score_y = mode
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_score_views()
 
     def action_score_coords(self, on: bool = True) -> None:
         self.score_coords = bool(on)
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_score_views()
 
     def action_filter_tab(self, key: str) -> None:
         if key not in FILTER_TABS or key == self.filter_tab:
@@ -1320,20 +1540,21 @@ class ReferenceWorkspace(Workspace):
 
     def action_epoch(self, key: str) -> None:
         self.epoch = key
+        self.map_focus = None
+        self._seshat_cache_key = None
+        self._seshat_cache = []
         if key == "all":
             self.playing = False
             if self._play:
                 self._play.pause()
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_list_views(bars=True)
 
     def action_region(self, key: str) -> None:
         keys = ["all", *self.present_regions()]
         if key not in keys:
             key = "all"
         self.area = key
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_list_views(bars=True)
 
     def action_region_next(self) -> None:
         keys = ["all", *self.present_regions()]
@@ -1360,25 +1581,29 @@ class ReferenceWorkspace(Workspace):
 
     def action_toggle_play(self) -> None:
         self.playing = not self.playing
+        need_list = False
         if self.playing:
             if self.epoch == "all":
                 keys = self.present_epochs()
                 if keys:
                     self.epoch = keys[0]
-                    self.fill_list()
+                    need_list = True
             if self._play:
                 self._play.resume()
         elif self._play:
             self._play.pause()
-        self.refresh_all()
+        if need_list:
+            self._refresh_list_views(bars=True)
+        else:
+            self._refresh_bars()
+            self.update_status()
 
     def action_toggle_y(self) -> None:
         if self.source != "aadr":
             self.app.notify("Y line is AADR-only", timeout=4)
             return
         self.y_only = not self.y_only
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_list_views(bars=False)
         if self.y_only and self.y_branch:
             off = sum(1 for h in self.hits.values() if h.relation == "other")
             self.app.notify(f"Y branch {self.y_branch.tip} · {off} other Y still listed")
@@ -1387,8 +1612,8 @@ class ReferenceWorkspace(Workspace):
         if self.source == "kg" and not self.kg_people_groups:
             self.app.notify("1000G people appear after an f3 scan", timeout=4)
         self.people_mode = not self.people_mode
-        self.fill_list()
-        self.refresh_all()
+        # Region set can change in KG people mode.
+        self._refresh_list_views(bars=True)
 
     def action_toggle_quest(self) -> None:
         if self.source != "aadr":
@@ -1396,8 +1621,7 @@ class ReferenceWorkspace(Workspace):
             return
         self.questionable = not self.questionable
         self.load_results()
-        self.fill_list()
-        self.refresh_all()
+        self._refresh_list_views(bars=True)
         if self.questionable and not self.results:
             self.app.notify("Questionable on — press F to rescan including them", timeout=6)
 
@@ -1420,7 +1644,7 @@ class ReferenceWorkspace(Workspace):
                 self.app.notify("1000G f3 is already running (C cancels it)", severity="warning")
                 return
             JOBS.start(JOB_KG, f"1000G · outgroup-f3 (YRI) · {gp.name}",
-                       lambda j: kg.scan_f3(store, gp, j, loaded))
+                       lambda j: _kg().scan_f3(store, gp, j, loaded))
             self.update_status()
             return
         if self.loading_msg:
@@ -1437,14 +1661,17 @@ class ReferenceWorkspace(Workspace):
             return
         q = self.questionable
         JOBS.start(JOB, f"AADR · outgroup-f3 · {gp.name}",
-                   lambda j, q=q: fstats.scan_f3(store, gp, j, loaded, q))
+                   lambda j, q=q: _fstats().scan_f3(store, gp, j, loaded, q))
         self.update_status()
 
     def action_cancel(self) -> None:
         stopped = 0
         for k in JOBS_ALL:
             job = JOBS.get(k)
-            if job and job.running:
+            # paused also holds the slot (JOBS.start checks .active).
+            if job and job.active:
+                if k == JOB_SUMMARY:
+                    chat.abort_send(job)
                 job.cancel()
                 stopped += 1
         if stopped:
@@ -1494,14 +1721,22 @@ class ReferenceWorkspace(Workspace):
         except Exception as exc:  # noqa: BLE001
             self.app.notify(f"Could not open DOI: {exc}", severity="error")
 
+    def _wait_summary_slot(self, timeout: float = 2.5) -> bool:
+        """After cancel, wait until ref-summary is free (paused/running → cancelled)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = JOBS.get(JOB_SUMMARY)
+            if not job or not job.active:
+                return True
+            time.sleep(0.05)
+        job = JOBS.get(JOB_SUMMARY)
+        return not (job and job.active)
+
     def action_ask_summary(self, refresh: bool = False) -> None:
         """SUMMARY tab: ask Chat model for a scientific brief grounded in ANNO."""
         g, sample, key = self._card_subject()
         if g is None or not key:
             self.app.notify("Select a group first", severity="warning")
-            return
-        if (job := JOBS.get(JOB_SUMMARY)) and job.running:
-            self.app.notify("Summary already running · C to cancel", severity="warning")
             return
         if not chat.api_key(self.store):
             self.app.notify("Set the Gemini API key in F2 (Google Gemini · P)",
@@ -1511,6 +1746,13 @@ class ReferenceWorkspace(Workspace):
             self.card_tab = "summary"
             self.refresh_card()
             return
+        # Paused jobs still occupy the slot (.active); replace with the new ask.
+        if (old := JOBS.get(JOB_SUMMARY)) and old.active:
+            old.cancel()
+            if not self._wait_summary_slot():
+                self.app.notify("Summary still stopping · C / try again",
+                                severity="warning")
+                return
         keep: list[aadr.Sample] = []
         if self.cat and self.source == "aadr":
             keep = [s for s in (self.cat.samples[i] for i in g.samples)
@@ -1521,18 +1763,23 @@ class ReferenceWorkspace(Workspace):
         subject = key
 
         def work(job) -> str:
-            t = chat.new_thread()
-            t.title = title
-            t.messages.append(chat.Message("user", prompt))
+            # One shared chat for all F5 asks; fresh Gemini turn (no prior group context).
+            t = chat.ensure_reference_thread()
+            # Label the turn in F6 history.
+            headed = f"[F5 · {subject}]\n\n{prompt}"
+            t.messages.append(chat.Message("user", headed))
             chat.save(t)
-            chat.send(store, t, job)
-            # Prefer the model reply on the thread (send also streams into job.draft).
+            chat.send(store, t, job, continue_chat=False)
             text = next((m.text for m in reversed(t.messages) if m.role == "model"), "")
             return (text or job.draft or "").strip() or "(empty reply)"
 
         self.summary_job_key = subject
         self.card_tab = "summary"
-        JOBS.start(JOB_SUMMARY, title, work)
+        try:
+            JOBS.start(JOB_SUMMARY, title, work)
+        except RuntimeError as exc:
+            self.app.notify(str(exc), severity="warning")
+            return
         self.refresh_card()
         self.update_status()
 
@@ -1548,11 +1795,21 @@ class ReferenceWorkspace(Workspace):
             if text in ("done",):
                 text = (job.draft or "").strip()
             model = chat.model_label(self.store)
-            self.summary_cache[key] = {
+            ts = chat.now()
+            entry = {
                 "text": text or "(empty reply)",
                 "model": model,
-                "ts": chat.now(),
+                "ts": ts,
             }
+            self.summary_cache[key] = entry
+            try:
+                ref_db.save_summary(
+                    key, text=entry["text"], model=model,
+                    thread_id=chat.REF_THREAD_ID, ts=ts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.app.notify(f"Summary saved in memory only: {exc}",
+                                severity="warning", timeout=8)
             self.app.notify(f"Summary · {key}", severity="information", timeout=6)
         elif job.status == "failed":
             self.app.notify(f"Summary failed: {job.message}", severity="error", timeout=10)
@@ -1577,30 +1834,38 @@ class ReferenceWorkspace(Workspace):
                 self.app.notify("smartpca is already running", severity="warning")
                 return
             JOBS.start(JOB_PCA, f"AADR · smartpca · {gp.name}",
-                       lambda j, q=q: admix.run_smartpca(store, gp, j, loaded, q))
+                       lambda j, q=q: _admix().run_smartpca(store, gp, j, loaded, q))
         elif kind == "qpadm":
             if (job := JOBS.get(JOB_QPADM)) and job.running:
                 self.app.notify("qpAdm is already running", severity="warning")
                 return
             JOBS.start(JOB_QPADM, f"AADR · qpAdm · {gp.name}",
-                       lambda j, q=q: admix.run_qpadm(store, gp, j, loaded, q))
+                       lambda j, q=q: _admix().run_qpadm(store, gp, j, loaded, q))
         elif kind == "impute":
             if (job := JOBS.get(JOB_IMPUTE)) and job.running:
                 self.app.notify("imputation is already running", severity="warning")
                 return
             JOBS.start(JOB_IMPUTE, f"Beagle · impute · {gp.name}",
-                       lambda j, q=q: admix.run_impute(store, gp, j, loaded, q))
+                       lambda j, q=q: _admix().run_impute(store, gp, j, loaded, q))
         elif kind == "paint":
             if (job := JOBS.get(JOB_PAINT)) and job.running:
                 self.app.notify("ChromoPainter is already running", severity="warning")
                 return
             JOBS.start(JOB_PAINT, f"1000G · ChromoPainter · {gp.name}",
-                       lambda j: admix.run_paint_job(store, gp, j, loaded))
+                       lambda j: _admix().run_paint_job(store, gp, j, loaded))
         else:
             self.app.notify(f"Unknown layer {kind}", severity="warning")
             return
         self.tab = "layers"
         self.refresh_all()
+
+    def action_map_focus(self, key: str) -> None:
+        """Toggle DEFCON radar for an ocean-legend culture / Seshat row."""
+        key = (key or "").strip()
+        if not key:
+            return
+        self.map_focus = None if self.map_focus == key else key
+        self.refresh_map()
 
     def action_select(self, name: str) -> None:
         ol = self.query_one("#groups", OptionList)

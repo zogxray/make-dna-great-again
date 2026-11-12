@@ -15,7 +15,7 @@ SCHEMA_VERSION = 6  # chat.threads.messages_json (avoid ART fatal on chat.messag
 GENOME_SCHEMA_VERSION = 3  # + genome.y_links (F1 YLink cache)
 DATA_SCHEMA_VERSION = 2  # + data.openhumans_files (OH catalog / samples)
 PGS_SCHEMA_VERSION = 1
-REF_SCHEMA_VERSION = 4  # + ref.y_badges (F5 Y hits without haplotree)
+REF_SCHEMA_VERSION = 5  # + ref.summaries (F5 SUMMARY ↔ chat.threads)
 TREE_SCHEMA_VERSION = 2  # + tree.index_blobs (haplotree / discover caches)
 _DB_NAME = "ydna.duckdb"
 
@@ -545,6 +545,17 @@ def _ensure_ref_schema(con) -> None:
             hits_people     JSON NOT NULL,
             y_ours_other    JSON NOT NULL,
             updated_at      TIMESTAMP
+        )
+    """)
+    # F5 SUMMARY briefs: one shared chat.threads row (chat.REF_THREAD_ID).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ref.summaries (
+            subject         VARCHAR PRIMARY KEY,
+            thread_id       VARCHAR NOT NULL,
+            text            VARCHAR NOT NULL,
+            model           VARCHAR NOT NULL DEFAULT '',
+            created         VARCHAR NOT NULL,
+            updated         VARCHAR NOT NULL
         )
     """)
     # PK (run_id, scope, name) хватает; secondary ART + DELETE run_id ломал DuckDB.

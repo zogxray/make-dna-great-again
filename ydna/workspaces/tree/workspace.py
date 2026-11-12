@@ -127,6 +127,9 @@ class TreeWorkspace(Workspace):
         self.our_i: int = 0                  # активный кандидат Our Y при ничьей
         self._fetch_names: list[str] = []
         self._fetch_seen: set[int] = set()
+        # Inspector re-paint during fetch only when stage changes (status carries %).
+        self._fetch_paint_sig: str | None = None
+        self._insp_timer = None  # debounce ↑↓ inspector (hydrate + Migration Map)
 
     @property
     def view(self) -> BranchView:
@@ -618,9 +621,26 @@ class TreeWorkspace(Workspace):
     # — события дерева —
     @on(BranchView.Highlighted)
     def _highlighted(self, event: BranchView.Highlighted) -> None:
-        if event.name != self.current:
-            self.current = event.name
-            self.refresh_inspector()
+        if event.name == self.current:
+            return
+        self.current = event.name
+        # Status updates immediately; heavy inspector waits until arrows settle.
+        self.update_status()
+        self._schedule_inspector()
+
+    def _schedule_inspector(self) -> None:
+        if self._insp_timer is not None:
+            self._insp_timer.stop()
+        self._insp_timer = self.set_timer(0.08, self._flush_inspector)
+
+    def _flush_inspector(self) -> None:
+        self._insp_timer = None
+        self.refresh_inspector()
+
+    def _cancel_inspector_timer(self) -> None:
+        if self._insp_timer is not None:
+            self._insp_timer.stop()
+            self._insp_timer = None
 
     @on(BranchView.Changed)
     def _changed(self) -> None:
@@ -628,6 +648,8 @@ class TreeWorkspace(Workspace):
 
     @on(BranchView.Selected)
     def _selected(self) -> None:
+        self._cancel_inspector_timer()
+        self.refresh_inspector(keep_scroll=True)
         self.query_one("#inspector-scroll").focus()
 
     def _keybar_items(self) -> list[tuple[str, str, str | None]]:
@@ -666,6 +688,7 @@ class TreeWorkspace(Workspace):
     def refresh_inspector(self, *, keep_scroll: bool = False) -> None:
         if not self.current or not self.ctx:
             return
+        self._cancel_inspector_timer()
         # Under Our Y BusyModal the cursor often sits on a root; Discover
         # subtree scans there are invisible and very large — skip until linked.
         if self.branch_busy:
@@ -762,6 +785,8 @@ class TreeWorkspace(Workspace):
         if self.current and self.ctx:
             self.query_one("#inspector", Static).update(
                 self.ctx.render(self.current, self.section))
+        job2 = JOBS.get(FETCH_JOB)
+        self._fetch_paint_sig = (job2.stage or "") if job2 else ""
         self.update_status()
 
     def action_fetch_node(self) -> None:
@@ -828,21 +853,27 @@ class TreeWorkspace(Workspace):
         job = JOBS.get(FETCH_JOB)
         if self._fetch_names and job and job.running:
             self._sync_fetch_ctx()
-            if self.current and self.ctx:
-                self.query_one("#inspector", Static).update(
-                    self.ctx.render(self.current, self.section))
-            self.update_keybar()
+            # Live % stays in the status line. Full inspector (Migration Map etc.)
+            # only when Discover stage text changes — not every 0.5s progress tick.
+            stage = job.stage or ""
+            if stage != self._fetch_paint_sig:
+                self._fetch_paint_sig = stage
+                if self.current and self.ctx:
+                    self.query_one("#inspector", Static).update(
+                        self.ctx.render(self.current, self.section))
             self.update_status()
             return
         if not self._fetch_names:
             if self.ctx and self.ctx.fetch:
                 self.ctx.fetch = None
+                self._fetch_paint_sig = None
                 self.update_keybar()
                 if self.current:
                     self.query_one("#inspector", Static).update(
                         self.ctx.render(self.current, self.section))
             return
         # Имена есть, джоба уже не running — завершить или снять залипание.
+        self._fetch_paint_sig = None
         if job is None or id(job) in self._fetch_seen:
             self._fetch_names = []
             self._sync_fetch_ctx()

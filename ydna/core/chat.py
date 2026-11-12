@@ -19,6 +19,15 @@ GEN_CFG = {"max_output_tokens": 65536, "thinking_level": "low"}
 SETTING_MODEL = "gemini_model"
 # 3.8-flash на free-tier без Search ок, но медленный; 2.5 + Search — лучший дефолт.
 DEFAULT_MODEL = "models/gemini-2.5-flash"
+# Network: without these, a stalled SSE blocks forever (no progress, C useless).
+CONNECT_S = 15.0
+READ_IDLE_S = 90.0          # no bytes from the wire → fail
+WRITE_S = 60.0
+WALL_S = 600.0              # whole Interactions call ceiling
+WALL_MS = int(WALL_S * 1000)
+# One shared F6 thread for all F5 SUMMARY asks (ref.summaries.thread_id → this id).
+REF_THREAD_ID = "ref-f5"
+REF_THREAD_TITLE = "Reference · F5"
 _SKIP = ("image", "embedding", "banana", "omni", "antigravity", "deep-research",
          "tts", "veo", "aqa", "robotics", "native-audio", "live")
 _models_cache: tuple[float, list["ChatModel"]] | None = None
@@ -196,6 +205,9 @@ def save_notes(thread: Thread) -> None:
 def delete(tid: str) -> None:
     from . import db
 
+    if tid == REF_THREAD_ID:
+        raise RuntimeError("Reference · F5 chat is shared — clear messages in NOTES, do not delete")
+
     def _once() -> None:
         with db.locked():
             con = db.connect()
@@ -215,6 +227,24 @@ def new_thread() -> Thread:
     t = Thread(id=uuid.uuid4().hex[:10])
     save(t)
     return t
+
+
+def ensure_reference_thread() -> Thread:
+    """Load or create the single Reference SUMMARY chat."""
+    t = load(REF_THREAD_ID)
+    if t is not None:
+        if t.title != REF_THREAD_TITLE:
+            t.title = REF_THREAD_TITLE
+            save(t)
+        return t
+    t = Thread(id=REF_THREAD_ID, title=REF_THREAD_TITLE)
+    save(t)
+    return t
+
+
+def is_reference_thread(tid: str | None) -> bool:
+    return bool(tid) and tid == REF_THREAD_ID
+
 
 def last_user_index(thread: Thread) -> int | None:
     for i in range(len(thread.messages) - 1, -1, -1):
@@ -274,11 +304,76 @@ def api_key(store: Store) -> str | None:
     return store.secret("gemini") or (os.environ.get("GEMINI_API_KEY") or "").strip() or None
 
 
+def _http_timeout():
+    """Per-hop timeout (google-genai 3.x ships httpx2, not httpx)."""
+    import httpx2
+    return httpx2.Timeout(
+        connect=CONNECT_S, read=READ_IDLE_S, write=WRITE_S, pool=CONNECT_S,
+    )
+
+
 def _client(key: str):
     """google-genai 3.x по умолчанию api_version=v1 — там нет Search и thinking; нужен v1beta."""
     from google import genai
     from google.genai import types
-    return genai.Client(api_key=key, http_options=types.HttpOptions(api_version="v1beta"))
+    return genai.Client(
+        api_key=key,
+        http_options=types.HttpOptions(
+            api_version="v1beta",
+            timeout=WALL_MS,
+            client_args={"timeout": _http_timeout()},
+        ),
+    )
+
+
+def wait_line(job: Job) -> str:
+    """Live status for UI ticks — elapsed grows even while the SSE is silent."""
+    elapsed = max(0, int(time.time() - (job.started or time.time())))
+    raw = (job.stage or "").strip()
+    # Worker may already append " · 12s"; strip so the UI owns the clock.
+    phase = re.sub(r" · \d+s$", "", raw).strip() or short_model(DEFAULT_MODEL)
+    n = len(job.draft or "")
+    if n:
+        return f"{phase} · {n:,} chars · {elapsed}s"
+    if elapsed < 3:
+        return f"{phase} · {elapsed}s"
+    if elapsed < 30:
+        return f"{phase} · {elapsed}s · first token…"
+    return f"{phase} · {elapsed}s · still waiting (Search/thinking can be slow)"
+
+
+def abort_send(job: Job | None) -> None:
+    """Unblock a hung send(): close stream/client so cancel is not stuck on SSE wait."""
+    if job is None:
+        return
+    stream = getattr(job, "_gemini_stream", None)
+    if stream is not None:
+        for name in ("close", "aclose", "cancel"):
+            fn = getattr(stream, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+                break
+        try:
+            delattr(job, "_gemini_stream")
+        except Exception:
+            pass
+    client = getattr(job, "_gemini_client", None)
+    if client is not None:
+        for name in ("close", "aclose"):
+            fn = getattr(client, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+                break
+        try:
+            delattr(job, "_gemini_client")
+        except Exception:
+            pass
 
 
 def _is_rate(exc: BaseException) -> bool:
@@ -288,11 +383,25 @@ def _is_rate(exc: BaseException) -> bool:
     return code == 429 or status == "RESOURCE_EXHAUSTED" or "429" in text[:80]
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    return (
+        "timeout" in name
+        or "timed out" in text
+        or "timeout" in text[:120]
+        or "deadline" in text[:120]
+    )
+
+
 def _friendly(exc: BaseException, model: str = "") -> str:
     code = getattr(exc, "code", None)
     status = str(getattr(exc, "status", "") or "").upper()
     msg = (getattr(exc, "message", None) or "").strip() or str(exc).strip()
     who = f" · {short_model(model)}" if model else ""
+    if _is_timeout(exc):
+        return (f"Gemini timed out{who} "
+                f"(idle {int(READ_IDLE_S)}s / wall {int(WALL_S)}s). Try again or M → another model.")
     if _is_rate(exc):
         tip = " Try M → gemini-2.5-flash (3.8 often hits free-tier quota)."
         bit = msg.split("For more information")[0].strip().rstrip(".")
@@ -476,8 +585,13 @@ def _output_text(interaction: object) -> str:
     return "\n".join(c for c in chunks if c).strip()
 
 
-def send(store: Store, thread: Thread, job: Job) -> str:
-    """Отправляет последний user-текст через Interactions API, как в примере Google."""
+def send(store: Store, thread: Thread, job: Job, *,
+         continue_chat: bool = True) -> str:
+    """Отправляет последний user-текст через Interactions API, как в примере Google.
+
+    continue_chat=False: do not pass previous_interaction_id (fresh ask; still
+    appends to the same thread for F6 history — used by F5 SUMMARY).
+    """
     key = api_key(store)
     if not key:
         raise RuntimeError("set the Gemini API key in F2 (Google Gemini · P)")
@@ -485,6 +599,7 @@ def send(store: Store, thread: Thread, job: Job) -> str:
         client = _client(key)
     except ImportError as exc:
         raise RuntimeError("pip install google-genai") from exc
+    job._gemini_client = client  # type: ignore[attr-defined]
     text = next((m.text for m in reversed(thread.messages) if m.role == "user"), "")
     if not text.strip():
         raise RuntimeError("empty message")
@@ -496,7 +611,14 @@ def send(store: Store, thread: Thread, job: Job) -> str:
         mid = api_model(saved)
     if saved != mid:
         store.set_setting(SETTING_MODEL, mid)
-    job.set_stage(short_model(mid))
+    label = short_model(mid)
+    t0 = time.time()
+
+    def _beat(note: str) -> None:
+        # Seconds are painted by wait_line() on the UI tick — keep stage as phase only.
+        job.stage = f"{label} · {note}"
+
+    _beat("connecting")
     job.check()
     gen = dict(GEN_CFG)
     name = short_model(mid).lower()
@@ -509,29 +631,49 @@ def send(store: Store, thread: Thread, job: Job) -> str:
         "model": mid,
         "input": text,
         "generation_config": gen,
+        "timeout": _http_timeout(),
     }
     tools = tools_for(mid)
     if tools:
         kw["tools"] = tools
-    prev = context_id(thread)
-    if prev:
-        kw["previous_interaction_id"] = prev
+    if continue_chat:
+        prev = context_id(thread)
+        if prev:
+            kw["previous_interaction_id"] = prev
     kw["stream"] = True
     job.draft = ""
     try:
+        _beat("waiting")
         stream = client.interactions.create(**kw)
+    except Cancelled:
+        abort_send(job)
+        raise
     except Exception as exc:
+        abort_send(job)
         raise RuntimeError(_friendly(exc, mid)) from exc
+    job._gemini_stream = stream  # type: ignore[attr-defined]
     chunks: list[str] = []
     iid: str | None = None
+    last_data = time.time()
     try:
         for event in stream:
             job.check()
+            now = time.time()
+            if now - t0 > WALL_S:
+                raise TimeoutError(
+                    f"wall clock {int(WALL_S)}s exceeded while waiting for Gemini"
+                )
+            if now - last_data > READ_IDLE_S and not chunks:
+                raise TimeoutError(
+                    f"no reply for {int(READ_IDLE_S)}s (still waiting for first token)"
+                )
             et = getattr(event, "event_type", None) or ""
             if et in ("interaction.created", "interaction.completed"):
+                last_data = now
                 inter = getattr(event, "interaction", None)
                 if inter is not None and getattr(inter, "id", None):
                     iid = str(inter.id)
+                _beat("created" if et.endswith("created") else "done")
                 if et == "interaction.completed" and not chunks and inter is not None:
                     fallback = _output_text(inter)
                     if fallback:
@@ -540,17 +682,26 @@ def send(store: Store, thread: Thread, job: Job) -> str:
             elif et == "step.delta":
                 delta = getattr(event, "delta", None)
                 if delta is None or (getattr(delta, "type", None) or "") != "text":
+                    _beat(et or "event")
                     continue
                 piece = getattr(delta, "text", None) or ""
                 if not piece:
+                    _beat("delta")
                     continue
+                last_data = now
                 chunks.append(piece)
                 job.draft = "".join(chunks)
-                job.stage = f"{short_model(mid)} · {len(job.draft):,} chars"
+                _beat(f"{len(job.draft):,} chars")
+            else:
+                # Search / thinking / unknown — keep stage alive so UI is not frozen.
+                _beat(et or "event")
     except Cancelled:
+        abort_send(job)
         raise
     except Exception as exc:
+        abort_send(job)
         raise RuntimeError(_friendly(exc, mid)) from exc
+    abort_send(job)
     job.check()
     out = "".join(chunks).strip() or "(empty reply)"
     job.draft = out

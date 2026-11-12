@@ -12,7 +12,7 @@ from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
-from ...core.chat import Thread
+from ...core.chat import REF_THREAD_ID, Thread
 from ...theme.styles import (BAD, BAD_BOLD, DIM, FAINT, HI, HI_BOLD, HI_REV, MUTED,
                              OK_BOLD, WARN, WARN_BOLD)
 from ..base import click, fit
@@ -35,12 +35,18 @@ def clear_md_cache() -> None:
 
 def chat_prompt(t: Thread) -> Text:
     out = Text()
-    out.append(fit(t.title or "New chat", LIST_W) + "\n", style="bold")
+    title = t.title or "New chat"
+    if t.id == REF_THREAD_ID:
+        out.append(fit(title, LIST_W) + "\n", style="bold #D4AD72")
+    else:
+        out.append(fit(title, LIST_W) + "\n", style="bold")
     if t.user_turns is not None:
         n = t.user_turns
     else:
         n = sum(1 for m in t.messages if m.role == "user")
     extra = " · notes" if t.notes.strip() else ""
+    if t.id == REF_THREAD_ID:
+        extra = " · F5" + extra
     out.append(f"  {n} turn{'s' if n != 1 else ''}{extra}\n", style=MUTED)
     out.append("  " + (t.updated.replace("T", " ")[5:16] if t.updated else ""), style=FAINT)
     return out

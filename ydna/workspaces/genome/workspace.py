@@ -70,12 +70,9 @@ class GenomeWorkspace(Workspace):
         self.phase: str | None = None          # "reading" | "linking" | None
         self.genome: Genome | None = None
         self.cache: dict[str, tuple[int, Genome]] = {}
-        self._read_config()
-        for p in extra or []:
-            p = Path(p).expanduser().resolve()
-            if p not in self.files:
-                self.files.append(p)
-            self.active = p
+        self._first_paint_done = False
+        # CLI --genome paths; DB list/hydrate runs in _first_paint under BusyModal.
+        self._extra = [Path(p).expanduser().resolve() for p in (extra or [])]
 
     # — список файлов (genome.files) —
     def _read_config(self) -> None:
@@ -86,14 +83,21 @@ class GenomeWorkspace(Workspace):
         self.files = [r["path"] for r in rows]
         self.active = next((r["path"] for r in rows if r["active"]), None)
         self.info = {}
-        self._hydrate_info_from_db()
+        self._hydrate_info_from_db(rows)
 
-    def _hydrate_info_from_db(self) -> None:
+    def _apply_extras(self) -> None:
+        for p in self._extra:
+            if p not in self.files:
+                self.files.append(p)
+            self.active = p
+
+    def _hydrate_info_from_db(self, rows: list[dict] | None = None) -> None:
         """Подтянуть snps/format/build_label из DuckDB."""
-        try:
-            rows = genome_db.list_files()
-        except Exception:
-            return
+        if rows is None:
+            try:
+                rows = genome_db.list_files()
+            except Exception:
+                return
         for row in rows:
             key = str(row["path"])
             label = None
@@ -201,18 +205,36 @@ class GenomeWorkspace(Workspace):
         self.query_one("#files-box").border_title = "FILES"
         self.query_one("#content-box").border_title = "CHROMOSOMES"
         self.query_one("#sum-box").border_title = "SUMMARY"
-        self.refresh_files()
-        self.query_one("#files", OptionList).focus()
-        if self.active and self.active.exists():
-            self.activate(self.active)
-        else:
-            self.active = None
-            try:
-                genome_db.set_active(None)
-            except Exception:
-                pass
-            self._show_onboarding()
-        self.update_status()
+        # Spinner first frame; DB list + warm activate after paint.
+        sub = self._extra[-1].name if self._extra else "Opening…"
+        show_busy(self.app, "Genome", sub)
+        self.call_after_refresh(self._first_paint)
+
+    def _first_paint(self) -> None:
+        if self._first_paint_done or not self.is_mounted:
+            hide_busy(self.app)
+            return
+        self._first_paint_done = True
+        try:
+            self._read_config()
+            self._apply_extras()
+            self.refresh_files()
+            self.query_one("#files", OptionList).focus()
+            if self.active and self.active.exists():
+                self.activate(self.active)
+            else:
+                self.active = None
+                try:
+                    genome_db.set_active(None)
+                except Exception:
+                    pass
+                self._show_onboarding()
+                self.update_status()
+        finally:
+            # activate() may keep BusyModal for reading/linking workers.
+            if self.phase in ("reading", "loading", "linking") or self.load_path:
+                return
+            hide_busy(self.app)
 
     def _show_onboarding(self) -> None:
         self.query_one("#content-box").border_subtitle = "O add a genotype file"

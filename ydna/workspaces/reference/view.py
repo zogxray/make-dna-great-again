@@ -5,6 +5,9 @@ from __future__ import annotations
 import math
 import re
 
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.text import Text
 
 from ...core.aadr import (EPOCH_LABEL, F3, Catalog, Group, Hit, ON_BRANCH, Sample,
@@ -31,6 +34,8 @@ LIST_W = 52
 REL_MARK = {"same": "●", "ancestor": "▲", "downstream": "▼", "other": "○"}
 REL_STYLE = {"same": "bold #53A94B", "ancestor": "#D4AD72",
              "downstream": "#B04A4A", "other": "#C3BCCC"}
+
+
 class _Doc:
     def __init__(self) -> None:
         self.t = Text()
@@ -423,6 +428,31 @@ ACCENT = "bold #D4AD72"
 MUTED = "#8A8294"
 BODY = "#C3BCCC"
 Y_RANK = {"same": 0, "ancestor": 1, "downstream": 2, "other": 3}
+_SUMMARY_MD_CACHE: dict[tuple[int, int], Text] = {}
+_SUMMARY_MD_CACHE_MAX = 32
+
+
+def _bake_md(body: str, *, width: int = CARD_W) -> Text:
+    """Parse SUMMARY Markdown once → styled Text (same approach as F6 chat)."""
+    text = (body or "").rstrip() or " "
+    key = (hash(text), max(36, width))
+    cached = _SUMMARY_MD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    console = Console(
+        width=max(36, width),
+        force_terminal=True,
+        color_system="truecolor",
+        highlight=False,
+        legacy_windows=False,
+    )
+    with console.capture() as cap:
+        console.print(Padding(Markdown(text), (0, 0, 0, 1)), end="")
+    out = Text.from_ansi(cap.get())
+    if len(_SUMMARY_MD_CACHE) >= _SUMMARY_MD_CACHE_MAX:
+        _SUMMARY_MD_CACHE.pop(next(iter(_SUMMARY_MD_CACHE)), None)
+    _SUMMARY_MD_CACHE[key] = out
+    return out
 
 
 def _filled(s: str | None) -> str:
@@ -1032,6 +1062,7 @@ def summary_prompt(g: Group, keep: list[Sample], *, sample: Sample | None = None
     subject = sample.gid if sample is not None else g.name
     lines = [
         "Write a scientific brief on this Allen Ancient DNA Resource (AADR) assemblage.",
+        "Reply in Markdown (## headings, bullet lists, **bold** for key terms).",
         "Use an academic tone. Structure the answer as:",
         "1) What this assemblage is (place, date, archaeological context).",
         "2) Key published studies that report or analyse these genomes — with specifics.",
@@ -1124,36 +1155,38 @@ def _summary_tab(d: Text, *,
                  cache: dict | None,
                  busy: bool,
                  draft: str = "",
-                 model_hint: str = "") -> None:
+                 model_hint: str = "",
+                 width: int = CARD_W) -> None:
+    w = max(36, width)
     if busy:
         d.append(" Generating summary…\n", style=ACCENT)
-        if model_hint:
-            d.append(f" {model_hint}\n", style=MUTED)
-        if draft:
+        d.append(f" {(model_hint or 'waiting for Gemini…')}\n", style=MUTED)
+        if not draft:
+            d.append(" First token can take 10–60s (Search / thinking).\n",
+                     style="#71697A")
+        else:
             d.append("\n")
-            for line in draft.splitlines()[:40]:
-                d.append(f" {line}\n", style=BODY)
+            d.append_text(_bake_md(draft, width=w))
         return
     if cache and (cache.get("text") or "").strip():
         model = cache.get("model") or "model"
         ts = (cache.get("ts") or "")[:10]
-        head = " · ".join(x for x in (model, ts, "from ANNO") if x)
+        head = " · ".join(x for x in (model, ts, "Markdown · from ANNO") if x)
         d.append(f" {head}\n", style=MUTED)
         d.append(" ")
         d.append(" Refresh ", style=click("screen.ask_summary(True)", "bold reverse #D4AD72"))
         d.append("\n\n", style=MUTED)
-        for line in str(cache.get("text") or "").splitlines():
-            d.append(f" {line}\n", style=BODY)
+        d.append_text(_bake_md(str(cache.get("text") or ""), width=w))
         return
     d.append(" No summary yet.\n\n", style=MUTED)
     d.append(" ")
     d.append(" Ask summary ", style=click("screen.ask_summary()", "bold reverse #D4AD72"))
-    d.append("  uses Chat model · scientific brief\n\n", style=MUTED)
+    d.append("  → shared F6 chat «Reference · F5»\n\n", style=MUTED)
     d.append(" Prompt sketch (what we send):\n", style="#8A8294")
     d.append("  · group + place/date/Y/mt from ANNO\n", style="#71697A")
     d.append("  · pubs + DOIs\n", style="#71697A")
     d.append("  · ask: what this assemblage is; key studies;\n", style="#71697A")
-    d.append("    what is new / contested — with details\n", style="#71697A")
+    d.append("    what is new / contested — Markdown reply\n", style="#71697A")
 
 
 def card(g: Group | None, *, sample: Sample | None = None,
@@ -1168,6 +1201,7 @@ def card(g: Group | None, *, sample: Sample | None = None,
          summary_busy: bool = False,
          summary_draft: str = "",
          summary_model: str = "",
+         summary_width: int = CARD_W,
          y_hits: dict[str, Hit] | None = None) -> Text:
     d = Text()
     if g is None:
@@ -1181,7 +1215,8 @@ def card(g: Group | None, *, sample: Sample | None = None,
                 if s.keep or (questionable and s.questionable)]
     if tab == "summary":
         _summary_tab(d, cache=summary, busy=summary_busy,
-                     draft=summary_draft, model_hint=summary_model)
+                     draft=summary_draft, model_hint=summary_model,
+                     width=summary_width)
         return d
     if tab == "catalog":
         if sample is not None:
@@ -1242,7 +1277,9 @@ def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float
              selected: str | None, title: str,
              world: bool, cols: int, rows: int,
              *, culture_labels: bool = True,
-             seshat_anchors: list[dict] | None = None) -> Text:
+             seshat_anchors: list[dict] | None = None,
+             selected_blink: bool = True,
+             map_focus: str | None = None) -> Text:
     doc = _Doc()
     doc.t = Text(no_wrap=True, overflow="crop")
     points = []
@@ -1268,8 +1305,9 @@ def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float
             "rank": float(p) if p is not None else -1.0,
         })
     scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows,
-                selected=selected, culture_labels=culture_labels,
-                anchors=seshat_anchors)
+                selected=selected, selected_blink=selected_blink,
+                culture_labels=culture_labels, anchors=seshat_anchors,
+                map_focus=map_focus)
     return doc.t
 
 
@@ -1311,7 +1349,8 @@ def seshat_layer_for_groups(groups: list[Group], *, epoch: str,
 
 def draw_y_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
                hits: dict[str, Hit], ours_other: set[str], selected: str | None,
-               title: str, world: bool, cols: int, rows: int) -> Text:
+               title: str, world: bool, cols: int, rows: int,
+               *, selected_blink: bool = True) -> Text:
     doc = _Doc()
     doc.t = Text(no_wrap=True, overflow="crop")
     points = []
@@ -1331,7 +1370,8 @@ def draw_y_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, flo
             continue
         points.append({"id": g.name, "lon": g.lon, "lat": g.lat, "color": color,
                        "glyph": glyph, "label": g.name.split("_")[0]})
-    scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows, selected=selected)
+    scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows,
+                selected=selected, selected_blink=selected_blink)
     return doc.t
 
 
