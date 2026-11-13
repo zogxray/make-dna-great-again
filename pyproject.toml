@@ -9,14 +9,17 @@ dependencies = [
     "google-genai>=1.0",
     "duckdb>=1.1",
     "pyarrow>=14",
+    "pillow>=10",
 ]
 
 [project.scripts]
 ydna = "ydna.__main__:main"
 mdga = "ydna.__main__:main"
+ydna-mcp = "ydna.mcp.server:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+mcp = ["mcp>=1.9,<2"]
 
 [build-system]
 requires = ["setuptools>=61"]

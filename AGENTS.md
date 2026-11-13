@@ -15,7 +15,8 @@ Local **Textual** TUI for one person’s genotype. CLI: `ydna` / `mdga` /
 |------|------|
 | `ydna/__main__.py` | Dispatcher: default → TUI; `ydna cli …` → headless |
 | `ydna/tui/` | Textual app shell + `--window` launch (`run.py`, `app.py`) |
-| `ydna/cli/` | Headless JSON/text (no Textual); `python -m ydna.cli` |
+| `ydna/cli/` | Headless JSON/text (no Textual); `ops.py` shared with MCP |
+| `ydna/mcp/` | stdio MCP (`python -m ydna.mcp`) — optional extra `[mcp]` |
 | `ydna/core/` | Domain: genome, DuckDB, sources, PGS, GWAS, chat/LLM, jobs |
 | `ydna/prompts/` | Future ask builders without Rich (empty placeholder) |
 | `ydna/workspaces/` | F1–F10 TUI modes only |
@@ -26,8 +27,8 @@ Local **Textual** TUI for one person’s genotype. CLI: `ydna` / `mdga` /
 | `tests/` | pytest |
 | `data/` | **Local only** — gitignored content; never commit kits/catalogs |
 
-**Layer rule:** `cli` / `prompts` → `core` only. `tui` / `workspaces` → `core`.  
-`core` must not import `tui`, `cli`, `workspaces`, or Textual.
+**Layer rule:** `cli` / `prompts` → `core` only. `mcp` → `cli.ops` (+ SDK).  
+`tui` / `workspaces` → `core`. `core` must not import `tui`, `cli`, `mcp`, `workspaces`, or Textual.
 
 App state: `~/.config/make-dna-great-again/` (DuckDB + lock).  
 Caches: `~/.cache/make-dna-great-again/` (GWAS match/index, etc.).
@@ -74,7 +75,9 @@ Useful env overrides:
 | Change | Start here |
 |--------|------------|
 | TUI flags / window launch | `ydna/__main__.py` → `ydna/tui/run.py`, `window_launch.py` |
-| Headless CLI | `ydna/cli/main.py` |
+| Headless CLI | `ydna/cli/` — `jsonio.py` envelope, `session.py` lock, `cmd_*.py` |
+| MCP tools | `ydna/mcp/server.py` → `cli.ops` only |
+| Agent search loop | `ydna/core/investigate.py` (`gwas.search` / `trait` / `pgs.search` / `genome.rs`) |
 | Paths, settings, secrets store | `ydna/core/store.py`, `sources_db.py` |
 | Downloads / F2 sources | `ydna/core/sources.py` |
 | Gemini client / models | `ydna/core/llm.py`, `chat.py` |
@@ -83,6 +86,14 @@ Useful env overrides:
 | Mode UI / keys | `ydna/workspaces/<mode>/` |
 | User-facing docs | `README.md` **and** `ydna/workspaces/help/view.py` |
 | Linux package | `packaging/*`, `.github/workflows/release-linux.yml` |
+
+**Investigation:** dual-tier tool loop — Flash plans **tool calls** → local
+gather → Argon Oracle → human Story MD (`ydna/core/investigate_brief.py`,
+`ydna/core/story_brief.py`). Tools span GWAS **and** Y/AADR/KG (`y_path`,
+`y_milestones`, `aadr_y_hits`, `modern_affinity` via `ydna/cli/lineage_session.py`
++ `ydna/core/tree_data.py`). Story uses Discover `image_url` + Wikimedia search
+cues (no HTML export). F7 **✶**/**◇** / `ydna cli investigate|story` / MCP;
+atoms also `ydna cli y|aadr|kg …`.
 
 ## Tests
 

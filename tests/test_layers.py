@@ -53,11 +53,26 @@ def test_cli_does_not_import_tui_or_workspaces():
     for path in CLI.rglob("*.py"):
         for mod in _imported_modules(path):
             top = mod.split(".")[0]
-            if top in {"tui", "workspaces", "textual", "rich"} or mod.startswith(
-                ("ydna.tui", "ydna.workspaces")
+            if top in {"tui", "workspaces", "textual", "rich", "mcp"} or mod.startswith(
+                ("ydna.tui", "ydna.workspaces", "ydna.mcp")
             ):
                 violations.append(f"{path.relative_to(ROOT.parent)}: {mod}")
     assert not violations, "cli layer leak:\n" + "\n".join(violations)
+
+
+def test_mcp_does_not_import_tui_or_workspaces():
+    mcp_dir = ROOT / "mcp"
+    if not mcp_dir.is_dir():
+        pytest.skip("no mcp package")
+    violations: list[str] = []
+    for path in mcp_dir.rglob("*.py"):
+        for mod in _imported_modules(path):
+            top = mod.split(".")[0]
+            if top in {"tui", "workspaces", "textual"} or mod.startswith(
+                ("ydna.tui", "ydna.workspaces")
+            ):
+                violations.append(f"{path.relative_to(ROOT.parent)}: {mod}")
+    assert not violations, "mcp layer leak:\n" + "\n".join(violations)
 
 
 def test_dispatcher_recognizes_cli_token():

@@ -200,8 +200,15 @@ AADR ↔ 1000G. Map / tree / layers views are different lenses on the same group
 **Job:** notebook-ish threads with Gemini. Mode asks use pinned chats (read-only here).
 
 - **◆ Tree · F3 / GWAS · F5 / Reference · F6** — pinned at top; no free-form Send.
-- **U** — pick channel: **AI Studio** or **Vertex**. **M** — model for that channel.
+- **U** — pick channel: **AI Studio** or **Vertex**. **M** — model for free-form Send.
 - Multiline prompt; **Ctrl+S** / **Alt+Enter** / **Send** (Enter = new line).
+- Shortcut row under the thread: **Ctrl+S** ▶ Send · **I** ✶ Investigate ·
+  **T** ◇ Story (clickable). ✶ = plan → facts → Oracle → Story Markdown.
+  F7 shows **inline image previews** for `![caption](url)` (Discover / Commons
+  thumbs). **T** re-runs Story (optional language in the prompt). Needs `pillow`.
+  Same atoms: `ydna cli y|aadr|kg|investigate|story`.
+  After ✶, **▶** follow-ups see the last model via Studio continue or a local
+  prior-text bridge (Vertex / no id).
 - **YOU** vs **GEMINI**; **N** last reply → NOTES; **S** select-mode.
 
 Ask from F3 **ASK**, F5 **ASK**, F6 **SUMMARY** — results land in the mode tab and the pinned chat.

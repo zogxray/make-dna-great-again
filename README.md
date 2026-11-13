@@ -84,12 +84,62 @@ python -m ydna
 python ydna_tui.py
 ```
 
-Headless CLI (JSON/text, no Textual) — subcommands grow under `ydna cli`:
+Headless CLI (JSON on stdout, no Textual):
 
 ```bash
-ydna cli --help
+ydna cli status
+ydna cli genome summary [--genome FILE]
+ydna cli genome rs rs123 rs456 […]
+ydna cli gwas match [--genome FILE] [--gwas-dir DIR] [--p-max 5e-8]
+ydna cli gwas search "vitamin D" [--limit 40]
+ydna cli gwas trait "Vitamin D levels" [--limit 80]
+ydna cli pgs search "vitamin" [--limit 40]
+ydna cli profile micronutrients [--age N] [--lab vitamin_d=28]
 python -m ydna.cli --help
 ```
+
+Agent loop (preferred): `status` → `gwas search` / `pgs search` → `gwas trait`
+→ `genome rs` → ask the user for labs/context → search again.
+`profile micronutrients` is an optional curated shortcut, not the only path.
+Responses include `next_queries` / `open_questions` / `need_from_user` hints.
+
+Dual-tier Investigate (Flash plans **tools** → local gather → Argon Oracle →
+human **Story** Markdown). Story media uses Discover / Commons **image files**;
+F7 renders terminal half-block previews (`pillow`). Tools cover GWAS/PGS **and**
+Y path / LORE / AADR epochs / cached 1000G·AADR f3 — any similar question, not a
+fixed template:
+
+```bash
+ydna cli investigate "…"                         # Oracle + Story (needs Gemini)
+ydna cli investigate "…" --no-story              # stop after Oracle
+ydna cli investigate "…" --lang Russian          # Story language hint
+ydna cli investigate "…" --facts-only            # heuristic tools + gather
+ydna cli story [--lang Russian]                  # Story from newest Oracle chat
+ydna cli y path | y lore [CLADE] | y milestones
+ydna cli aadr hits [--epoch bronze]
+ydna cli kg affinity
+```
+
+In the TUI **F7 Chat**: shortcut row under the thread — **Ctrl+S** Send ·
+**I** Investigate · **T** Story (`GEMINI_FAST_MODEL` + `GEMINI_REASONING_MODEL`;
+does not change **M**).
+
+Envelope: `{"ok":true,"data":…}` or `{"ok":false,"error":{"code","message"}}`.
+Exit: 0 ok · 2 usage · 3 lock busy · 4 missing data · 1 other.
+
+### MCP (Cursor / other hosts)
+
+Same ops over stdio MCP (`status`, `genome_summary`, `genome_rs`, `gwas_match`,
+`gwas_search`, `gwas_trait`, `pgs_search`, `profile_micronutrients`):
+
+```bash
+pip install -e ".[mcp]"
+python -m ydna.mcp          # or: ydna-mcp
+```
+
+Cursor example: copy `packaging/mcp.json.example` into your MCP config; set
+`cwd` to this repo and `command` to your venv’s `python`. Close the TUI first
+(shared app lock).
 
 Separate desktop window (terminal emulator — not a browser):
 
@@ -234,11 +284,18 @@ Left column: **GROUPS** (list) above **GROUP** (card).
 
 ## F7 · Chat
 
-Threads with Gemini (key + model in F2).
+Threads with Gemini (channel **U** / model **M** in F7; keys in F2).
 
-- Left chats · center transcript · right NOTES (yours)  
-- Enter sends; replies stream and are stored locally  
-- **N** last reply → NOTES · **S** select mode for copy  
+- Left chats · center transcript · right NOTES (yours)
+- Shortcut row under the thread (clickable): **Ctrl+S** ▶ Send · **I** ✶
+  Investigate · **T** ◇ Story
+- **✶** Investigate = plan → local facts → Oracle → Story Markdown
+- Story images: `![caption](url)` → inline half-block preview in the TUI
+  (needs `pillow`; real image URLs / Commons thumbs, not HTML search pages)
+- Enter = new line in the prompt; replies stream and are stored locally
+- **N** last reply → NOTES · **S** select mode for copy
+- After ✶, **▶** follow-ups (e.g. translate) see the last model via Studio
+  continue or a local prior-text bridge
 
 The model does not auto-read your RAW file — talk from F3–F6 findings or paste.
 

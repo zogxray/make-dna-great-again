@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "make-dna-great-again": {
+      "command": "python",
+      "args": ["-m", "ydna.mcp"],
+      "cwd": "/ABS/PATH/TO/make-dna-great-again",
+      "env": {
+        "VIRTUAL_ENV": "/ABS/PATH/TO/venv"
+      }
+    }
+  }
+}

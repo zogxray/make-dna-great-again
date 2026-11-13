@@ -1171,7 +1171,9 @@ class TreeWorkspace(Workspace):
             headed = f"[F3 · {label}]\n\n{prompt}"
             t.messages.append(chat.Message("user", headed))
             chat.save(t)
-            chat.send(store, t, job, continue_chat=False, tier="reasoning")
+            chat.send(
+                store, t, job, continue_chat=False, tier="reasoning", use_saved=False,
+            )
             text = next((m.text for m in reversed(t.messages) if m.role == "model"), "")
             return (text or job.draft or "").strip() or "(empty reply)"
 

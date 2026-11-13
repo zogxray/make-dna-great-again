@@ -120,7 +120,8 @@ def thread_view(t: Thread | None, waiting: bool, draft: str = "",
         edit = i if m.role == "user" and not waiting else None
         parts.append(_header_rich(m.role, m.at, edit))
         if m.role == "model":
-            parts.append(_md(m.text, width=w))
+            from .images import render_model_body
+            parts.append(render_model_body(m.text, md_render=_md, width=w))
         else:
             parts.append(_plain(m.text, BODY_STYLE.get(m.role, "")))
     if waiting:
@@ -129,7 +130,8 @@ def thread_view(t: Thread | None, waiting: bool, draft: str = "",
         if draft.strip():
             head.append(" streaming\n", style=WARN)
             parts.append(head)
-            parts.append(_md(draft, width=w))
+            from .images import render_model_body
+            parts.append(render_model_body(draft, md_render=_md, width=w))
         else:
             head.append(" …\n", style=WARN)
             parts.append(head)

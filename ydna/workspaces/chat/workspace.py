@@ -9,7 +9,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, ContentSwitcher, OptionList, Static
+from textual.widgets import ContentSwitcher, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core import chat
@@ -24,6 +24,8 @@ from .screens import ConfirmScreen, EditScreen, ModelScreen, ProviderScreen
 from .view import chat_prompt, thread_text, thread_view
 
 JOB = "chat"
+JOB_INV = "investigate"
+JOB_STORY = "story"
 
 # Ctrl+Enter в большинстве TTY неотличим от Enter — шлём через Ctrl+S / Alt+Enter + кнопку.
 _SEND_KEYS = "ctrl+s,alt+enter,meta+enter,ctrl+enter"
@@ -59,16 +61,18 @@ class ChatWorkspace(Workspace):
     #thread-sel {
         height: 1fr; border: none; background: transparent; padding: 0 1;
     }
+    #chat-actions {
+        height: 1;
+        padding: 0 1;
+        margin: 0 1;
+        color: $text-muted;
+    }
     #prompt-row {
-        height: 8; max-height: 8; margin: 0 1 1 1;
+        height: 7; max-height: 7; margin: 0 1 1 1;
     }
     #prompt {
         width: 1fr; height: 1fr; border: round $primary;
     }
-    #send-col {
-        width: 12; height: 1fr; align: center middle; padding: 0 0 0 1;
-    }
-    #send-btn { width: 100%; }
     #notes { height: 1fr; border: none; }
     #thread-sel .text-area--selection, #notes .text-area--selection,
     #prompt .text-area--selection {
@@ -87,6 +91,8 @@ class ChatWorkspace(Workspace):
         Binding(alt_keys("m"), "pick_model", "Model"),
         Binding(alt_keys("u"), "pick_provider", "Provider"),
         Binding(alt_keys("c"), "cancel", "Cancel"),
+        Binding(alt_keys("i"), "investigate", "Investigate"),
+        Binding(alt_keys("t"), "story", "Story"),
         Binding(_SEND_KEYS, "send_prompt", "Send", show=False),
     ]
 
@@ -113,20 +119,22 @@ class ChatWorkspace(Workspace):
                 with ContentSwitcher(initial="thread-scroll", id="thread-switch"):
                     with VerticalScroll(id="thread-scroll"):
                         yield SelectableRichStatic(id="thread-md")
+                yield KeyBar([
+                    ("Ctrl+S", "▶ Send", "screen.send_prompt"),
+                    ("I", "✶ Investigate", "screen.investigate"),
+                    ("T", "◇ Story", "screen.story"),
+                ], id="chat-actions")
                 with Horizontal(id="prompt-row"):
                     yield PromptArea(
                         "",
                         id="prompt",
                         show_line_numbers=False,
-                        placeholder="message · Ctrl+S / Alt+Enter / Send · Enter = new line",
+                        placeholder="message · Enter = new line",
                     )
-                    with Vertical(id="send-col"):
-                        yield Button("Send", id="send-btn", variant="primary")
             with Vertical(id="notes-box"):
                 yield ClipTextArea("", id="notes", show_line_numbers=False,
                                   placeholder="drag or Shift+arrows to select · Ctrl+C copy · Ctrl+V paste")
         yield KeyBar([("A", "New chat", "screen.new_chat"),
-                      ("Ctrl+S", "Send", "screen.send_prompt"),
                       ("U", "Channel", "screen.pick_provider"),
                       ("M", "Model", "screen.pick_model"),
                       ("N", "Last → notes", "screen.clip_last"),
@@ -137,7 +145,6 @@ class ChatWorkspace(Workspace):
                       ("Tab", "Panel", "app.focus_next"),
                       ("F1–F10", "Modes", None), ("Q", "Quit", "app.quit")], id="help")
         yield Static(id="status")
-
     def _active(self) -> Path | None:
         ws = getattr(self.app, "genome_ws", None)
         if ws and ws.active and ws.active.exists():
@@ -243,16 +250,25 @@ class ChatWorkspace(Workspace):
     def _sync_prompt_lock(self) -> None:
         """Pinned mode chats: read-only history — no free-form Send."""
         prompt = self.query_one("#prompt", PromptArea)
-        btn = self.query_one("#send-btn", Button)
+        actions = self.query_one("#chat-actions", KeyBar)
         locked = bool(self.current and chat.is_shared_thread(self.current.id))
         prompt.disabled = locked
-        btn.disabled = locked
         if locked:
             label = chat.shared_thread_label(self.current.id if self.current else None)
             prompt.load_text("")
             prompt.placeholder = f"{label} · read-only · ask from the mode tab"
+            actions.set_items([
+                ("Ctrl+S", "▶ Send", None),
+                ("I", "✶ Investigate", None),
+                ("T", "◇ Story", None),
+            ])
         else:
-            prompt.placeholder = "message · Ctrl+S / Alt+Enter / Send · Enter = new line"
+            prompt.placeholder = "message · Enter = new line · shortcuts above"
+            actions.set_items([
+                ("Ctrl+S", "▶ Send", "screen.send_prompt"),
+                ("I", "✶ Investigate", "screen.investigate"),
+                ("T", "◇ Story", "screen.story"),
+            ])
 
     def on_screen_suspend(self) -> None:
         self._flush_notes()
@@ -299,9 +315,16 @@ class ChatWorkspace(Workspace):
             switch.mount(area)
             return area
 
+    def _active_chat_job(self):
+        for key in (JOB_INV, JOB_STORY, JOB):
+            job = JOBS.get(key)
+            if job and job.active:
+                return job
+        return JOBS.get(JOB_INV) or JOBS.get(JOB_STORY) or JOBS.get(JOB)
+
     def _show(self) -> None:
         t = self.current
-        job = JOBS.get(JOB)
+        job = self._active_chat_job()
         waiting = bool(job and job.active)
         draft = job.draft if waiting and job else ""
         switch = self.query_one("#thread-switch", ContentSwitcher)
@@ -348,7 +371,7 @@ class ChatWorkspace(Workspace):
             bits.append(f"active: {self.genome.name}")
         else:
             bits.append("active: — (F1)")
-        job = JOBS.get(JOB)
+        job = self._active_chat_job()
         if job and job.active:
             bits.append(f"⚙ {chat.wait_line(job)}")
         elif job and job.status == "failed":
@@ -487,25 +510,33 @@ class ChatWorkspace(Workspace):
             return
         self.app.push_screen(ModelScreen(rows, current, mode=mode), done)
 
+    def _reload_current_thread(self) -> None:
+        if not self.current:
+            return
+        fresh = chat.load(self.current.id)
+        if not fresh:
+            return
+        self.current = fresh
+        for i, t in enumerate(self.threads):
+            if t.id == fresh.id:
+                self.threads[i] = fresh
+        ol = self.query_one("#chats", OptionList)
+        idx = next((i for i, x in enumerate(self.threads) if x.id == fresh.id), None)
+        if idx is not None:
+            ol.replace_option_prompt_at_index(idx, chat_prompt(fresh))
+
     def _tick(self) -> None:
         self._flush_notes()
-        job = JOBS.get(JOB)
+        job = self._active_chat_job()
         draft_n = len(job.draft) if job else 0
+        stage = job.stage if job else None
         # Identity only — draft length is handled below (avoids full rebuild every char).
-        sig = (id(job), job.status if job else None, job.finished if job else None)
+        sig = (id(job), job.status if job else None, job.finished if job else None, stage)
         if sig != self.seen_job:
             self.seen_job = sig
-            if job and not job.active and self.current:
-                fresh = chat.load(self.current.id)
-                if fresh:
-                    self.current = fresh
-                    for i, t in enumerate(self.threads):
-                        if t.id == fresh.id:
-                            self.threads[i] = fresh
-                    ol = self.query_one("#chats", OptionList)
-                    idx = next((i for i, x in enumerate(self.threads) if x.id == fresh.id), None)
-                    if idx is not None:
-                        ol.replace_option_prompt_at_index(idx, chat_prompt(fresh))
+            if job and self.current:
+                # Investigate appends mid-job; always refresh thread body on stage change.
+                self._reload_current_thread()
             self._show()
             self._stream_shown_draft = draft_n
             self._stream_show_at = time.monotonic()
@@ -526,6 +557,8 @@ class ChatWorkspace(Workspace):
             return
         self._stream_shown_draft = draft_n
         self._stream_show_at = now
+        if job.key in (JOB_INV, JOB_STORY):
+            self._reload_current_thread()
         self._show()
 
     @on(OptionList.OptionHighlighted, "#chats")
@@ -545,9 +578,10 @@ class ChatWorkspace(Workspace):
             self._sync_prompt_lock()
 
     def _busy(self) -> bool:
-        if (job := JOBS.get(JOB)) and job.running:
-            self.app.notify("Wait for the current reply, or C to cancel", severity="warning")
-            return True
+        for key in (JOB, JOB_INV, JOB_STORY):
+            if (job := JOBS.get(key)) and job.running:
+                self.app.notify("Wait for the current reply, or C to cancel", severity="warning")
+                return True
         if self.current and chat.is_shared_thread(self.current.id):
             self.app.notify(
                 f"{chat.shared_thread_label(self.current.id)} is read-only · "
@@ -582,36 +616,121 @@ class ChatWorkspace(Workspace):
         self.reload(keep=tid)
         self._focus_prompt()
 
-    @on(Button.Pressed, "#send-btn")
-    def on_send_btn(self) -> None:
-        self.action_send_prompt()
+    def _kick_investigate(self, question: str) -> None:
+        if self.current is None:
+            return
+        tid = self.current.id
+        store = self.store
+        genome = self._active()
 
-    def action_send_prompt(self) -> None:
+        def work(job) -> str:
+            from ...cli.lineage_session import lineage_tool_handlers
+            from ...core.investigate_brief import run_investigate
+
+            t = chat.load(tid)
+            if t is None:
+                raise RuntimeError("chat disappeared")
+            try:
+                handlers = lineage_tool_handlers(store, genome=genome, job=job)
+                out = run_investigate(
+                    store, t, job, question, genome=genome, handlers=handlers,
+                    with_story=True,
+                )
+                return (out.get("story") or out.get("oracle") or job.draft or "done")[:2000] or "done"
+            except Exception as exc:
+                t.messages.append(chat.Message("error", str(exc)[:400]))
+                chat.save(t)
+                raise
+
+        JOBS.start(JOB_INV, "Investigate", work)
+        self.reload(keep=tid)
+        self._focus_prompt()
+
+    def _kick_story(self, language: str | None = None) -> None:
+        if self.current is None:
+            return
+        tid = self.current.id
+        store = self.store
+
+        def work(job) -> str:
+            from ...core.story_brief import run_story
+
+            t = chat.load(tid)
+            if t is None:
+                raise RuntimeError("chat disappeared")
+            try:
+                return run_story(store, t, job, language=language)[:2000] or "done"
+            except Exception as exc:
+                t.messages.append(chat.Message("error", str(exc)[:400]))
+                chat.save(t)
+                raise
+
+        JOBS.start(JOB_STORY, "Story", work)
+        self.reload(keep=tid)
+        self._focus_prompt()
+
+    def _take_prompt_text(self) -> str | None:
         if self.current and chat.is_shared_thread(self.current.id):
             self.app.notify(
                 f"{chat.shared_thread_label(self.current.id)} is read-only · "
                 "ask from F3 ASK / F5 ASK / F6 SUMMARY",
                 severity="warning",
             )
-            return
+            return None
         prompt = self.query_one("#prompt", PromptArea)
         text = prompt.text.strip()
         if not text:
             self.app.notify("Type a message first", severity="warning")
-            return
+            return None
         if self._busy():
-            self.app.notify("Gemini is still answering · C to cancel", severity="warning")
-            return
+            return None
         prompt.load_text("")
         if self.current is None or chat.is_shared_thread(self.current.id):
             self.current = chat.new_thread()
             self.threads.insert(0, self.current)
         self._flush_notes()
+        return text
+
+    def action_send_prompt(self) -> None:
+        text = self._take_prompt_text()
+        if not text or self.current is None:
+            return
         self.current.messages.append(chat.Message("user", text))
         if self.current.title == "New chat":
             self.current.title = text.splitlines()[0][:48]
         chat.save(self.current)
         self._kick_send()
+
+    def action_investigate(self) -> None:
+        text = self._take_prompt_text()
+        if not text or self.current is None:
+            return
+        if self.current.title == "New chat":
+            self.current.title = f"Investigate · {text.splitlines()[0][:36]}"
+        chat.save(self.current)
+        self.app.notify("Investigate · plan → facts → Oracle → Story", timeout=4)
+        self._kick_investigate(text)
+
+    def action_story(self) -> None:
+        if self._busy() or self.current is None:
+            return
+        if chat.is_shared_thread(self.current.id):
+            self.app.notify(
+                f"{chat.shared_thread_label(self.current.id)} is read-only",
+                severity="warning",
+            )
+            return
+        from ...core.story_brief import find_last_oracle
+        if not find_last_oracle(self.current):
+            self.app.notify("Run ✶ Investigate first (need an Oracle)", severity="warning")
+            return
+        # Optional language hint from prompt without consuming a full Send turn.
+        prompt = self.query_one("#prompt", PromptArea)
+        lang = prompt.text.strip() or None
+        if lang:
+            prompt.load_text("")
+        self.app.notify("Story · human Markdown from last Oracle", timeout=4)
+        self._kick_story(language=lang)
 
     def action_edit_last(self) -> None:
         if not self.current:
@@ -717,10 +836,16 @@ class ChatWorkspace(Workspace):
         self.app.notify("Last reply copied to NOTES")
 
     def action_cancel(self) -> None:
-        job = JOBS.get(JOB)
-        if job and job.active:
-            chat.abort_send(job)
-            job.cancel()
-            self.app.notify("Cancelling Gemini")
-        else:
+        cancelled = False
+        for key, label in (
+            (JOB_INV, "Investigate"), (JOB_STORY, "Story"), (JOB, "Gemini"),
+        ):
+            job = JOBS.get(key)
+            if job and job.active:
+                chat.abort_send(job)
+                job.cancel()
+                self.app.notify(f"Cancelling {label}")
+                cancelled = True
+                break
+        if not cancelled:
             self.app.notify("Nothing is running")

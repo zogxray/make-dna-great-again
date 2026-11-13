@@ -337,14 +337,49 @@ def last_user_index(thread: Thread) -> int | None:
     return None
 
 
-def context_id(thread: Thread) -> str | None:
-    """previous_interaction_id: последний model перед последним user."""
+def last_model_before_user(thread: Thread) -> Message | None:
+    """Nearest model message before the latest user turn (skip errors)."""
     stop = last_user_index(thread)
     msgs = thread.messages if stop is None else thread.messages[:stop]
     for m in reversed(msgs):
-        if m.role == "model" and m.interaction_id:
-            return m.interaction_id
+        if m.role == "model":
+            return m
+        if m.role == "user":
+            break
     return None
+
+
+def context_id(thread: Thread) -> str | None:
+    """previous_interaction_id for the nearest prior model only.
+
+    Do not skip to an older model that has an id — after Investigate the Oracle
+    may lack an id while an earlier free-chat turn still has one; continuing
+    that older id would ignore the report the user just saw.
+    """
+    prior = last_model_before_user(thread)
+    if prior is None:
+        return None
+    return prior.interaction_id or None
+
+
+_FOLLOWUP_PRIOR_MAX = 40_000
+
+
+def followup_input(user_text: str, prior_model: Message | None) -> str:
+    """Embed prior model text when API continue is unavailable (Vertex / no iid)."""
+    user = (user_text or "").strip()
+    if prior_model is None or not (prior_model.text or "").strip():
+        return user
+    prior = prior_model.text.strip()
+    if len(prior) > _FOLLOWUP_PRIOR_MAX:
+        prior = prior[: _FOLLOWUP_PRIOR_MAX - 20].rstrip() + "\n…[truncated]"
+    return "\n".join([
+        "### Prior assistant reply (same chat thread — treat as the report/context)",
+        prior,
+        "",
+        "### User request",
+        user,
+    ])
 
 
 def _copy_msg(m: Message) -> Message:
@@ -837,7 +872,19 @@ def _generate_content_text(client, mid: str, text: str, job: Job,
     """Vertex fallback when Interactions yields no text (common on argon/pro)."""
     job.stage = f"{label} · generateContent"
     job.check()
-    resp = client.models.generate_content(model=short_model(mid), contents=text)
+    gen_kw: dict = {}
+    max_tok = GEN_CFG.get("max_output_tokens")
+    if max_tok:
+        try:
+            from google.genai import types as genai_types
+            gen_kw["config"] = genai_types.GenerateContentConfig(
+                max_output_tokens=int(max_tok),
+            )
+        except Exception:  # noqa: BLE001 — older SDK / missing types
+            gen_kw = {}
+    resp = client.models.generate_content(
+        model=short_model(mid), contents=text, **gen_kw,
+    )
     out = (getattr(resp, "text", None) or "").strip()
     if out:
         job.draft = out
@@ -859,14 +906,92 @@ def _generate_content_text(client, mid: str, text: str, job: Job,
     return out
 
 
+def _prefer_complete_text(streamed: str, interaction: object | None) -> str:
+    """Reasoning models may stream a short prefix; completed payload is authoritative."""
+    streamed = (streamed or "").strip()
+    if interaction is None:
+        return streamed
+    final = _output_text(interaction).strip()
+    if not final:
+        return streamed
+    if not streamed:
+        return final
+    if len(final) > len(streamed):
+        return final
+    # Same length or streamed longer — keep streamed (already joined deltas).
+    return streamed
+
+
+def _commit_model_reply(
+    thread: Thread,
+    out: str,
+    *,
+    mid: str,
+    mode: llm.Provider,
+    iid: str | None,
+    append: bool,
+    title_hint: str | None,
+    job: Job | None = None,
+) -> str:
+    """Optionally append model reply + save. Always returns ``out``."""
+    del mid  # label already painted on job.stage
+    if job is not None:
+        job._last_interaction_id = iid if (iid and mode == "aistudio") else None  # type: ignore[attr-defined]
+    if not append:
+        return out
+    if iid and mode == "aistudio":
+        thread.interaction_id = iid
+        thread.messages.append(Message("model", out, interaction_id=iid))
+    else:
+        if mode == "vertex":
+            thread.interaction_id = None
+        thread.messages.append(Message("model", out))
+    if thread.title == "New chat" and title_hint:
+        thread.title = title_hint.strip().splitlines()[0][:48]
+    save(thread)
+    return out
+
+
+def resolve_model_for_send(
+    store: Store,
+    *,
+    tier: str = "fast",
+    model: str | None = None,
+    use_saved: bool = True,
+) -> str:
+    """Pick wire model id for one send.
+
+    use_saved=True (F7 free chat): honour M picker; tier only if nothing saved.
+    use_saved=False (ASK / Investigate): force ``GEMINI_FAST_MODEL`` /
+    ``GEMINI_REASONING_MODEL`` (or ``model=``) and do not rewrite M.
+    """
+    mode = provider_mode(store)
+    if model:
+        return wire_model(model, mode)
+    want_tier = "reasoning" if tier == "reasoning" else "fast"
+    if not use_saved:
+        return wire_model(llm.default_model_for(mode, tier=want_tier), mode)
+    saved = get_saved_model(store, mode)
+    if short_model(saved) in ("", "gemini-flash-latest", "gemini-flash-lite-latest"):
+        return wire_model(llm.default_model_for(mode, tier=want_tier), mode)
+    return wire_model(saved, mode)
+
+
 def send(store: Store, thread: Thread, job: Job, *,
          continue_chat: bool = True,
-         tier: str = "fast") -> str:
-    """Отправляет последний user-текст через Interactions API, как в примере Google.
+         tier: str = "fast",
+         model: str | None = None,
+         use_saved: bool = True,
+         input_text: str | None = None,
+         append: bool = True) -> str:
+    """Отправляет текст через Interactions API, как в примере Google.
 
     continue_chat=False: do not pass previous_interaction_id (fresh ask; still
     appends to the same thread for F6 history — used by F5 SUMMARY / F5 ASK).
-    tier: fast | reasoning — picks env default model when Store has none.
+    tier: fast | reasoning — used when use_saved=False, or when M is empty.
+    use_saved=False: always the tier default; does not change the M picker.
+    input_text: override body sent to the API (thread's last user stays as-is).
+    append=False: return text only; caller owns thread messages.
     Provider is an explicit choice (Store / LLM_PROVIDER_MODE); no failover.
     """
     mode = provider_mode(store)
@@ -880,18 +1005,36 @@ def send(store: Store, thread: Thread, job: Job, *,
     except RuntimeError:
         raise
     job._gemini_client = client  # type: ignore[attr-defined]
-    text = next((m.text for m in reversed(thread.messages) if m.role == "user"), "")
+    job._last_interaction_id = None  # type: ignore[attr-defined]
+    title_hint: str | None = None
+    prior = last_model_before_user(thread) if continue_chat else None
+    prev_iid = (prior.interaction_id if prior else None) or None
+    use_api_continue = bool(continue_chat and mode == "aistudio" and prev_iid)
+
+    if input_text is not None:
+        text = input_text
+    else:
+        user_text = next(
+            (m.text for m in reversed(thread.messages) if m.role == "user"), "",
+        )
+        if not user_text.strip():
+            raise RuntimeError("empty message")
+        title_hint = user_text
+        # Free-form follow-up: Studio continue when nearest model has iid;
+        # otherwise embed that model text (Vertex, Investigate Oracle, etc.).
+        if continue_chat and prior and prior.text.strip() and not use_api_continue:
+            text = followup_input(user_text, prior)
+        else:
+            text = user_text
     if not text.strip():
         raise RuntimeError("empty message")
-    saved = get_saved_model(store, mode)
-    # Legacy aliases / empty → channel default for this tier.
-    if short_model(saved) in ("", "gemini-flash-latest", "gemini-flash-lite-latest"):
-        want = llm.default_model_for(mode, tier="reasoning" if tier == "reasoning" else "fast")
-        mid = wire_model(want, mode)
-    else:
-        mid = wire_model(saved, mode)
-    if saved != mid:
-        set_saved_model(store, mid, mode)
+    mid = resolve_model_for_send(
+        store, tier=tier, model=model, use_saved=use_saved,
+    )
+    if use_saved:
+        saved = get_saved_model(store, mode)
+        if saved != mid:
+            set_saved_model(store, mid, mode)
     label = f"{short_model(mid)} · {llm.provider_label(mode)}"
     idle_s = READ_IDLE_VERTEX_S if mode == "vertex" else READ_IDLE_S
     t0 = time.time()
@@ -920,10 +1063,8 @@ def send(store: Store, thread: Thread, job: Job, *,
     if tools:
         kw["tools"] = tools
     # Studio↔Vertex interaction ids are not interchangeable — never cross-continue.
-    if continue_chat and mode == "aistudio":
-        prev = context_id(thread)
-        if prev:
-            kw["previous_interaction_id"] = prev
+    if use_api_continue:
+        kw["previous_interaction_id"] = prev_iid
     kw["stream"] = True
     job.draft = ""
     try:
@@ -948,17 +1089,16 @@ def send(store: Store, thread: Thread, job: Job, *,
                 raise RuntimeError(
                     f"{llm.provider_label(mode)} · {short_model(mid)} returned empty reply"
                 ) from exc
-            thread.interaction_id = None
-            thread.messages.append(Message("model", out))
-            if thread.title == "New chat":
-                thread.title = text.strip().splitlines()[0][:48]
-            save(thread)
-            return out[:80]
+            return _commit_model_reply(
+                thread, out, mid=mid, mode=mode, iid=None, append=append,
+                title_hint=title_hint, job=job,
+            )
         abort_send(job)
         raise RuntimeError(_friendly(exc, mid, mode=mode)) from exc
     job._gemini_stream = stream  # type: ignore[attr-defined]
     chunks: list[str] = []
     iid: str | None = None
+    last_inter: object | None = None
     last_data = time.time()
     try:
         for event in stream:
@@ -978,6 +1118,8 @@ def send(store: Store, thread: Thread, job: Job, *,
                 last_data = now
             if et in ("interaction.created", "interaction.completed"):
                 inter = getattr(event, "interaction", None)
+                if inter is not None:
+                    last_inter = inter
                 if inter is not None and getattr(inter, "id", None):
                     iid = str(inter.id)
                 status = str(getattr(inter, "status", "") or "") if inter is not None else ""
@@ -988,18 +1130,27 @@ def send(store: Store, thread: Thread, job: Job, *,
                             f"{llm.provider_label(mode)} · {short_model(mid)} "
                             f"ended with status={status or 'unknown'}"
                         )
-                    if not chunks:
-                        fallback = _output_text(inter)
-                        if fallback:
-                            chunks.append(fallback)
-                            job.draft = fallback
+                    # Prefer completed payload when longer than streamed prefix
+                    # (argon/pro often emit a short text delta, then full output_text).
+                    merged = _prefer_complete_text("".join(chunks), inter)
+                    if merged:
+                        chunks = [merged]
+                        job.draft = merged
+                        _beat(f"{len(merged):,} chars")
             elif et == "step.delta":
                 delta = getattr(event, "delta", None)
                 kind = _delta_kind(delta) if delta is not None else ""
-                if delta is None or kind != "text":
+                # Accept text / output_text; ignore thought* keepalives.
+                if delta is None or kind not in ("text", "output_text", "content"):
                     _beat("thinking" if kind in ("thought_signature", "thought") else (et or "event"))
                     continue
-                piece = getattr(delta, "text", None) or ""
+                piece = (
+                    getattr(delta, "text", None)
+                    or getattr(delta, "content", None)
+                    or ""
+                )
+                if not isinstance(piece, str):
+                    piece = _piece(piece)
                 if not piece:
                     _beat("delta")
                     continue
@@ -1017,7 +1168,7 @@ def send(store: Store, thread: Thread, job: Job, *,
         raise RuntimeError(_friendly(exc, mid, mode=mode)) from exc
     abort_send(job)
     job.check()
-    out = "".join(chunks).strip()
+    out = _prefer_complete_text("".join(chunks), last_inter)
     if not out and mode == "vertex":
         try:
             out = _generate_content_text(client, mid, text, job, label=label)
@@ -1030,15 +1181,7 @@ def send(store: Store, thread: Thread, job: Job, *,
             f"{llm.provider_label(mode)} · {short_model(mid)} returned empty reply"
         )
     job.draft = out
-    if iid and mode == "aistudio":
-        thread.interaction_id = iid
-        thread.messages.append(Message("model", out, interaction_id=iid))
-    else:
-        # Vertex ids are not reused for Studio continue_chat.
-        if mode == "vertex":
-            thread.interaction_id = None
-        thread.messages.append(Message("model", out))
-    if thread.title == "New chat":
-        thread.title = text.strip().splitlines()[0][:48]
-    save(thread)
-    return out[:80]
+    return _commit_model_reply(
+        thread, out, mid=mid, mode=mode, iid=iid, append=append,
+        title_hint=title_hint, job=job,
+    )
