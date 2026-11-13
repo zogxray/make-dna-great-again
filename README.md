@@ -11,6 +11,60 @@ Same guide lives inside the app as **F10 Help** (flow & UX; light on internals).
 
 Modes: **F1 Genome → F2 Data → F3 Tree → F4 PGS → F5 GWAS → F6 Reference → F7 Chat → F8 Jobs → F9 Samples → F10 Help**.
 
+## Tour
+
+A quick look at the TUI.
+
+### F3 · Y Tree
+
+Our paternal branch on the haplotree — ages, geography, Ancestors tab.
+Tip **J-Z30390**, path tip→root, Discover-rich nodes.
+
+![F3 Y Tree — Our branch, ages, Ancestors](docs/f3-tree.png)
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### F4 · PGS
+
+Trait scores vs 1000 Genomes — EUR percentile, z-score, theme bars.
+
+![F4 PGS — Fluid intelligence score](docs/f4-pgs.png)
+
+</td>
+<td width="50%" valign="top">
+
+### F5 · GWAS
+
+Catalog hits on your chip; Ask brief beside the association table.
+
+![F5 GWAS — Educational attainment + Ask](docs/f5-gwas.png)
+
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+
+### F6 · Reference
+
+AADR f₃ by epoch — ranked groups and a world map of sites.
+
+![F6 Reference — Neolithic map / f3](docs/f6-reference.png)
+
+</td>
+<td width="50%" valign="top">
+
+### F7 · Chat / Agent
+
+Investigate → Oracle → Story (epochs, cultures). Shortcuts under the thread.
+
+![F7 Chat — Story / Investigate](docs/f7-chat.png)
+
+</td>
+</tr>
+</table>
+
 ## Requirements
 
 - Python **3.10+**

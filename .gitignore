@@ -99,6 +99,8 @@ temp/
 # ── local one-off scripts / DuckDB scratch (not shipped) ──────────────
 /local/
 /scripts/
+# Raw desktop dumps; curated shots live in docs/
+/screenshots/
 # test kits / OpenHumans catalogs live under data/ (already ignored via /data/**)
 *.duckdb
 *.duckdb.wal
