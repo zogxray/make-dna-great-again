@@ -34,7 +34,7 @@ Technical guts exist under the hood; this page is about **what to do** and
 3. **F3 Tree** — walk the Y tree with **your** branch highlighted (**O** = Our Y).
 4. **F4 PGS** — polygenic scores when you have a models folder from F2.
 5. **F5 GWAS** — match the active F1 chip against the local GWAS Catalog (F2).
-6. **F6 Reference** — f3 / ancient & 1000 Genomes panels against AADR (or 1000G).
+6. **F6 Reference** — f3 vs AADR / 1000G / Human Origins (G cycles the three).
 7. **F7 Chat** — ask Gemini (AI Studio key or Vertex ADC — F7 **U** picks channel).
 8. **F8 Jobs** — watch downloads / fetches / scores (cancel here; start them elsewhere).
 9. **F9 Samples** — Open Humans public kits (filter, get missing, DuckDB).
@@ -63,7 +63,7 @@ Change the active file here; F3/F5/F6 follow it.
 **Job:** tell the app where reference datasets live, download or verify them.
 
 Grouped sources (FTDNA, YFull/TheYtree overlays, PGS models, AADR, Seshat Polaris,
-Open Humans public samples, Gemini key…).
+Cliopatria polity maps, Open Humans public samples, Gemini key…).
 Each row: path status, size hints, optional fetch/verify in the background.
 
 **Open Humans** catalog is **F9 Samples** (opens directly). In F2: **P** path,
@@ -84,9 +84,13 @@ NEED stays downloadable; READY also ingests into `genome.*`.
 
 **Minimum for F6**
 
-- **AADR** folder (the classic `.geno` / `.ind` / `.anno` trio).
+- **AADR** folder (the classic `.geno` / `.ind` / `.anno` trio) — 1240K for ancient f₃.
+- Optional **AADR · Human Origins** — same Dataverse, denser living pops for modern maps (**D** in F2).
 - **Seshat · Polaris** — historical polity codes (religion / complexity); **D** pulls
   the Excel snapshot (~3 MB, CC BY-NC). Feeds F3 **LORE** anchors (not a myth download).
+- **Cliopatria · polity maps** — Seshat GeoJSON polygons (~44 MB zip, CC BY 4.0);
+  **D** downloads + builds a map cache. F6 draws simplified outlines for the
+  active epoch year (ocean legend ¶).
 
 **GWAS Catalog**
 
@@ -176,8 +180,8 @@ Needs: active F1 file + **F2 → GWAS Catalog → D** (or **P**).
 
 ## F6 · Reference
 
-**Job:** put your genome next to published panels — mainly **AADR** ancients
-(and optionally 1000 Genomes), with f3-style results you already computed offline.
+**Job:** put your genome next to published panels — **AADR** ancients, **1000G**,
+and **Human Origins** (dense modern map refs), with offline f3 results.
 
 What loads when you open F6
 
@@ -191,7 +195,12 @@ done, numbers appear from the local store; the catalog is still needed to name
 and tag the rows.
 
 **F** starts / manages scoring jobs when you need a new panel. **G** toggles
-AADR ↔ 1000G. Map / tree / layers views are different lenses on the same groups.
+AADR ↔ 1000G ↔ HO. Map / tree / layers views are different lenses on the same groups.
+Map header shows the **O** mode (default **sites only** — overlays off).
+**O** cycles: sites only → **⌂ habitat ranges** → **¶ Cliopatria empires** → both.
+Region layers are outlines only (fill on focus) so points stay readable.
+Click a legend row to radar-focus one culture/polity (outline even if O is off).
+Cliopatria needs the F2 download; ⌂ hulls come from visible AADR sites.
 
 ---
 

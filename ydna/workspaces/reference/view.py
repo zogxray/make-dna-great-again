@@ -111,7 +111,7 @@ def epoch_bar(epoch: str, present: list[str], playing: bool,
 
 def source_bar(source: str) -> Text:
     t = Text(no_wrap=True)
-    for key, lab in (("aadr", "AADR"), ("kg", "1000G")):
+    for key, lab in (("aadr", "AADR"), ("kg", "1000G"), ("aadr_ho", "HO")):
         style = "bold reverse #D4AD72" if source == key else "#AEA5B8"
         t.append(f" {lab} ", style=click(f"screen.source({key!r})", style))
         t.append(" ")
@@ -640,12 +640,13 @@ def _paint_bits(name: str, paint: dict | None) -> str:
     return " · ".join(bits)
 
 
-CARD_TABS = ("our", "catalog", "summary")
+CARD_TABS = ("our", "catalog", "kin", "summary")
 
 
 def card_tab_bar(tab: str) -> Text:
     t = Text(no_wrap=True)
-    for key, lab in (("our", "OUR"), ("catalog", "CATALOG"), ("summary", "SUMMARY")):
+    for key, lab in (("our", "OUR"), ("catalog", "CATALOG"),
+                     ("kin", "KIN"), ("summary", "SUMMARY")):
         style = "bold reverse #D4AD72" if tab == key else "#AEA5B8"
         t.append(f" {lab} ", style=click(f"screen.card_tab({key!r})", style))
         t.append(" ")
@@ -655,7 +656,8 @@ def card_tab_bar(tab: str) -> Text:
 def _our_block(d: Text, r: F3 | None, hit: Hit | None, tip: str | None,
                name: str, n: int, qpadm: list | None, paint: dict | None,
                *, place: int | None, ok_total: int, decide: str,
-               rank: float | None) -> None:
+               rank: float | None, mt_tip: str | None = None,
+               mt_tip_score: float | None = None) -> None:
     if r and r.ok:
         lo = r.est - 2 * r.se
         where = f"#{place} of {ok_total} · decided by {decide}" if place else f"decided by {decide}"
@@ -687,6 +689,11 @@ def _our_block(d: Text, r: F3 | None, hit: Hit | None, tip: str | None,
             yv += f" · not your {tip}"
         _row(d, "Y", yv, accent=(decide == "Y"),
              style=REL_STYLE.get(hit.relation, BODY))
+    elif tip:
+        _row(d, "Y", tip, style=MUTED)
+    if mt_tip:
+        sc = f" · {mt_tip_score:.0%}" if mt_tip_score is not None else ""
+        _row(d, "mt", f"Our {mt_tip}{sc}")
     qp = _qpadm_bits(name, qpadm)
     if qp:
         _row(d, "qpAdm", qp)
@@ -851,8 +858,34 @@ def _catalog_y_row(d: Text, keep: list[Sample], y_hits: dict[str, Hit] | None,
     d.append("\n")
 
 
+def _amtdb_mt_note(d: Text, hg: str, *, store=None) -> None:
+    """One muted line: AmtDB ancient hits for this mt haplogroup."""
+    if not hg:
+        return
+    try:
+        from ...core import mtdna as mtdna_mod
+        idx = mtdna_mod.load_amtdb(store)
+        if idx is None:
+            return
+        hits = idx.match(hg, limit=5)
+        if not hits:
+            return
+        bits = []
+        for s in hits[:3]:
+            bit = s.identifier
+            if s.culture:
+                bit += f"/{s.culture}"
+            bits.append(bit)
+        more = f" +{len(hits) - 3}" if len(hits) > 3 else ""
+        _row(d, "AmtDB", f"{len(hits)} ancient · " + " · ".join(bits) + more,
+             style=MUTED)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _catalog_group(d: Text, g: Group, keep: list[Sample],
-                   *, y_hits: dict[str, Hit] | None = None) -> None:
+                   *, y_hits: dict[str, Hit] | None = None,
+                   store=None) -> None:
     # 1 PLACE
     country = _filled(g.country)
     site = _filled(g.locality)
@@ -909,6 +942,8 @@ def _catalog_group(d: Text, g: Group, keep: list[Sample],
                 _row(d, "ISOGG", isos, style=MUTED)
         if mts:
             _row(d, "mt", mts)
+            first = mts.split("·")[0].strip() if mts else ""
+            _amtdb_mt_note(d, first, store=store)
         d.append("\n")
     # 5 DATA
     snps = [float(s.snps) for s in keep if s.snps]
@@ -944,7 +979,8 @@ def _catalog_group(d: Text, g: Group, keep: list[Sample],
     _catalog_pubs(d, keep)
 
 
-def _catalog_person(d: Text, s: Sample, *, hit: Hit | None = None) -> None:
+def _catalog_person(d: Text, s: Sample, *, hit: Hit | None = None,
+                    store=None) -> None:
     # 1 PLACE
     country = _filled(s.country)
     site = _filled(s.locality)
@@ -1016,6 +1052,7 @@ def _catalog_person(d: Text, s: Sample, *, hit: Hit | None = None) -> None:
             if _anno_get(s, "mt_match"):
                 mt_line += f"  match {_anno_get(s, 'mt_match')}"
             _row(d, "mt", mt_line)
+            _amtdb_mt_note(d, mt, store=store)
         d.append("\n")
     # 5 DATA
     _sec(d, "DATA", major=False)
@@ -1057,8 +1094,19 @@ def _catalog_person(d: Text, s: Sample, *, hit: Hit | None = None) -> None:
     _catalog_pubs(d, [], sample=s)
 
 
-def summary_prompt(g: Group, keep: list[Sample], *, sample: Sample | None = None) -> str:
-    """Scientific Ask prompt for SUMMARY — ANNO facts only as grounding."""
+def summary_prompt(
+    g: Group,
+    keep: list[Sample],
+    *,
+    sample: Sample | None = None,
+    our_mt: str | None = None,
+    our_mt_score: float | None = None,
+    our_y: str | None = None,
+    uysd_top: list[dict] | None = None,
+    amtdb_hits: list[dict] | None = None,
+    kin_edges: list[dict] | None = None,
+) -> str:
+    """Scientific Ask prompt for SUMMARY — ANNO + optional local F2 catalogs."""
     subject = sample.gid if sample is not None else g.name
     lines = [
         "Write a scientific brief on this Allen Ancient DNA Resource (AADR) assemblage.",
@@ -1067,6 +1115,8 @@ def summary_prompt(g: Group, keep: list[Sample], *, sample: Sample | None = None
         "1) What this assemblage is (place, date, archaeological context).",
         "2) Key published studies that report or analyse these genomes — with specifics.",
         "3) What is new, contested, or still open — with details.",
+        "4) If kit/local catalog facts are present, briefly relate the assemblage to Our Y/mt,",
+        "   modern Y geography (UYSD), AmtDB mt parallels, and/or ancIBD kinship — without inventing.",
         "Do not invent sample IDs, DOIs, or dates beyond the facts below.",
         "",
         f"Subject: {subject}",
@@ -1148,6 +1198,51 @@ def summary_prompt(g: Group, keep: list[Sample], *, sample: Sample | None = None
             lines.append("DOIs: " + "; ".join(dois[:6]))
         if repos:
             lines.append(f"Repositories: {repos}")
+    # Optional kit / F2 catalog grounding (session-local; may be empty).
+    extras: list[str] = []
+    if our_y:
+        extras.append(f"Our Y tip: {our_y}")
+    if our_mt:
+        sc = f" · score {our_mt_score:.0%}" if our_mt_score is not None else ""
+        extras.append(f"Our mt tip: {our_mt}{sc}")
+    if uysd_top:
+        bits = []
+        for row in uysd_top[:6]:
+            label = row.get("label") or row.get("country") or "?"
+            pct = row.get("pct")
+            if pct is None:
+                continue
+            bits.append(f"{label} {float(pct):.0f}%")
+        if bits:
+            hg = (uysd_top[0].get("haplogroup") if uysd_top else None) or our_y or "?"
+            extras.append(f"UYSD modern freq ({hg}): " + "; ".join(bits))
+    if amtdb_hits:
+        bits = []
+        for row in amtdb_hits[:6]:
+            ident = row.get("id") or row.get("identifier") or "?"
+            mt = row.get("mt") or row.get("mt_hg") or ""
+            cult = row.get("culture") or ""
+            country = row.get("country") or ""
+            bits.append(" · ".join(x for x in (ident, mt, cult, country) if x))
+        if bits:
+            extras.append("AmtDB mt parallels: " + "; ".join(bits))
+    if kin_edges:
+        bits = []
+        for row in kin_edges[:8]:
+            other = row.get("other") or "?"
+            cm = row.get("sum_cm")
+            seed = row.get("seed") or ""
+            head = f"{seed}→{other}" if seed else other
+            if cm is not None:
+                bits.append(f"{head} {float(cm):.1f} cM")
+            else:
+                bits.append(head)
+        if bits:
+            extras.append("ancIBD kinship (≥8 cM): " + "; ".join(bits))
+    if extras:
+        lines.append("")
+        lines.append("Kit / local catalogs (grounding only):")
+        lines.extend(f"- {x}" for x in extras)
     return "\n".join(lines)
 
 
@@ -1202,7 +1297,10 @@ def card(g: Group | None, *, sample: Sample | None = None,
          summary_draft: str = "",
          summary_model: str = "",
          summary_width: int = CARD_W,
-         y_hits: dict[str, Hit] | None = None) -> Text:
+         y_hits: dict[str, Hit] | None = None,
+         store=None,
+         mt_tip: str | None = None,
+         mt_tip_score: float | None = None) -> Text:
     d = Text()
     if g is None:
         d.append(" No selection.\n", style="#AEA5B8")
@@ -1218,19 +1316,61 @@ def card(g: Group | None, *, sample: Sample | None = None,
                      draft=summary_draft, model_hint=summary_model,
                      width=summary_width)
         return d
+    if tab == "kin":
+        _kin_tab(d, g, sample=sample, keep=keep, store=store)
+        return d
     if tab == "catalog":
         if sample is not None:
             person_hit = hit or (y_hits or {}).get(sample.gid)
-            _catalog_person(d, sample, hit=person_hit)
+            _catalog_person(d, sample, hit=person_hit, store=store)
         else:
-            _catalog_group(d, g, keep, y_hits=y_hits)
+            _catalog_group(d, g, keep, y_hits=y_hits, store=store)
         return d
     # OUR
     name = sample.gid if sample is not None else g.name
     n = 1 if sample is not None else (g.n if g.n else len(keep))
     _our_block(d, result, hit, branch, name, n, qpadm, paint,
-               place=place, ok_total=ok_total, decide=decide, rank=rank)
+               place=place, ok_total=ok_total, decide=decide, rank=rank,
+               mt_tip=mt_tip, mt_tip_score=mt_tip_score)
     return d
+
+
+def _kin_tab(d: Text, g: Group, *, sample: Sample | None,
+             keep: list[Sample], store=None) -> None:
+    """ancIBD neighbors for the selected person or group members."""
+    from ...core import ancibd as ancibd_mod
+
+    idx = ancibd_mod.load_index(store)
+    _sec(d, "KIN · ancIBD")
+    if idx is None:
+        _row(d, "data", "off · F2 → ancIBD · D (or P zip)", style=MUTED)
+        d.append("  Pairwise IBD ≥8 cM among published Eurasians "
+                 "(Ringbauer 2023).\n", style=MUTED)
+        return
+    seeds: list[Sample] = [sample] if sample is not None else keep[:12]
+    if not seeds:
+        _row(d, "who", "no samples in selection", style=MUTED)
+        return
+    shown = 0
+    for s in seeds:
+        edges = idx.for_id(s.gid, limit=6)
+        if not edges:
+            continue
+        _row(d, s.gid if sample is not None else fit(s.gid, 14),
+             f"{len(edges)} neighbor(s)")
+        for e in edges[:5]:
+            d.append(f"  {'':<8} ", style=MUTED)
+            d.append(f"{e.sum_cm:5.1f} cM  ", style="#D4AD72")
+            d.append(f"{e.other}", style=BODY)
+            d.append(f"  ·  {e.n_seg} seg\n", style=MUTED)
+            shown += 1
+        if sample is None and shown >= 12:
+            break
+    if not shown:
+        who = sample.gid if sample is not None else g.name
+        _row(d, "match", f"no IBD ≥8 cM for {who}", style=MUTED)
+        d.append("  Index covers ~4.2k Eurasian AADR ids (v54.1 public).\n",
+                 style=MUTED)
 
 
 def _rank_color(p: float) -> str:
@@ -1273,16 +1413,10 @@ def culture_map_label(group_name: str) -> str:
     return fit(label, 14)
 
 
-def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
-             selected: str | None, title: str,
-             world: bool, cols: int, rows: int,
-             *, culture_labels: bool = True,
-             seshat_anchors: list[dict] | None = None,
-             selected_blink: bool = True,
-             map_focus: str | None = None) -> Text:
-    doc = _Doc()
-    doc.t = Text(no_wrap=True, overflow="crop")
-    points = []
+def map_points(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
+               selected: str | None) -> list[dict]:
+    """Scatter points for the epoch map (shared across blink phases)."""
+    points: list[dict] = []
     for g in groups:
         if g.lat is None or g.lon is None or (g.lat == 0 and g.lon == 0):
             continue
@@ -1304,9 +1438,36 @@ def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float
             "culture": cult,
             "rank": float(p) if p is not None else -1.0,
         })
+    return points
+
+
+def draw_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
+             selected: str | None, title: str,
+             world: bool, cols: int, rows: int,
+             *, culture_labels: bool = True,
+             seshat_anchors: list[dict] | None = None,
+             cliopatria_polities: list[dict] | None = None,
+             show_habitat: bool = False,
+             show_polity: bool = False,
+             freq_discs: list[dict] | None = None,
+             kin_edges: list[dict] | None = None,
+             show_freq: bool = False,
+             show_kin: bool = False,
+             show_amtdb: bool = False,
+             selected_blink: bool = True,
+             map_focus: str | None = None,
+             points: list[dict] | None = None) -> Text:
+    doc = _Doc()
+    doc.t = Text(no_wrap=True, overflow="crop")
+    if points is None:
+        points = map_points(groups, results, ranks, selected)
     scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows,
                 selected=selected, selected_blink=selected_blink,
                 culture_labels=culture_labels, anchors=seshat_anchors,
+                polities=cliopatria_polities,
+                show_habitat=show_habitat, show_polity=show_polity,
+                freq_discs=freq_discs, kin_edges=kin_edges,
+                show_freq=show_freq, show_kin=show_kin, show_amtdb=show_amtdb,
                 map_focus=map_focus)
     return doc.t
 
@@ -1347,13 +1508,39 @@ def seshat_layer_for_groups(groups: list[Group], *, epoch: str,
     return map_anchors(idx, hints=uniq, epoch=epoch, aadr_xy=aadr_xy, limit=limit)
 
 
-def draw_y_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
-               hits: dict[str, Hit], ours_other: set[str], selected: str | None,
-               title: str, world: bool, cols: int, rows: int,
-               *, selected_blink: bool = True) -> Text:
-    doc = _Doc()
-    doc.t = Text(no_wrap=True, overflow="crop")
-    points = []
+def cliopatria_layer_for_epoch(epoch: str, *, store=None, world: bool = True,
+                               groups: list[Group] | None = None,
+                               limit: int = 36) -> list[dict]:
+    """Cliopatria polity rings for the AADR epoch mid-year (empty if missing)."""
+    if not epoch or epoch in ("", "all"):
+        return []
+    try:
+        from ...core.cliopatria import load_index, map_polities
+    except Exception:  # noqa: BLE001
+        return []
+    idx = load_index(store=store)
+    if idx is None:
+        return []
+    bbox = None
+    if not world and groups:
+        xs = [float(g.lon) for g in groups
+              if g.lon is not None and g.lat is not None
+              and not (g.lat == 0 and g.lon == 0)]
+        ys = [float(g.lat) for g in groups
+              if g.lon is not None and g.lat is not None
+              and not (g.lat == 0 and g.lon == 0)]
+        if xs and ys:
+            pad_x, pad_y = 12.0, 10.0
+            bbox = (min(xs) - pad_x, min(ys) - pad_y,
+                    max(xs) + pad_x, max(ys) + pad_y)
+    return map_polities(idx, epoch=epoch, limit=limit, bbox=bbox)
+
+
+def y_map_points(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
+                 hits: dict[str, Hit], ours_other: set[str],
+                 selected: str | None) -> list[dict]:
+    """Scatter points for the Y map (shared across blink phases)."""
+    points: list[dict] = []
     for g in groups:
         if g.lat is None or g.lon is None or (g.lat == 0 and g.lon == 0):
             continue
@@ -1370,6 +1557,18 @@ def draw_y_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, flo
             continue
         points.append({"id": g.name, "lon": g.lon, "lat": g.lat, "color": color,
                        "glyph": glyph, "label": g.name.split("_")[0]})
+    return points
+
+
+def draw_y_map(groups: list[Group], results: dict[str, F3], ranks: dict[str, float],
+               hits: dict[str, Hit], ours_other: set[str], selected: str | None,
+               title: str, world: bool, cols: int, rows: int,
+               *, selected_blink: bool = True,
+               points: list[dict] | None = None) -> Text:
+    doc = _Doc()
+    doc.t = Text(no_wrap=True, overflow="crop")
+    if points is None:
+        points = y_map_points(groups, results, ranks, hits, ours_other, selected)
     scatter_map(doc, points, title, world=world, cols=cols, max_rows=rows,
                 selected=selected, selected_blink=selected_blink)
     return doc.t

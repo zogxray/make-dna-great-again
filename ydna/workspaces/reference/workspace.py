@@ -23,10 +23,12 @@ from ...core.store import Store
 from ...core.ylink import YBranch, YLink, active_genome, link_genome, load_haplotree, our_branch
 from ..base import KeyBar, ModeBar, Workspace, alt_keys, busy_progress, fit, hide_busy, show_busy
 from ..data.workspace import job_line
-from .view import (CARD_TABS, FILTER_TABS, REGIONS, card, card_tab_bar, decide_key, draw_map, draw_y_map,
-                   epoch_bar, group_prompt, layers_view, ranks_of, region_bar, region_of,
-                   score_filter_panel, seshat_layer_for_groups, sort_tuple, source_bar,
-                   summary_prompt, tab_bar, tree_view)
+from .view import (CARD_TABS, FILTER_TABS, REGIONS, card, card_tab_bar,
+                   cliopatria_layer_for_epoch, decide_key, draw_map, draw_y_map,
+                   epoch_bar, group_prompt, layers_view, map_points, ranks_of,
+                   region_bar, region_of, score_filter_panel, seshat_layer_for_groups,
+                   sort_tuple, source_bar, summary_prompt, tab_bar, tree_view,
+                   y_map_points)
 
 
 def _kg():
@@ -44,14 +46,18 @@ def _fstats():
     return fstats
 
 JOB = "aadr-f3"
+JOB_HO = "aadr-ho-f3"
 JOB_KG = "kg-f3"
 JOB_PCA = "aadr-pca"
 JOB_QPADM = "aadr-qpadm"
 JOB_IMPUTE = "aadr-impute"
 JOB_PAINT = "kg-paint"
 JOB_SUMMARY = "ref-summary"
-JOBS_ALL = (JOB, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT, JOB_SUMMARY)
+JOBS_ALL = (JOB, JOB_HO, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT, JOB_SUMMARY)
 TABS = ("map", "y", "tree", "layers")
+# G cycles: AADR (1240K) → 1000G → Human Origins → …
+SRC_CYCLE = ("aadr", "kg", "aadr_ho")
+AADR_LIKE = frozenset({"aadr", "aadr_ho"})
 
 
 class ReferenceWorkspace(Workspace):
@@ -78,12 +84,13 @@ class ReferenceWorkspace(Workspace):
         Binding("right", "epoch_next", "Epoch +"),
         Binding("space", "toggle_play", "Play epochs", show=False),
         Binding(alt_keys("f"), "score", "Scan f3"),
-        Binding(alt_keys("y"), "toggle_y", "Y line"),
+        Binding(alt_keys("y"), "toggle_y", "Y/mt filter"),
         Binding(alt_keys("p"), "toggle_people", "People"),
         Binding(alt_keys("u"), "toggle_quest", "Questionable"),
         Binding(alt_keys("w"), "toggle_world", "World map"),
+        Binding(alt_keys("o"), "toggle_map_overlay", "Map overlays"),
         Binding(alt_keys("r"), "region_next", "Region"),
-        Binding(alt_keys("g"), "toggle_source", "AADR/1000G"),
+        Binding(alt_keys("g"), "toggle_source", "AADR/1000G/HO"),
         Binding(alt_keys("v"), "toggle_tab", "Map/Tree/Layers"),
         Binding(alt_keys("c"), "cancel", "Cancel"),
         Binding(alt_keys("x"), "score_clear", "Clear score filter"),
@@ -106,9 +113,19 @@ class ReferenceWorkspace(Workspace):
         self.check: dict | None = None
         self.epoch = "all"
         self.y_only = False
+        self.mt_only = False
         self.people_mode = False
         self.questionable = False
         self.world = True
+        # Map region overlays (default: genotype points only).
+        # Cycle O: pts → ⌂ → ¶ → both → % UYSD → ≈ kin → m AmtDB.
+        self.map_habitat = False
+        self.map_polity = False
+        self.map_uysd = False
+        self.map_kin = False
+        self.map_amtdb = False
+        self.mt_tip: str | None = None       # Our mt (PhyloTree tip)
+        self.mt_tip_score: float | None = None
         self.playing = False
         self.source = "aadr"
         self.area = "all"
@@ -155,11 +172,16 @@ class ReferenceWorkspace(Workspace):
         self.summary_cache: dict[str, dict] = {}
         self.summary_job_key: str | None = None  # subject currently generating
         self._sel_blink: bool = True  # ◆ pulse on selected map point
-        # Ocean-legend focus: 'c:Culture' / 's:Seshat' → DEFCON rings on map.
+        # Ocean-legend focus: 'c:Culture(+hull)' / 's:Seshat' / 'p:Cliopatria'.
         self.map_focus: str | None = None
         # Seshat anchors: recompute only when epoch / visible set changes.
         self._seshat_cache_key: tuple | None = None
         self._seshat_cache: list[dict] = []
+        self._clio_cache_key: tuple | None = None
+        self._clio_cache: list[dict] = []
+        self._map_sel_timer = None  # debounce map redraw while arrowing GROUPS
+        # True while fill_list sets highlighted — ignore OptionHighlighted map/card.
+        self._list_syncing: bool = False
         # Last GROUPS rows — blink / highlight redraw without re-running visible().
         self._last_vis: list[aadr.Group] | None = None
         # LAYERS panel: skip tick repaint when stamps + job stages unchanged.
@@ -169,9 +191,19 @@ class ReferenceWorkspace(Workspace):
         self._gcount_q: bool | None = None
         # gid → Group for people mode (built once per catalog; Q only filters).
         self._people_by_gid: dict[str, aadr.Group] = {}
+        # epoch → groups with gcount>0 (rebuilt with gcount cache).
+        self._groups_by_epoch: dict[str, list[aadr.Group]] = {}
+        # epoch → samples for people mode (rebuilt with people cache).
+        self._samples_by_epoch: dict[str, list[aadr.Sample]] = {}
+        # OptionList: last id order + prompt signatures (incremental update).
+        self._list_ids: list[str] = []
+        self._list_prompt_sigs: dict[str, str] = {}
         # Blink phases for map/Y: swap Text instead of redrawing scatter.
         self._map_blink_key: tuple | None = None
         self._map_blink_frames: dict[bool, Text] = {}
+        # Points for current blink key — reuse when drawing the off-phase.
+        self._map_points_key: tuple | None = None
+        self._map_points: list[dict] | None = None
         # Idle stamp poll: every N ticks (~2s); every tick while jobs active.
         self._stamp_tick: int = 0
 
@@ -196,12 +228,13 @@ class ReferenceWorkspace(Workspace):
                     yield Static(id="map")
                 yield Static(id="score-filter")
         yield KeyBar([("←→", "Epoch", "screen.epoch_step(1)"), ("Space", "Play", "screen.toggle_play"),
-                      ("F", "Scan f3", "screen.score"), ("G", "AADR/1000G", "screen.toggle_source"),
+                      ("F", "Scan f3", "screen.score"), ("G", "AADR/1000G/HO", "screen.toggle_source"),
                       ("V", "View", "screen.toggle_tab"),
-                      ("Y", "Y line", "screen.toggle_y"),
+                      ("Y", "Y/mt", "screen.toggle_y"),
                       ("P", "People", "screen.toggle_people"),
                       ("U", "Questionable", "screen.toggle_quest"),
                       ("W", "World/fit", "screen.toggle_world"),
+                      ("O", "O overlays ⌂¶%≈m", "screen.toggle_map_overlay"),
                       ("R", "Region", "screen.region_next"),
                       ("X", "Clear filter", "screen.score_clear()"),
                       ("C", "Cancel", "screen.cancel"),
@@ -228,15 +261,20 @@ class ReferenceWorkspace(Workspace):
         self._play = self.set_interval(2.4, self._play_tick, pause=True)
 
     def on_screen_resume(self) -> None:
-        folder = self.store.path("aadr")
-        folder_changed = folder != (self.cat.folder if self.cat else None)
         genome = self._active()
-        if folder_changed or self.cat is None:
-            self.reload()
-        elif genome != self.genome:
+        if self.source in AADR_LIKE:
+            folder = self.store.path(self.source)
+            folder_changed = folder != (self.cat.folder if self.cat else None)
+            if folder_changed or self.cat is None:
+                self.reload()
+                return
+        if genome != self.genome:
             self.refresh_genome()
+            return
+        self._prewarm_world_coast()
 
     def on_resize(self) -> None:
+        self._prewarm_world_coast()
         self.refresh_map()
 
     def _active(self) -> Path | None:
@@ -244,6 +282,17 @@ class ReferenceWorkspace(Workspace):
         if ws and ws.active and ws.active.exists():
             return ws.active
         return active_genome()
+
+    @staticmethod
+    def _aadr_like(source: str) -> bool:
+        return source in AADR_LIKE
+
+    def _source_label(self, source: str | None = None) -> str:
+        src = source or self.source
+        return {"aadr": "AADR", "kg": "1000G", "aadr_ho": "Human Origins"}.get(src, src)
+
+    def _load_msg(self) -> str:
+        return f"Loading {self._source_label()}…"
 
     def _set_groups_title(self) -> None:
         box = self.query_one("#groups-box")
@@ -267,8 +316,14 @@ class ReferenceWorkspace(Workspace):
         self._gcount_cache = {}
         self._gcount_q = None
         self._people_by_gid = {}
+        self._groups_by_epoch = {}
+        self._samples_by_epoch = {}
+        self._list_ids = []
+        self._list_prompt_sigs = {}
         self._map_blink_key = None
         self._map_blink_frames = {}
+        self._map_points_key = None
+        self._map_points = None
         self.loading_msg = msg
         self.genome = self._active()
         self._set_groups_title()
@@ -298,13 +353,16 @@ class ReferenceWorkspace(Workspace):
         self.query_one("#view-tabs", Static).update(tab_bar(self.tab))
         title = {"map": "MAP", "y": "Y", "tree": "TREE", "layers": "LAYERS"}.get(self.tab, "MAP")
         self.query_one("#map-box").border_title = title
+        self._refresh_mt_tip()
+        self._prewarm_world_coast()
         t = time.perf_counter()
         self.refresh_map()
         self.last_refresh_map_s = time.perf_counter() - t
         t = time.perf_counter()
         self.refresh_card()
         self.last_refresh_card_s = time.perf_counter() - t
-        self.refresh_score_filter()
+        shown = len(self._last_vis) if self._last_vis is not None else None
+        self.refresh_score_filter(shown=shown)
         self.update_status()
         self.last_paint_s = time.perf_counter() - t0
         hide_busy(self.app)
@@ -312,7 +370,7 @@ class ReferenceWorkspace(Workspace):
 
     def reload(self) -> None:
         """Полная перезагрузка каталога + результатов + Y — в фоне, модальный BusyModal."""
-        gen = self._begin_load("Loading AADR…", title="Reference")
+        gen = self._begin_load(self._load_msg(), title="Reference")
         self.run_worker(lambda: self._reload_work(gen), thread=True, exclusive=True, group="ref-load")
 
     def refresh_genome(self) -> None:
@@ -328,16 +386,22 @@ class ReferenceWorkspace(Workspace):
         source = self.source
         questionable = self.questionable
         genome = self._active()
-        folder = store.path("aadr")
         cat = None
         aadr_problem = ""
-        if not folder:
-            aadr_problem = "Set the AADR folder in F2."
-        else:
-            try:
-                cat = aadr.load_catalog(folder)
-            except (OSError, RuntimeError, ValueError) as exc:
-                aadr_problem = str(exc)
+        if source in AADR_LIKE:
+            folder = store.path(source)
+            label = self._source_label(source)
+            if not folder:
+                aadr_problem = (
+                    f"Set {label} in F2 (download still running, or P to the folder)."
+                    if source == "aadr_ho"
+                    else "Set the AADR folder in F2."
+                )
+            else:
+                try:
+                    cat = aadr.load_catalog(folder, panel=aadr.snp_panel_for(source))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    aadr_problem = str(exc)
         # Skip 1000G/numpy until user is on kg (G) — AADR map does not need it.
         kg_groups, kg_people, kg_problem = [], [], ""
         if source == "kg":
@@ -360,8 +424,10 @@ class ReferenceWorkspace(Workspace):
             self.app.call_from_thread(self._load_progress, gen,
                                       f"Updating Y for {genome.name}…", 0.7)
         y = self._compute_y(cat, genome, store)
-        problem = aadr_problem if source == "aadr" else (
-            kg_problem or ("No 1000 Genomes pops." if not kg_groups else ""))
+        if source in AADR_LIKE:
+            problem = aadr_problem
+        else:
+            problem = kg_problem or ("No 1000 Genomes pops." if not kg_groups else "")
         load_s = time.perf_counter() - t0
         self.app.call_from_thread(self._apply_reload, gen, {
             "genome": genome, "cat": cat, "problem": problem,
@@ -426,8 +492,13 @@ class ReferenceWorkspace(Workspace):
         self.last_load_s = float(data.get("load_s") or 0.0)
         try:
             self.genome = data["genome"]
-            if self.source == "aadr":
-                self.problem = "" if self.cat else "Set the AADR folder in F2."
+            if self.source in AADR_LIKE:
+                if self.cat:
+                    self.problem = ""
+                elif self.source == "aadr_ho":
+                    self.problem = "Set Human Origins in F2 (download still running, or P)."
+                else:
+                    self.problem = "Set the AADR folder in F2."
             else:
                 self.problem = self.kg_problem or (
                     "No 1000 Genomes pops." if not self.kg_groups else "")
@@ -467,18 +538,17 @@ class ReferenceWorkspace(Workspace):
     def _panel_stamp(self, genome: Path | None, source: str, questionable: bool) -> tuple[int, int]:
         if not genome:
             return (0, 0)
-        q = questionable if source == "aadr" else False
-        aadr_p, kg_p, _ = ref_db.genome_run_stamps(genome, q)
-        return aadr_p if source == "aadr" else kg_p
+        q = questionable if source in AADR_LIKE else False
+        return ref_db.panel_stamps(genome, source, q)
 
     def _poll_db_stamps(self) -> None:
-        """Compare panel + layer stamps in one DuckDB round-trip; reload if changed."""
+        """Compare panel + layer stamps; reload if changed."""
         genome = self.genome
         if not genome:
             return
-        q = self.questionable if self.source == "aadr" else False
-        aadr_p, kg_p, layer_stamp = ref_db.genome_run_stamps(genome, q)
-        stamp = aadr_p if self.source == "aadr" else kg_p
+        q = self.questionable if self.source in AADR_LIKE else False
+        stamp = ref_db.panel_stamps(genome, self.source, q)
+        layer_stamp = ref_db.layer_stamps(genome, q if self.source in AADR_LIKE else False)
         if stamp != self.stamp or layer_stamp != self.layer_stamp:
             self.load_results()
             self._refresh_list_views(bars=False)
@@ -520,13 +590,14 @@ class ReferenceWorkspace(Workspace):
         }
         if not genome:
             return out
-        if source == "aadr":
-            bundle = aadr.load_bundle(genome, questionable)
+        if source in AADR_LIKE:
+            bundle = aadr.load_bundle(genome, questionable, panel=source)
             out["results"], out["people"] = bundle.groups, bundle.people
             out["check"], out["pca"], out["qpadm"] = bundle.check, bundle.pca, bundle.qpadm
-            imp = aadr.load_bundle(genome, questionable, kind="imp")
+            imp = aadr.load_bundle(genome, questionable, kind="imp", panel=source)
             out["imputed"] = imp.groups
-            out["reuse_layers"] = {"aadr": bundle, "aadr_imp": imp}
+            if source == "aadr":
+                out["reuse_layers"] = {"aadr": bundle, "aadr_imp": imp}
         else:
             kg = _kg()
             bundle = kg.load_bundle(genome)
@@ -660,6 +731,27 @@ class ReferenceWorkspace(Workspace):
     def _on_line(self, name: str) -> bool:
         return name in (self.hits_people if self.people_mode else self.hits)
 
+    def _on_mt(self, name: str) -> bool:
+        """True if person/group mt shares a clade prefix with Our mt tip."""
+        tip = self.mt_tip
+        if not tip or not self.cat:
+            return False
+        from ...core.mtdna import hg_related
+        if self.people_mode:
+            for s in self.cat.samples:
+                if s.gid == name:
+                    return bool(s.mt and hg_related(s.mt, tip))
+            return False
+        g = self.cat.groups.get(name)
+        if g is None:
+            return False
+        samples = self.cat.samples
+        for i in g.samples:
+            s = samples[i]
+            if self._kept(s) and s.mt and hg_related(s.mt, tip):
+                return True
+        return False
+
     def _y_rank(self, name: str) -> int:
         h = self._hit_of(name)
         if not h:
@@ -673,29 +765,157 @@ class ReferenceWorkspace(Workspace):
         """One pass over the catalog: kept samples per group for current Q flag."""
         self._gcount_cache = {}
         self._gcount_q = self.questionable
+        self._groups_by_epoch = {}
         if not self.cat:
             return
         samples = self.cat.samples
         q = self.questionable
+        by_ep: dict[str, list[aadr.Group]] = {}
         for name, g in self.cat.groups.items():
             if not g.samples:
                 self._gcount_cache[name] = g.n
-                continue
-            n = 0
-            for i in g.samples:
-                s = samples[i]
-                if s.keep or (q and s.questionable):
-                    n += 1
-            self._gcount_cache[name] = n
+            else:
+                n = 0
+                for i in g.samples:
+                    s = samples[i]
+                    if s.keep or (q and s.questionable):
+                        n += 1
+                self._gcount_cache[name] = n
+            if self._gcount_cache[name] > 0:
+                by_ep.setdefault(g.epoch or "unknown", []).append(g)
+        self._groups_by_epoch = by_ep
 
     def _rebuild_people_cache(self) -> None:
         """gid → as_group(sample); once per catalog (Q only filters later)."""
         self._people_by_gid = {}
+        self._samples_by_epoch = {}
         if not self.cat:
             return
-        self._people_by_gid = {
-            s.gid: aadr.as_group(s) for s in self.cat.samples
-        }
+        by_ep: dict[str, list[aadr.Sample]] = {}
+        people: dict[str, aadr.Group] = {}
+        for s in self.cat.samples:
+            g = aadr.as_group(s)
+            people[s.gid] = g
+            by_ep.setdefault(g.epoch or "unknown", []).append(s)
+        self._people_by_gid = people
+        self._samples_by_epoch = by_ep
+
+    def _prewarm_world_coast(self) -> None:
+        """Fill ``_BASE_CACHE`` for the current map box (world framing)."""
+        try:
+            from ..tree.tabs.worldmap import prewarm_world_base
+            box = self.query_one("#map-box")
+            inner = self.query_one("#map-scroll")
+            w = inner.size.width or box.size.width or 80
+            h = inner.size.height or box.size.height or 24
+            cols = max(40, int(w) - 6)
+            rows_n = max(12, int(h) - 4)
+            prewarm_world_base(cols, rows_n)
+            # Nearby widths — resize / padding jitter without a cold miss.
+            for dcols in (-8, 8, -16, 16):
+                prewarm_world_base(max(40, cols + dcols), rows_n)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_mt_tip(self) -> None:
+        """Score Our mt from F1 MT calls + PhyloTree (best-effort)."""
+        self.mt_tip = None
+        self.mt_tip_score = None
+        if not self.genome:
+            return
+        try:
+            from ...core import genome_db, mtdna
+            ws = getattr(self.app, "genome_ws", None)
+            g = ws.genome if ws and genome_db.same_path(ws.genome, self.genome) else None
+            if g is None:
+                g = genome_db.get(self.genome, store=self.store)
+            if g is None:
+                return
+            hit = mtdna.tip_from_genome(g, self.store)
+            if hit:
+                self.mt_tip, self.mt_tip_score = hit
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _uysd_map_discs(self) -> list[dict]:
+        try:
+            from ...core import uysd as uysd_mod
+            idx = uysd_mod.load_index(self.store)
+            if idx is None:
+                return []
+            tip = self.y_branch.tip if self.y_branch else None
+            if not tip:
+                return []
+            return idx.map_points(tip, limit=28, fetch=True, min_pct=3.0)
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _ancibd_map_edges(self, vis: list[aadr.Group]) -> list[dict]:
+        try:
+            from ...core import ancibd as ancibd_mod
+            idx = ancibd_mod.load_index(self.store)
+            if idx is None or not self.cat:
+                return []
+        except Exception:  # noqa: BLE001
+            return []
+        # Seed: selected person, else first visible people with coords.
+        seeds: list[aadr.Sample] = []
+        g_cur, sample, _ = self._card_subject()
+        if sample is not None:
+            seeds = [sample]
+        elif self.people_mode:
+            for g in vis[:40]:
+                i = self.cat.by_gid.get(g.name)
+                if i is not None:
+                    seeds.append(self.cat.samples[i])
+        else:
+            for g in vis[:8]:
+                for i in g.samples[:3]:
+                    seeds.append(self.cat.samples[i])
+        # gid → lat/lon from catalog
+        xy: dict[str, tuple[float, float]] = {}
+        for s in self.cat.samples:
+            if s.lat is None or s.lon is None or (s.lat == 0 and s.lon == 0):
+                continue
+            xy[s.gid] = (float(s.lon), float(s.lat))
+            base = s.gid.rsplit(".", 1)[0] if "." in s.gid else s.gid
+            xy.setdefault(base, (float(s.lon), float(s.lat)))
+        edges: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for s in seeds[:12]:
+            for e in idx.for_id(s.gid, limit=8):
+                a, b = s.gid, e.other
+                key = (a, b) if a < b else (b, a)
+                if key in seen:
+                    continue
+                p1 = xy.get(a) or xy.get(a.rsplit(".", 1)[0] if "." in a else a)
+                p2 = xy.get(b) or xy.get(b.rsplit(".", 1)[0] if "." in b else b)
+                if not p1 or not p2:
+                    continue
+                seen.add(key)
+                edges.append({
+                    "lon1": p1[0], "lat1": p1[1],
+                    "lon2": p2[0], "lat2": p2[1],
+                    "cm": e.sum_cm, "a": a, "b": b,
+                })
+                if len(edges) >= 40:
+                    return edges
+        return edges
+
+    def _amtdb_map_anchors(self) -> list[dict]:
+        try:
+            from ...core import mtdna as mtdna_mod
+        except Exception:  # noqa: BLE001
+            return []
+        hg = self.mt_tip or ""
+        g, sample, _ = self._card_subject()
+        if sample is not None and sample.mt:
+            hg = sample.mt
+        elif g is not None and g.mt:
+            hg = g.mt[0] if isinstance(g.mt, list) and g.mt else (g.mt or hg)
+        if not hg:
+            return []
+        return mtdna_mod.map_anchors_for_hg(str(hg), store=self.store, limit=10)
 
     def _person_group(self, s: aadr.Sample) -> aadr.Group:
         g = self._people_by_gid.get(s.gid)
@@ -818,35 +1038,48 @@ class ReferenceWorkspace(Workspace):
         if self.people_mode:
             if not self._people_by_gid:
                 self._rebuild_people_cache()
-            for s in self.cat.samples:
-                if not self._kept(s) or s.group == self.cat.outgroup:
+            if self.epoch == "all":
+                sample_pool: list[aadr.Sample] = list(self.cat.samples)
+            else:
+                sample_pool = list(self._samples_by_epoch.get(self.epoch, ()))
+            og = self.cat.outgroup
+            for s in sample_pool:
+                if not self._kept(s) or s.group == og:
                     continue
                 g = self._person_group(s)
-                if self.epoch != "all" and g.epoch != self.epoch:
-                    continue
                 if not self._in_region(g):
                     continue
                 if self.y_only and not self._on_line(s.gid):
                     continue
-                if self.y_only or s.gid in self.hits_people or s.lat is not None or s.gid in self.people:
+                if self.mt_only and not self._on_mt(s.gid):
+                    continue
+                if (self.y_only or self.mt_only or s.gid in self.hits_people
+                        or s.lat is not None or s.gid in self.people):
                     if self._passes_score_filter(s.gid, scores):
                         rows.append(g)
         else:
-            for g in self.cat.groups.values():
-                if self._gcount(g) <= 0:
-                    continue
-                if self.epoch != "all" and g.epoch != self.epoch:
-                    continue
+            if self._gcount_q != self.questionable or not self._gcount_cache:
+                self._rebuild_gcount_cache()
+            if self.epoch == "all":
+                group_pool: list[aadr.Group] = [
+                    g for ep in self._groups_by_epoch.values() for g in ep]
+            else:
+                group_pool = list(self._groups_by_epoch.get(self.epoch, ()))
+            for g in group_pool:
                 if not self._in_region(g):
                     continue
                 if self.y_only and not self._on_line(g.name):
                     continue
-                if self.y_only or g.name in self.hits or g.lat is not None or g.name in self.results:
+                if self.mt_only and not self._on_mt(g.name):
+                    continue
+                if (self.y_only or self.mt_only or g.name in self.hits
+                        or g.lat is not None or g.name in self.results):
                     if self._passes_score_filter(g.name, scores):
                         rows.append(g)
 
         rows.sort(key=lambda g: self._row_key(g, scores))
-        if (self.epoch == "all" and self.area == "all" and not self.y_only
+        if (self.epoch == "all" and self.area == "all"
+                and not self.y_only and not self.mt_only
                 and len(rows) > 250):
             rows = self._cap_rows(rows, scores)
         return rows
@@ -910,7 +1143,7 @@ class ReferenceWorkspace(Workspace):
         cached = self._map_blink_frames.get(self._sel_blink)
         key = self._map_blink_key
         if cached is not None and key is not None:
-            # key: (tab, source, epoch, world, people, focus, sel, cols, rows, …)
+            # key: tab, source, epoch, world, people, habitat, polity, focus, sel, cols, rows, …
             box = self.query_one("#map-box")
             inner = self.query_one("#map-scroll")
             w = inner.size.width or box.size.width
@@ -918,8 +1151,12 @@ class ReferenceWorkspace(Workspace):
             cols = max(40, (w or 80) - 6)
             rows_n = max(12, (h or 24) - 4)
             sel = self.current.name if self.current else None
-            if (key[0] == self.tab and key[7] == cols and key[8] == rows_n
-                    and key[6] == sel):
+            if (key[0] == self.tab
+                    and key[5] == self.map_habitat and key[6] == self.map_polity
+                    and key[7] == self.map_uysd and key[8] == self.map_kin
+                    and key[9] == self.map_amtdb
+                    and key[10] == self.map_focus
+                    and key[11] == sel and key[12] == cols and key[13] == rows_n):
                 self.query_one("#map", Static).update(cached)
                 return
         # First off-phase (or size/selection change): draw once and keep the frame.
@@ -931,6 +1168,8 @@ class ReferenceWorkspace(Workspace):
     ) -> tuple:
         return (
             self.tab, self.source, self.epoch, self.world, self.people_mode,
+            self.map_habitat, self.map_polity,
+            self.map_uysd, self.map_kin, self.map_amtdb,
             self.map_focus, sel, cols, rows_n, title,
             tuple(g.name for g in vis),
             id(self._scores()), id(self._ranks()),
@@ -942,6 +1181,21 @@ class ReferenceWorkspace(Workspace):
             self._map_blink_frames = {}
         self._map_blink_frames[self._sel_blink] = text
 
+    def _set_list_highlight(self, ol: OptionList, index: int) -> None:
+        """Set highlighted without scheduling a redundant map redraw."""
+        self._list_syncing = True
+        try:
+            ol.highlighted = index
+        finally:
+            self._list_syncing = False
+        # Drop a timer that may have been armed if the event was deferred.
+        if self._map_sel_timer is not None:
+            try:
+                self._map_sel_timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._map_sel_timer = None
+
     def fill_list(self, rows: list[aadr.Group] | None = None,
                   *, update_filter: bool = True) -> list[aadr.Group]:
         ol = self.query_one("#groups", OptionList)
@@ -952,29 +1206,59 @@ class ReferenceWorkspace(Workspace):
         ranks = self._ranks()
         meta = self._list_meta(rows)
         self._meta_by_name = {m["g"].name: m for m in meta}
-        opts = []
+        new_ids = [m["g"].name for m in meta]
+        prompts: list = []
+        sigs: dict[str, str] = {}
         for m in meta:
             g = m["g"]
-            opts.append(Option(group_prompt(g, m["r"], m["hit"], ranks.get(g.name),
-                                            place=m["place"], decide=m["decide"],
-                                            outside_head=m["outside_head"]),
-                               id=g.name))
+            prompt = group_prompt(g, m["r"], m["hit"], ranks.get(g.name),
+                                  place=m["place"], decide=m["decide"],
+                                  outside_head=m["outside_head"])
+            prompts.append(prompt)
+            sigs[g.name] = prompt.plain
+        # Same membership + order → only rewrite changed prompts (no clear/rebuild).
+        if (new_ids == self._list_ids and ol.option_count == len(new_ids)
+                and new_ids):
+            for oid, prompt in zip(new_ids, prompts):
+                if self._list_prompt_sigs.get(oid) != sigs[oid]:
+                    try:
+                        ol.replace_option_prompt(oid, prompt)
+                    except Exception:  # noqa: BLE001
+                        # Id missing / stale — fall through to full rebuild.
+                        self._list_ids = []
+                        break
+            else:
+                self._list_prompt_sigs = sigs
+                if keep in new_ids:
+                    self._set_list_highlight(ol, new_ids.index(keep))
+                self._fill_list_chrome(rows, update_filter=update_filter)
+                return rows
+        opts = [Option(prompt, id=oid) for oid, prompt in zip(new_ids, prompts)]
         ol.clear_options()
-        ol.add_options(opts)
-        if rows:
-            ids = [g.name for g in rows]
-            ol.highlighted = ids.index(keep) if keep in ids else 0
+        if opts:
+            ol.add_options(opts)
+        self._list_ids = new_ids
+        self._list_prompt_sigs = sigs
+        if rows and keep in new_ids:
+            self._set_list_highlight(ol, new_ids.index(keep))
+        elif rows:
+            self._set_list_highlight(ol, 0)
+        self._fill_list_chrome(rows, update_filter=update_filter)
+        return rows
+
+    def _fill_list_chrome(self, rows: list[aadr.Group], *, update_filter: bool) -> None:
         bits = [f"{len(rows)} {'people' if self.people_mode else 'groups'}",
                 "lo › Z › SNP › Y"]
         if self.y_only:
             bits.append("Y-only")
+        if self.mt_only:
+            bits.append("mt-only")
         if self.questionable:
             bits.append("Q")
         self.query_one("#groups-box").border_subtitle = " · ".join(bits)
         self._set_groups_title()
         if update_filter:
             self.refresh_score_filter(shown=len(rows))
-        return rows
 
     def _refresh_bars(self) -> None:
         """Source / epoch / region / tab chrome (no list or map)."""
@@ -1112,10 +1396,12 @@ class ReferenceWorkspace(Workspace):
         labels = self._epoch_labels()
         if self.tab == "y":
             self.query_one("#map-scroll").styles.overflow_y = "hidden"
-            if self.source != "aadr":
+            if self.source not in AADR_LIKE:
                 self._map_blink_key = None
                 self._map_blink_frames = {}
-                body.update(Text("Y map is AADR-only. Switch to AADR with G.", style="#AEA5B8"))
+                self._map_points_key = None
+                self._map_points = None
+                body.update(Text("Y map is AADR/HO-only. Switch with G.", style="#AEA5B8"))
                 return
             box = self.query_one("#map-box")
             inner = self.query_one("#map-scroll")
@@ -1135,18 +1421,29 @@ class ReferenceWorkspace(Workspace):
             key = self._map_blink_content_key(
                 cols=cols, rows_n=rows_n, title=title, sel=sel, vis=vis)
             hits = self.hits_people if self.people_mode else self.hits
+            scores, ranks = self._scores(), self._ranks()
+            if self._map_points_key == key and self._map_points is not None:
+                points = self._map_points
+            else:
+                points = y_map_points(
+                    vis, scores, ranks, hits, self.y_ours_other, sel)
+                self._map_points_key = key
+                self._map_points = points
             # Same GROUPS rows as the list — draw_y_map drops non-hits / no coords.
+            # Lazy off-phase: _sel_blink_tick draws the sibling frame on demand.
             text = draw_y_map(
-                vis, self._scores(), self._ranks(), hits,
+                vis, scores, ranks, hits,
                 self.y_ours_other, sel,
                 title, self.world, cols, rows_n,
-                selected_blink=self._sel_blink)
+                selected_blink=self._sel_blink, points=points)
             self._store_map_blink_frame(key, text)
             body.update(text)
             return
         if self.tab == "tree":
             self._map_blink_key = None
             self._map_blink_frames = {}
+            self._map_points_key = None
+            self._map_points = None
             self.query_one("#map-scroll").styles.overflow_y = "auto"
             body.update(tree_view(
                 vis, self._scores(), self._ranks(),
@@ -1158,13 +1455,23 @@ class ReferenceWorkspace(Workspace):
         if self.tab == "layers":
             self._map_blink_key = None
             self._map_blink_frames = {}
+            self._map_points_key = None
+            self._map_points = None
             self.query_one("#map-scroll").styles.overflow_y = "auto"
             self._load_layer_bundles(self.genome, self.questionable)
             aadr_b, aadr_imp = self.layer_aadr, self.layer_aadr_imp
             kg_b, kg_imp = self.layer_kg, self.layer_kg_imp
+            if self.source == "aadr_ho":
+                # HO f3 lives in self.results — fabricate a thin Bundle for LAYERS counts.
+                aadr_b = aadr.Bundle(
+                    groups=dict(self.results), people=dict(self.people),
+                    check=self.check, pca=self.pca, qpadm=None,
+                    snps=0, outgroup=(self.cat.outgroup if self.cat else "") or "",
+                )
+                aadr_imp = aadr.Bundle(groups=dict(self.imputed)) if self.imputed else None
             rows = _admix().layer_state(self.store, self.genome, self.source,
                                         aadr_b, kg_b, aadr_imp, kg_imp)
-            if self.source == "aadr":
+            if self.source in AADR_LIKE:
                 chip = aadr_b.groups if aadr_b else {}
                 imp = aadr_imp.groups if aadr_imp else {}
             else:
@@ -1182,31 +1489,84 @@ class ReferenceWorkspace(Workspace):
         cols = max(40, (w or 80) - 6)
         rows_n = max(12, (h or 24) - 4)
         if self.epoch == "all":
-            title = "ALL EPOCHS" if self.source == "aadr" else "1000 GENOMES"
+            title = {
+                "aadr": "ALL EPOCHS",
+                "aadr_ho": "HUMAN ORIGINS",
+                "kg": "1000 GENOMES",
+            }.get(self.source, self.source.upper())
         else:
             title = labels.get(self.epoch, self.epoch)
         if self.people_mode:
             title += " · people"
         seshat: list[dict] = []
-        if self.epoch != "all" and self.source == "aadr":
+        clio: list[dict] = []
+        want_polity = self.map_polity or (
+            bool(self.map_focus) and str(self.map_focus).startswith("p:"))
+        if self.epoch != "all" and self.source in AADR_LIKE:
             skey = (self.epoch, tuple(g.name for g in vis))
             if skey != self._seshat_cache_key:
                 self._seshat_cache_key = skey
                 self._seshat_cache = seshat_layer_for_groups(
                     vis, epoch=self.epoch, store=self.store)
             seshat = self._seshat_cache
+            if want_polity:
+                ckey = (self.epoch, self.world, tuple(g.name for g in vis[:80]))
+                if ckey != self._clio_cache_key:
+                    self._clio_cache_key = ckey
+                    self._clio_cache = cliopatria_layer_for_epoch(
+                        self.epoch, store=self.store, world=self.world, groups=vis)
+                clio = self._clio_cache
             if seshat:
                 title += f" · §{len(seshat)}"
+        freq_discs: list[dict] = []
+        kin_edges: list[dict] = []
+        amtdb_anchors: list[dict] = []
+        want_freq = self.map_uysd or (
+            bool(self.map_focus) and str(self.map_focus).startswith("u:"))
+        want_kin = self.map_kin or (
+            bool(self.map_focus) and str(self.map_focus).startswith("k:"))
+        want_amtdb = self.map_amtdb or (
+            bool(self.map_focus) and str(self.map_focus).startswith("m:"))
+        if want_freq:
+            freq_discs = self._uysd_map_discs()
+            if freq_discs:
+                title += f" · %{len(freq_discs)}"
+        if want_kin and self.source in AADR_LIKE and self.cat:
+            kin_edges = self._ancibd_map_edges(vis)
+            if kin_edges:
+                title += f" · ≈{len(kin_edges)}"
+        if want_amtdb:
+            amtdb_anchors = self._amtdb_map_anchors()
+            if amtdb_anchors:
+                title += f" · m{len(amtdb_anchors)}"
+        anchors = list(seshat or []) + amtdb_anchors
         sel = self.current.name if self.current else None
         key = self._map_blink_content_key(
             cols=cols, rows_n=rows_n, title=title, sel=sel, vis=vis)
-        text = draw_map(vis, self._scores(), self._ranks(),
+        scores, ranks = self._scores(), self._ranks()
+        if self._map_points_key == key and self._map_points is not None:
+            points = self._map_points
+        else:
+            points = map_points(vis, scores, ranks, sel)
+            self._map_points_key = key
+            self._map_points = points
+        # Lazy off-phase: only the current blink frame; tick draws the other.
+        text = draw_map(vis, scores, ranks,
                         sel, title,
                         self.world, cols, rows_n,
                         culture_labels=(self.epoch != "all"),
-                        seshat_anchors=seshat or None,
+                        seshat_anchors=anchors or None,
+                        cliopatria_polities=clio or None,
+                        show_habitat=self.map_habitat,
+                        show_polity=self.map_polity,
+                        freq_discs=freq_discs or None,
+                        kin_edges=kin_edges or None,
+                        show_freq=self.map_uysd,
+                        show_kin=self.map_kin,
+                        show_amtdb=self.map_amtdb,
                         selected_blink=self._sel_blink,
-                        map_focus=self.map_focus)
+                        map_focus=self.map_focus,
+                        points=points)
         self._store_map_blink_frame(key, text)
         body.update(text)
 
@@ -1214,7 +1574,7 @@ class ReferenceWorkspace(Workspace):
         """Current GROUP/PERSON selection + cache key for SUMMARY."""
         g = self.current
         sample = None
-        if (self.source == "aadr" and self.people_mode and self.cat and g
+        if (self.source in AADR_LIKE and self.people_mode and self.cat and g
                 and g.name in self.cat.by_gid):
             sample = self.cat.samples[self.cat.by_gid[g.name]]
         key = sample.gid if sample is not None else (g.name if g else None)
@@ -1242,7 +1602,7 @@ class ReferenceWorkspace(Workspace):
         card_box = self.query_one("#card")
         md_w = max(36, (card_box.size.width or 52) - 2)
         t = card(g, sample=sample,
-                 cat=self.cat if self.source == "aadr" else None,
+                 cat=self.cat if self.source in AADR_LIKE else None,
                  hit=self._hit_of(g.name) if g else None,
                  branch=self.y_branch.tip if self.y_branch else None,
                  questionable=self.questionable,
@@ -1259,7 +1619,10 @@ class ReferenceWorkspace(Workspace):
                  summary_draft=draft,
                  summary_model=model_hint,
                  summary_width=md_w,
-                 y_hits=self.hits_people)
+                 y_hits=self.hits_people,
+                 store=self.store,
+                 mt_tip=self.mt_tip,
+                 mt_tip_score=self.mt_tip_score)
         card_box.update(t)
 
     def update_status(self) -> None:
@@ -1268,14 +1631,17 @@ class ReferenceWorkspace(Workspace):
             self.query_one("#status", Static).update(f"{self.loading_msg}{g}")
             return
         scored = sum(1 for r in self.results.values() if r.ok)
-        if self.source == "aadr":
+        if self.source in AADR_LIKE:
             n = self.cat.n_pass if self.cat else 0
             g = len(self.cat.groups) if self.cat else 0
             og = self.cat.outgroup if self.cat else "—"
             people = sum(1 for r in self.people.values() if r.ok)
-            line = f"AADR: {n:,} samples · {g:,} groups · outgroup {og}    f3: {scored}g/{people}p"
+            tag = "HO" if self.source == "aadr_ho" else "AADR"
+            line = f"{tag}: {n:,} samples · {g:,} groups · outgroup {og}    f3: {scored}g/{people}p"
             if self.y_branch:
                 line += f"    Y {self.y_branch.tip}"
+            if self.mt_tip:
+                line += f"    mt {self.mt_tip}"
             if self.questionable:
                 line += "    Q"
             if self.check:
@@ -1307,7 +1673,7 @@ class ReferenceWorkspace(Workspace):
     def _layers_paint_sig(self) -> tuple:
         """LAYERS content identity — DB stamps + live job stages (not wall-clock)."""
         job_bits: list[tuple] = []
-        for k in (JOB, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT):
+        for k in (JOB, JOB_HO, JOB_KG, JOB_PCA, JOB_QPADM, JOB_IMPUTE, JOB_PAINT):
             j = JOBS.get(k)
             if j and j.active:
                 job_bits.append((
@@ -1361,9 +1727,49 @@ class ReferenceWorkspace(Workspace):
 
     @on(OptionList.OptionHighlighted, "#groups")
     def _highlighted(self) -> None:
+        # Programmatic highlight from fill_list — callers paint card/map themselves.
+        if self._list_syncing:
+            return
         self._sel_blink = True
         self.refresh_card()
-        # Same visible set — only selection glyph / card change.
+        # Map/Y need a new ◆ frame; tree/layers don't paint selection on the map.
+        # Debounce: arrowing the list otherwise redraws the full braille map ~15–30ms
+        # per key — coalesce into one paint after navigation pauses.
+        if self.tab not in ("map", "y"):
+            return
+        if self._map_sel_timer is not None:
+            try:
+                self._map_sel_timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._map_sel_timer = self.set_timer(0.05, self._flush_map_selection)
+
+    def _flush_map_selection(self) -> None:
+        self._map_sel_timer = None
+        if self.tab not in ("map", "y"):
+            return
+        # Skip full redraw when refresh_map already painted this selection
+        # (fill_list → OptionHighlighted after paint, or duplicate flush).
+        key = self._map_blink_key
+        if key is not None:
+            sel = self.current.name if self.current else None
+            box = self.query_one("#map-box")
+            inner = self.query_one("#map-scroll")
+            w = inner.size.width or box.size.width
+            h = inner.size.height or box.size.height
+            cols = max(40, (w or 80) - 6)
+            rows_n = max(12, (h or 24) - 4)
+            if (key[0] == self.tab
+                    and key[5] == self.map_habitat and key[6] == self.map_polity
+                    and key[7] == self.map_uysd and key[8] == self.map_kin
+                    and key[9] == self.map_amtdb
+                    and key[10] == self.map_focus
+                    and key[11] == sel and key[12] == cols and key[13] == rows_n):
+                cached = self._map_blink_frames.get(True)
+                if cached is not None:
+                    self._sel_blink = True
+                    self.query_one("#map", Static).update(cached)
+                    return
         self.refresh_map(vis=self._last_vis)
 
     def action_score_set(self, axis: str, value: float) -> None:
@@ -1543,6 +1949,8 @@ class ReferenceWorkspace(Workspace):
         self.map_focus = None
         self._seshat_cache_key = None
         self._seshat_cache = []
+        self._clio_cache_key = None
+        self._clio_cache = []
         if key == "all":
             self.playing = False
             if self._play:
@@ -1599,14 +2007,34 @@ class ReferenceWorkspace(Workspace):
             self.update_status()
 
     def action_toggle_y(self) -> None:
-        if self.source != "aadr":
-            self.app.notify("Y line is AADR-only", timeout=4)
+        """Cycle GROUPS filter: all → Y-only → mt-only → all."""
+        if self.source not in AADR_LIKE:
+            self.app.notify("Y/mt filter is AADR/HO-only", timeout=4)
             return
-        self.y_only = not self.y_only
+        if not self.y_only and not self.mt_only:
+            self.y_only = True
+            self.mt_only = False
+            msg = "Y-only"
+            if self.y_branch:
+                off = sum(1 for h in self.hits.values() if h.relation == "other")
+                msg = f"Y-only · {self.y_branch.tip} · {off} other Y still listed"
+        elif self.y_only:
+            self.y_only = False
+            if not self.mt_tip:
+                self.mt_only = False
+                self.app.notify(
+                    "mt filter needs Our mt tip (F2 PhyloTree + F1 MT calls)",
+                    timeout=5)
+                self._refresh_list_views(bars=False)
+                return
+            self.mt_only = True
+            msg = f"mt-only · Our {self.mt_tip}"
+        else:
+            self.y_only = False
+            self.mt_only = False
+            msg = "Y/mt filter off"
         self._refresh_list_views(bars=False)
-        if self.y_only and self.y_branch:
-            off = sum(1 for h in self.hits.values() if h.relation == "other")
-            self.app.notify(f"Y branch {self.y_branch.tip} · {off} other Y still listed")
+        self.app.notify(msg, timeout=4)
 
     def action_toggle_people(self) -> None:
         if self.source == "kg" and not self.kg_people_groups:
@@ -1616,8 +2044,8 @@ class ReferenceWorkspace(Workspace):
         self._refresh_list_views(bars=True)
 
     def action_toggle_quest(self) -> None:
-        if self.source != "aadr":
-            self.app.notify("Questionable is AADR-only", timeout=4)
+        if self.source not in AADR_LIKE:
+            self.app.notify("Questionable is AADR/HO-only", timeout=4)
             return
         self.questionable = not self.questionable
         self.load_results()
@@ -1628,6 +2056,38 @@ class ReferenceWorkspace(Workspace):
     def action_toggle_world(self) -> None:
         self.world = not self.world
         self.refresh_map()
+
+    def action_toggle_map_overlay(self) -> None:
+        """Cycle overlays: pts → ⌂ → ¶ → both → % UYSD → ≈ kin → m AmtDB."""
+        state = (self.map_habitat, self.map_polity,
+                 self.map_uysd, self.map_kin, self.map_amtdb)
+        cycle = (
+            (False, False, False, False, False),
+            (True, False, False, False, False),
+            (False, True, False, False, False),
+            (True, True, False, False, False),
+            (False, False, True, False, False),
+            (False, False, False, True, False),
+            (False, False, False, False, True),
+        )
+        try:
+            i = cycle.index(state)
+        except ValueError:
+            i = 0
+        (self.map_habitat, self.map_polity,
+         self.map_uysd, self.map_kin, self.map_amtdb) = cycle[(i + 1) % len(cycle)]
+        label = {
+            (False, False, False, False, False): "sites only (overlays off)",
+            (True, False, False, False, False): "⌂ habitat ranges — where cultures lived",
+            (False, True, False, False, False): "¶ Cliopatria — historical empires",
+            (True, True, False, False, False): "⌂ habitat + ¶ empires",
+            (False, False, True, False, False): "% UYSD — modern Y frequencies (Our Y tip)",
+            (False, False, False, True, False): "≈ ancIBD — kinship edges",
+            (False, False, False, False, True): "m AmtDB — ancient mt for selection",
+        }.get((self.map_habitat, self.map_polity,
+               self.map_uysd, self.map_kin, self.map_amtdb), "overlays")
+        self.app.notify(f"O · {label}", timeout=3)
+        self.refresh_map(vis=self._last_vis)
 
     def action_score(self) -> None:
         if not self.genome:
@@ -1654,14 +2114,19 @@ class ReferenceWorkspace(Workspace):
             self.app.notify(self.problem, severity="warning")
             return
         if not self.cat or not self.cat.files.get("geno"):
-            self.app.notify("AADR .geno is missing", severity="warning")
+            miss = "Human Origins" if self.source == "aadr_ho" else "AADR"
+            self.app.notify(f"{miss} .geno is missing", severity="warning")
             return
-        if (job := JOBS.get(JOB)) and job.running:
+        job_key = JOB_HO if self.source == "aadr_ho" else JOB
+        if (job := JOBS.get(job_key)) and job.running:
             self.app.notify("f3 scan is already running (C cancels it)", severity="warning")
             return
         q = self.questionable
-        JOBS.start(JOB, f"AADR · outgroup-f3 · {gp.name}",
-                   lambda j, q=q: _fstats().scan_f3(store, gp, j, loaded, q))
+        panel_key = self.source
+        label = self._source_label(panel_key)
+        JOBS.start(job_key, f"{label} · outgroup-f3 · {gp.name}",
+                   lambda j, q=q, pk=panel_key: _fstats().scan_f3(
+                       store, gp, j, loaded, q, panel_key=pk))
         self.update_status()
 
     def action_cancel(self) -> None:
@@ -1680,17 +2145,19 @@ class ReferenceWorkspace(Workspace):
             self.app.notify("Nothing is running")
 
     def action_source(self, key: str) -> None:
-        if key not in ("aadr", "kg") or key == self.source:
+        if key not in SRC_CYCLE or key == self.source:
             return
         self.source = key
         self.epoch = "all"
         self.area = "all"
         self.people_mode = False
         self.y_only = False
+        self.mt_only = False
         self.reload()
 
     def action_toggle_source(self) -> None:
-        self.action_source("kg" if self.source == "aadr" else "aadr")
+        i = SRC_CYCLE.index(self.source) if self.source in SRC_CYCLE else 0
+        self.action_source(SRC_CYCLE[(i + 1) % len(SRC_CYCLE)])
 
     def action_tab(self, key: str) -> None:
         if key not in TABS or key == self.tab:
@@ -1732,6 +2199,79 @@ class ReferenceWorkspace(Workspace):
         job = JOBS.get(JOB_SUMMARY)
         return not (job and job.active)
 
+    def _summary_extras(
+        self, g: aadr.Group, sample: aadr.Sample | None, keep: list[aadr.Sample],
+    ) -> dict:
+        """Local F2/kit facts for SUMMARY grounding (cache-only; no network)."""
+        extras: dict = {
+            "our_mt": self.mt_tip,
+            "our_mt_score": self.mt_tip_score,
+            "our_y": self.y_branch.tip if self.y_branch else None,
+            "uysd_top": None,
+            "amtdb_hits": None,
+            "kin_edges": None,
+        }
+        try:
+            from ...core import uysd as uysd_mod
+            tip = extras["our_y"]
+            idx = uysd_mod.load_index(self.store)
+            if idx is not None and tip:
+                rows = idx.frequencies(tip, limit=6, fetch=False)
+                extras["uysd_top"] = [
+                    {"haplogroup": tip, "label": r.label, "pct": r.pct, "n": r.n}
+                    for r in rows
+                ] or None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from ...core import mtdna as mtdna_mod
+            hg = ""
+            if sample is not None and sample.mt:
+                hg = sample.mt
+            elif keep:
+                for s in keep:
+                    if s.mt:
+                        hg = s.mt
+                        break
+            if not hg:
+                hg = self.mt_tip or ""
+            amt = mtdna_mod.load_amtdb(self.store)
+            if amt is not None and hg:
+                extras["amtdb_hits"] = [
+                    {
+                        "id": s.identifier,
+                        "mt": s.mt_hg,
+                        "culture": s.culture,
+                        "country": s.country,
+                        "epoch": s.epoch,
+                    }
+                    for s in amt.match(hg, limit=6)
+                ] or None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from ...core import ancibd as ancibd_mod
+            aidx = ancibd_mod.load_index(self.store)
+            if aidx is not None:
+                seeds = [sample] if sample is not None else keep[:8]
+                edges: list[dict] = []
+                for s in seeds:
+                    for e in aidx.for_id(s.gid, limit=3):
+                        edges.append({
+                            "seed": s.gid,
+                            "other": e.other,
+                            "sum_cm": e.sum_cm,
+                            "n_seg": e.n_seg,
+                        })
+                        if len(edges) >= 8:
+                            break
+                    if len(edges) >= 8:
+                        break
+                extras["kin_edges"] = edges or None
+        except Exception:  # noqa: BLE001
+            pass
+        return extras
+
     def action_ask_summary(self, refresh: bool = False) -> None:
         """SUMMARY tab: ask Chat model for a scientific brief grounded in ANNO."""
         g, sample, key = self._card_subject()
@@ -1754,10 +2294,11 @@ class ReferenceWorkspace(Workspace):
                                 severity="warning")
                 return
         keep: list[aadr.Sample] = []
-        if self.cat and self.source == "aadr":
+        if self.cat and self.source in AADR_LIKE:
             keep = [s for s in (self.cat.samples[i] for i in g.samples)
                     if s.keep or (self.questionable and s.questionable)]
-        prompt = summary_prompt(g, keep, sample=sample)
+        extras = self._summary_extras(g, sample, keep)
+        prompt = summary_prompt(g, keep, sample=sample, **extras)
         title = f"Summary · {key}"[:48]
         store = self.store
         subject = key
@@ -1862,7 +2403,7 @@ class ReferenceWorkspace(Workspace):
         self.refresh_all()
 
     def action_map_focus(self, key: str) -> None:
-        """Toggle DEFCON radar for an ocean-legend culture / Seshat row."""
+        """Toggle DEFCON radar for ocean-legend culture / Cliopatria / Seshat."""
         key = (key or "").strip()
         if not key:
             return

@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from . import aadr, genome_db
-from .aadr import F3, mark_clusters, save_results
+from .aadr import KEEP, F3, mark_clusters, save_results
 from .genome import Genome
 from .jobs import Cancelled, Job
 from .pgs import AUTOSOMES, COMPLEMENT, PALINDROMIC
@@ -23,6 +23,10 @@ HEADER = 48
 BLOCK_M = 0.05                      # размер блока jackknife, морганы
 MIN_SNPS = 1000
 MIN_OUT = 2
+# Person-level f3 is O(n_samples); HO keeps ~24k moderns and turns a scan into hours
+# (plus DuckDB rewrites every flush). Cap: groups still scored; People mode needs a
+# smaller panel (1240K ancients) or a later subsampled pass.
+PEOPLE_F3_CAP = 8_000
 # TGENO хранит копии allele1; 0↔2 даёт копии allele2. 3 = missing.
 _FLIP = np.array([2, 1, 0, 3], dtype=np.uint8)
 
@@ -155,7 +159,8 @@ def match_chip(snps: list[tuple[str, str, float, int, str, str]],
         rsids.append(rsid)
         a2s.append(a2)
     if len(idx) < MIN_SNPS:
-        raise RuntimeError(f"only {len(idx)} SNPs overlap the chip and AADR 1240K (need {MIN_SNPS})")
+        raise RuntimeError(f"only {len(idx)} SNPs overlap the chip and the reference panel "
+                           f"(need {MIN_SNPS})")
     panel = Panel(np.array(idx, np.int32), np.array(blocks, np.int32), len(block_key),
                   rsids, a2s)
     return panel, np.array(dose, np.float64), np.array(n_al, np.float64)
@@ -435,18 +440,21 @@ def _read_outgroup(geno: Path, indices: list[int], panel: Panel,
 def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = None,
             questionable: bool = False, kind: str = "",
             p_t: np.ndarray | None = None, n_t: np.ndarray | None = None,
-            panel: Panel | None = None) -> str:
-    folder = store.path("aadr")
+            panel: Panel | None = None, panel_key: str = "aadr") -> str:
+    """Outgroup-f3 vs AADR 1240K (``panel_key='aadr'``) or Human Origins (``'aadr_ho'``)."""
+    folder = store.path(panel_key)
+    label = "Human Origins" if panel_key == "aadr_ho" else "AADR"
     if not folder:
-        raise RuntimeError("set the AADR folder in F2")
-    cat = aadr.load_catalog(folder, job)
+        raise RuntimeError(f"set the {label} folder in F2")
+    snp_panel = aadr.snp_panel_for(panel_key)
+    cat = aadr.load_catalog(folder, job, panel=snp_panel)
     geno, snp_path = cat.files.get("geno"), cat.files.get("snp")
     if geno is None or snp_path is None:
-        raise RuntimeError("AADR .geno/.snp missing")
+        raise RuntimeError(f"{label} .geno/.snp missing")
     if not cat.outgroup:
         raise RuntimeError("no Mbuti outgroup with ≥2 samples after QC")
 
-    job.set_stage("matching SNPs to AADR")
+    job.set_stage(f"matching SNPs to {label}")
     g = genome_db.get(genome_path, genome)
     if panel is None:
         panel, dose_t, n_chip = match_chip(read_snp(snp_path), g)
@@ -456,7 +464,7 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
     elif p_t is None or n_t is None:
         raise RuntimeError("imputed scan needs dosages for the panel")
     if len(p_t) != len(panel.index) or len(n_t) != len(panel.index):
-        raise RuntimeError("dosages do not match the AADR panel")
+        raise RuntimeError(f"dosages do not match the {label} panel")
 
     want = _wanted(cat, questionable)
     names = [n for n, gr in cat.groups.items() if n != cat.outgroup
@@ -475,15 +483,19 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
 
     row_of: list[list[tuple[int, bool]]] = [[] for _ in range(cat.nind)]
     og: list[int] = []
+    n_keep = 0
     for s in cat.samples:
         if not want[s.i]:
             continue
+        n_keep += 1
         if s.group == cat.outgroup:
             og.append(s.i)
         elif s.group in gi:
             k = gi[s.group]
             row_of[s.i].append((k, s.diploid))
             left[k] += 1
+    # HO Affy moderns almost all Pass → person-f3 dominates runtime; keep groups only.
+    score_people = n_keep <= PEOPLE_F3_CAP
 
     job.set_stage("reading outgroup", len(og))
     _read_outgroup(geno, og, panel, cat, alt_o, n_o)
@@ -516,14 +528,20 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
             _mark_epoch_f4(groups, cat, gi, p_o, n_o, p_t, n_t, alt, nct, panel)
             job.set_stage("group PCA")
             pca = _group_pca(names, gi, alt, nct, p_t, n_t, n_o)
-        mark_clusters(list(people.values()))
-        save_results(genome_path, cat.outgroup or "", n_snps, groups, people=people,
+        if people:
+            mark_clusters(list(people.values()))
+        # Partial: rewrite groups only — rewriting tens of thousands of person rows
+        # every 1.5s is what made HO scans look hung / die mid-flight.
+        save_results(genome_path, cat.outgroup or "", n_snps, groups,
+                     people=KEEP if partial else people,
                      check=None if partial else check, questionable=questionable,
-                     partial=partial, kind=kind, pca=None if partial else pca)
+                     partial=partial, kind=kind, pca=None if partial else pca,
+                     panel=panel_key)
         last_save = time.monotonic()
 
     job.unit = "items"
-    job.set_stage("scanning AADR", nind)
+    people_note = "" if score_people else f" · groups only ({n_keep:,} samples > {PEOPLE_F3_CAP:,})"
+    job.set_stage(f"scanning {label}{people_note}", nind)
     try:
         with geno.open("rb") as fh:
             fh.seek(HEADER)
@@ -533,12 +551,12 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
                 if fh.readinto(buf) != rlen:
                     raise RuntimeError(f"TGENO truncated at individual {i}")
                 if i not in og_set and not row_of[i]:
-                    if i % 20 == 0:
+                    if i % 100 == 0:
                         job.progress(i + 1)
                     continue
                 gtypes = dosages(buf, panel.index)
                 if i in og_set:
-                    if i % 20 == 0:
+                    if i % 100 == 0:
                         job.progress(i + 1)
                     continue
                 s = cat.samples[i]
@@ -552,16 +570,18 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
                             nct[k].astype(np.float64), panel.block, panel.n_blocks)
                         if used > 0:
                             groups[names[k]] = _record(names[k], est, se, int(n_ind[k]), used)
-                (est, se, used), alt_p, n_p = _from_gtypes(
-                    gtypes, s.diploid, p_o, n_o, p_t, n_t, panel)
-                if used > 0:
-                    people[s.gid] = _record(s.gid, est, se, 1, used)
-                if probe and i == probe.i:
-                    alt_h, n_h = alt_p, n_p
+                need_person = score_people or (probe is not None and i == probe.i)
+                if need_person:
+                    (est, se, used), alt_p, n_p = _from_gtypes(
+                        gtypes, s.diploid, p_o, n_o, p_t, n_t, panel)
+                    if score_people and used > 0:
+                        people[s.gid] = _record(s.gid, est, se, 1, used)
+                    if probe and i == probe.i:
+                        alt_h, n_h = alt_p, n_p
                 now = time.monotonic()
                 if now - last_save >= 1.5 and groups:
                     flush(True)
-                if i % 20 == 0:
+                if i % 100 == 0:
                     job.progress(i + 1)
             job.progress(nind)
 
@@ -579,14 +599,14 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
                 check = {**(check or {}), **extra}
                 save_results(genome_path, cat.outgroup or "", n_snps, groups, people=people,
                              check=check, questionable=questionable, partial=False, kind=kind,
-                             pca=pca)
+                             pca=pca, panel=panel_key)
             except (OSError, RuntimeError, ValueError) as exc:
                 if check is None:
                     check = {}
                 check["admixtools_error"] = str(exc)[:200]
                 save_results(genome_path, cat.outgroup or "", n_snps, groups, people=people,
                              check=check, questionable=questionable, partial=False, kind=kind,
-                             pca=pca)
+                             pca=pca, panel=panel_key)
     except Cancelled:
         flush(True)
         raise
@@ -596,4 +616,6 @@ def scan_f3(store: Store, genome_path: Path, job: Job, genome: Genome | None = N
     loo = ""
     if check and check.get("gid"):
         loo = f" · LOO {check['gid']} → {check.get('group')} #{check.get('rank')}"
-    return (f"{len(groups)} groups · {len(people)} people · {n_snps:,} SNPs · top: {top}{loo}")
+    people_bit = (f"{len(people)} people" if score_people
+                  else f"0 people (skipped {n_keep:,} > {PEOPLE_F3_CAP:,})")
+    return (f"{len(groups)} groups · {people_bit} · {n_snps:,} SNPs · top: {top}{loo}")

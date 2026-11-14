@@ -312,9 +312,17 @@ def genome_run_stamps(
 
 
 def panel_stamps(genome: Path, panel: str, questionable: bool = False) -> tuple[int, int]:
-    """(chip, imp) stamps для UI polling."""
-    aadr_p, kg_p, _ = genome_run_stamps(genome, questionable)
-    return aadr_p if panel == "aadr" else kg_p
+    """(chip, imp) stamps для UI polling — panel: aadr | aadr_ho | kg."""
+    genome = Path(genome).expanduser().resolve()
+    q = bool(questionable) if panel in ("aadr", "aadr_ho") else False
+    rows = db.fetchall("""
+        SELECT kind, CAST(epoch_ns(updated_at) AS BIGINT)
+        FROM ref.runs
+        WHERE genome_path = ? AND panel = ? AND questionable = ?
+          AND kind IN ('', 'imp')
+    """, [str(genome), panel, q]) or []
+    got = {str(kind or ""): int(ts or 0) for kind, ts in rows}
+    return (got.get("", 0), got.get("imp", 0))
 
 
 def layer_stamps(genome: Path, questionable: bool = False) -> tuple[int, int, int, int]:

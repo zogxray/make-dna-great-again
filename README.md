@@ -72,7 +72,8 @@ Investigate → Oracle → Story (epochs, cultures). Shortcuts under the thread.
 - Optional external data (paths in **F2**):
   - FTDNA Y-DNA Haplotree JSON — **F3** + Y linking
   - FTDNA Discover haplogroup JSON folder — rich **F3** cards
-  - AADR panel — **F6**
+  - AADR 1240K panel — **F6**
+  - AADR Human Origins (optional denser modern map refs) — **F2** download
   - 1000 Genomes PLINK2 set — **F4** / some **F6** layers
   - PGS catalog built in **F2** (or pointed at with **P**) — **F4**
   - GWAS Catalog dump from **F2** — **F5**
@@ -258,8 +259,14 @@ Point the app at reference datasets; download or verify in the background.
 |--------|---------------------|
 | FTDNA Discover | **P** to a folder (optional seed from `ftdna_downloader.py`). Missing nodes: staged fetch **1–5** / **D** below, or **D** / Shift+D in F3. |
 | FTDNA Haplotree | **D** in F2, or **P** to an existing JSON. |
-| AADR / 1000 Genomes | **D** or **P**. Large downloads. |
+| YFull / TheYtree | **D** or **P** — read-only overlays on the FTDNA tree (F3). |
+| UYSD · Y frequencies | **D** — region GeoJSON; F3 Overview fetches modern haplogroup frequencies on demand (cached). |
+| AADR 1240K / Human Origins / 1000 Genomes | **D** or **P**. Large downloads (HO ~4 GB from the same Harvard Dataverse as 1240K). |
+| ancIBD · ancient kinship | **D** — Zenodo IBD table → neighbor index. F6 **KIN** card. If Zenodo blocks auto-fetch: download the zip, **P**, then **D**. |
+| PhyloTree · mtDNA | **D** — HaploGrep PhyloTree 17 FU (rCRS) zip for mt haplogroup labels. |
+| AmtDB · ancient mtDNA | **D** — metadata CSV from amtdb.org. F6 CATALOG shows AmtDB hits next to mt. |
 | Seshat · Polaris | **D** — polity / religion codes (~3 MB Excel, CC BY-NC). |
+| Cliopatria · polity maps | **D** — Seshat historical polygons (~44 MB zip → GeoJSON + map cache, CC BY 4.0). F6 epoch map outlines. |
 | Open Humans | **F9** (or F2 **B**) is the catalog; **D on a row** downloads that genome (any compat) → DuckDB (+ READY → genome). **V**: API new + missing under filter. |
 | GWAS Catalog | **D** in F2 — latest FTP snapshot (associations, studies, EFO). Or **P** to a folder. Used by **F5**. |
 | PGS models | **D** in F2 (needs F1 genome for coverage), or **P** to an existing catalog folder. |
@@ -322,16 +329,24 @@ Not a polygenic score — that is **F4**.
 
 ## F6 · Reference
 
-Your genome next to published panels — mainly **AADR** (and optionally 1000G),
-with f3-style results you computed offline.
+Your genome next to published panels — **AADR** 1240K, **1000G**, and **Human Origins**
+(HO; denser modern map refs), with f3-style results you computed offline.
 
 Opening F6 loads: AADR **catalog** (who the groups are + Y labels), **your result
 bundles**, and **Y relation tags** (same / ancestor / downstream / other), same
 Our Y idea as F3. “Loading AADR…” means that whole package.
 
-- **F** — scoring jobs · **G** — AADR ↔ 1000G · map / tree / layers lenses  
+- **F** — scoring jobs · **G** — AADR ↔ 1000G ↔ HO · map / tree / layers lenses  
+- **Y** — cycle GROUPS filter: all → **Y-only** → **mt-only** (Our mt tip) → all  
+- **O** — map overlays (off by default): sites → ⌂ habitat → ¶ Cliopatria → both →
+  **% UYSD** (modern Y freq for Our tip) → **≈ ancIBD** kin edges → **m AmtDB**
+  ancient mt. Header shows the active mode.
 
-Left column: **GROUPS** (list) above **GROUP** (card).  
+
+Left column: **GROUPS** (list) above **GROUP** (card). Card tabs: **OUR** /
+**CATALOG** / **KIN** (ancIBD neighbors when the F2 index is present) / **SUMMARY**
+(Ask grounds in ANNO plus Our mt / UYSD / AmtDB / ancIBD when those F2 catalogs
+are present).
 
 **LAYERS** (smartpca / qpAdm / imputation / ChromoPainter) need lab binaries on
 `PATH` — optional research tools, not the default path.

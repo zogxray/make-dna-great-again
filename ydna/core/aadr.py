@@ -195,7 +195,15 @@ def _prefer(suffix: str) -> int:
     return {"DG": 3, "SG": 2, "AG": 1, "TW": 1}.get(suffix, 0)
 
 
-def trio(folder: Path) -> tuple[str, dict[str, Path | None]] | None:
+def snp_panel_for(source_key: str) -> str:
+    """F2/F6 source key → AADR marker-set tag (1240K / HO)."""
+    return "HO" if source_key == "aadr_ho" else "1240K"
+
+
+def trio(folder: Path, panel: str = "1240K") -> tuple[str, dict[str, Path | None]] | None:
+    if panel == "HO":
+        from .sources import AadrHumanOrigins
+        return AadrHumanOrigins().trio(folder)
     return AadrSource().trio(folder)
 
 
@@ -371,9 +379,9 @@ def _read_anno(path: Path) -> dict[str, dict]:
     return out
 
 
-def catalog_cache_key(folder: Path) -> tuple | None:
+def catalog_cache_key(folder: Path, panel: str = "1240K") -> tuple | None:
     """Ключ кэша каталога (folder, ind_mtime, anno_mtime, version) или None."""
-    found = trio(folder)
+    found = trio(folder, panel=panel)
     if not found:
         return None
     _prefix, files = found
@@ -387,16 +395,16 @@ def catalog_cache_key(folder: Path) -> tuple | None:
     )
 
 
-def load_catalog(folder: Path, job: Job | None = None) -> Catalog:
+def load_catalog(folder: Path, job: Job | None = None, panel: str = "1240K") -> Catalog:
     from . import ref_db
 
-    key = catalog_cache_key(folder)
+    key = catalog_cache_key(folder, panel=panel)
     if key is None:
-        found = trio(folder)
+        found = trio(folder, panel=panel)
         if not found:
             raise RuntimeError("no AADR .geno in the folder (F2)")
         raise RuntimeError("AADR .ind is missing")
-    found = trio(folder)
+    found = trio(folder, panel=panel)
     assert found is not None
     prefix, files = found
     with _lock:
@@ -606,9 +614,10 @@ def _f3_from(raw: dict) -> F3 | None:
     return F3(**{k: raw[k] for k in keys if k in raw})
 
 
-def load_bundle(genome: Path, questionable: bool = False, kind: str = "") -> Bundle:
+def load_bundle(genome: Path, questionable: bool = False, kind: str = "",
+                panel: str = "aadr") -> Bundle:
     from . import ref_db
-    b = ref_db.load_bundle(genome, panel="aadr", kind=kind or "",
+    b = ref_db.load_bundle(genome, panel=panel, kind=kind or "",
                            questionable=questionable)
     blobs = b.blobs or {}
     return Bundle(
@@ -619,14 +628,15 @@ def load_bundle(genome: Path, questionable: bool = False, kind: str = "") -> Bun
     )
 
 
-def load_results(genome: Path, questionable: bool = False) -> dict[str, F3]:
-    return load_bundle(genome, questionable).groups
+def load_results(genome: Path, questionable: bool = False,
+                 panel: str = "aadr") -> dict[str, F3]:
+    return load_bundle(genome, questionable, panel=panel).groups
 
 
 def save_results(genome: Path, outgroup: str, snps: int, groups: dict[str, F3], *,
                  people: dict[str, F3] | None = None, check: dict | None = None,
                  questionable: bool = False, partial: bool = False, kind: str = "",
-                 pca=KEEP, qpadm=KEEP) -> None:
+                 pca=KEEP, qpadm=KEEP, panel: str = "aadr") -> None:
     from . import ref_db
     blobs: dict = {}
     if pca is not KEEP:
@@ -636,7 +646,7 @@ def save_results(genome: Path, outgroup: str, snps: int, groups: dict[str, F3], 
     if check is not None:
         blobs["check"] = check
     ref_db.save_bundle(
-        genome, panel="aadr", kind=kind or "", questionable=questionable,
+        genome, panel=panel, kind=kind or "", questionable=questionable,
         partial=partial, outgroup=outgroup, snps=snps, groups=groups,
         people=people if people is not None else {},
         blobs=blobs,

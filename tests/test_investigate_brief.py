@@ -18,6 +18,7 @@ def test_normalize_plan_lineage_heuristic():
     names = [t["tool"] for t in plan["tools"]]
     assert "y_path" in names
     assert "y_milestones" in names or "aadr_y_hits" in names
+    assert "local_ref" in names
     assert "gwas_search" not in names
 
 

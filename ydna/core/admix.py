@@ -856,13 +856,14 @@ def layer_state(_store: Store, genome: Path | None, source: str,
                 return {"status": "running", "detail": j.stage, "action": None}
         return None
 
+    aadr_like = source in ("aadr", "aadr_ho")
     chip = "ready" if genome else "missing"
     rows = [{
         "id": "0", "title": "Chip genotypes",
         "status": chip, "detail": genome.name if genome else "load a file in F1",
         "action": None,
     }]
-    pca = (aadr_b.pca if source == "aadr" and aadr_b else None) or (
+    pca = (aadr_b.pca if aadr_like and aadr_b else None) or (
         kg_b.pca if kg_b else None)
     run = job_of("aadr-pca")
     if run:
@@ -880,10 +881,11 @@ def layer_state(_store: Store, genome: Path | None, source: str,
         rows.append({"id": "1", "title": "PCA", "status": "missing",
                      "detail": "produced at the end of an f3 scan",
                      "action": "screen.score"})
-    b = aadr_b if source == "aadr" else kg_b
+    b = aadr_b if aadr_like else kg_b
     n = sum(1 for r in (b.groups if b else {}).values() if r.ok) if b else 0
-    run = job_of("aadr-f3" if source == "aadr" else "kg-f3")
-    og = "Mbuti" if source == "aadr" else "YRI"
+    f3_job = {"aadr": "aadr-f3", "aadr_ho": "aadr-ho-f3", "kg": "kg-f3"}.get(source, "aadr-f3")
+    run = job_of(f3_job)
+    og = "Mbuti" if aadr_like else "YRI"
     if run:
         rows.append({"id": "2", "title": f"outgroup-f3 ({og})", **run})
     else:
@@ -894,12 +896,12 @@ def layer_state(_store: Store, genome: Path | None, source: str,
             "action": None if n else "screen.score",
         })
     ep = 0
-    if source == "aadr" and aadr_b:
+    if aadr_like and aadr_b:
         ep = sum(1 for r in aadr_b.groups.values() if r.ok and r.epoch_cluster == 0)
     rows.append({
-        "id": "3", "title": "f4 clusters by epoch" if source == "aadr" else "f4 vs #1 (YRI)",
+        "id": "3", "title": "f4 clusters by epoch" if aadr_like else "f4 vs #1 (YRI)",
         "status": "done" if n else "missing",
-        "detail": (f"{ep} epoch-tied groups" if source == "aadr" and n
+        "detail": (f"{ep} epoch-tied groups" if aadr_like and n
                    else ("Z vs best pop" if n else "after f3")),
         "action": None,
     })

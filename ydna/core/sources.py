@@ -5,11 +5,15 @@ download/verify выполняются внутри core.jobs.Job."""
 
 from __future__ import annotations
 
+import html as html_lib
+import http.cookiejar
 import json
 import os
 import re
 import shutil
 import struct
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import Counter
@@ -690,7 +694,7 @@ class Theytree(Source):
 
 DATAVERSE = "https://dataverse.harvard.edu"
 AADR_DOI = "doi:10.7910/DVN/FFIDCW"
-AADR_PANEL = "1240K"
+AADR_PANEL = "1240K"  # default panel; subclasses override .panel
 MANIFEST = "aadr-download-manifest.json"
 
 
@@ -712,8 +716,17 @@ def _md5_list(folder: Path) -> dict[str, str]:
     return out
 
 
+def _aadr_panel_match(name: str, panel: str) -> bool:
+    """True for ``v66_HO.aadr…`` / ``v66_1240K.aadr…``, not compatibility_* panels."""
+    if "compatibility" in name.lower():
+        return False
+    return f"_{panel}.aadr." in name
+
+
 class Aadr(Source):
     key = "aadr"
+    panel = AADR_PANEL
+    manifest = MANIFEST
     title = f"AADR · {AADR_PANEL}"
     url = "https://doi.org/10.7910/DVN/FFIDCW"
     about = ("Allen Ancient DNA Resource: genotypes of ancient and modern individuals (EIGENSTRAT "
@@ -726,7 +739,9 @@ class Aadr(Source):
         genos = sorted(path.glob("*.geno")) + sorted(path.glob("*.tgeno"))
         if not genos:
             return None
-        geno = next((g for g in genos if f"_{AADR_PANEL}." in g.name), genos[0])
+        geno = next((g for g in genos if _aadr_panel_match(g.name, self.panel)), None)
+        if geno is None:
+            geno = next((g for g in genos if f"_{self.panel}." in g.name), genos[0])
         prefix = geno.name[: -len(geno.suffix)]
         stem = prefix.split(".patch")[0].split(".aadr")[0]
         files: dict[str, Path | None] = {"geno": geno}
@@ -735,7 +750,11 @@ class Aadr(Source):
             files[ext] = p if p.exists() else None
         anno = path / f"{prefix}.anno"
         if not anno.exists():
-            anno = next(iter(sorted(path.glob(f"{stem}*.anno"))), None)
+            # HO/1240K anno is often ``v66_HO.aadr.PUB.anno`` (no ``.patch``).
+            cands = [p for p in path.glob(f"{stem}*.anno") if _aadr_panel_match(p.name, self.panel)]
+            if not cands:
+                cands = sorted(path.glob(f"{stem}*.anno"))
+            anno = cands[0] if cands else None
         files["anno"] = anno
         return prefix, files
 
@@ -752,7 +771,7 @@ class Aadr(Source):
         m = re.match(r"(v[\d.]+(?:p\d+)?)_([^.]+)", prefix)
         if m:
             facts += [("Release", m.group(1)), ("Panel", m.group(2))]
-        man = path / MANIFEST
+        man = path / self.manifest
         if man.exists():
             try:
                 data = json.loads(man.read_text(encoding="utf-8"))
@@ -789,7 +808,7 @@ class Aadr(Source):
         return Status("ok", f"{indiv}{human_size(total)}", facts, rows)
 
     def suggest(self, store: Store) -> Path:
-        return store.path(self.key) or data_dir() / "aadr"
+        return store.path(self.key) or data_dir() / self.key
 
     def download(self, path: Path, job: Job) -> str:
         job.set_stage("querying Harvard Dataverse")
@@ -800,17 +819,18 @@ class Aadr(Source):
         records = [{"name": f["dataFile"]["filename"], "id": f["dataFile"]["id"],
                     "size": f["dataFile"].get("filesize"), "md5": f["dataFile"].get("md5")}
                    for f in version.get("files", []) if f.get("dataFile")]
-        tag = f"_{AADR_PANEL}.aadr."
 
         def pick(ext: str) -> dict | None:
-            c = [r for r in records if tag in r["name"] and r["name"].endswith(ext)]
+            c = [r for r in records
+                 if _aadr_panel_match(r["name"], self.panel) and r["name"].endswith(ext)]
+            # Prefer patched PUB geno/snp/ind when several variants exist.
             c.sort(key=lambda r: (".patch." not in r["name"], "PUB" not in r["name"]))
             return c[0] if c else None
 
         chosen = [pick(e) for e in (".geno", ".snp", ".ind", ".anno")]
         chosen += [r for r in records if r["name"].endswith("files.md5sum")][:1]
         if not all(chosen[:3]):
-            raise RuntimeError("cannot find the 1240K geno/snp/ind in the latest release: "
+            raise RuntimeError(f"cannot find the {self.panel} geno/snp/ind in the latest release: "
                                + ", ".join(r["name"] for r in records))
         chosen = [r for r in chosen if r]
         need = sum((r["size"] or 0) for r in chosen
@@ -823,13 +843,13 @@ class Aadr(Source):
                         f"{i}/{len(chosen)} {r['name']}", r["size"], r["md5"])
             got += res == "downloaded"
         minor = version.get("versionMinorNumber")
-        (path / MANIFEST).write_text(json.dumps({
+        (path / self.manifest).write_text(json.dumps({
             "dataset": "The Allen Ancient DNA Resource (AADR)",
             "persistent_id": AADR_DOI,
             "dataverse_url": self.url,
             "version": f"{version.get('versionNumber')}.{minor}" if minor else str(version.get("versionNumber")),
             "release_time": version.get("releaseTime"),
-            "panel": AADR_PANEL,
+            "panel": self.panel,
             "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
             "files": [{"name": r["name"], "dataverse_file_id": r["id"], "expected_size_bytes": r["size"],
                        "published_md5": r["md5"]} for r in chosen],
@@ -855,6 +875,19 @@ class Aadr(Source):
             raise RuntimeError("MD5 mismatch: " + ", ".join(bad))
         tail = f"; no checksum for {', '.join(skipped)}" if skipped else ""
         return f"MD5 OK for {len(ok)} file(s){tail}"
+
+
+class AadrHumanOrigins(Aadr):
+    """AADR Affymetrix Human Origins panel — denser living pops for modern maps."""
+
+    key = "aadr_ho"
+    panel = "HO"
+    manifest = "aadr-ho-download-manifest.json"
+    title = "AADR · Human Origins"
+    about = ("AADR Human Origins (~584k SNPs): same Harvard Dataverse release as 1240K, with more "
+             "present-day Affymetrix HO populations (lat/lon) for modern-map / living-reference work. "
+             "Ancients are included too; prefer 1240K for ancient f₃ when SNP overlap matters.")
+    size_hint = "~4.1 GB (geno ~4.0 GB + snp + ind + anno)"
 
 
 # ───────────────────────── 1000 Genomes ─────────────────────────
@@ -1521,6 +1554,755 @@ class Seshat(Source):
         return f"OK · {len(sheets)} sheets · {human_size(book.stat().st_size)}"
 
 
+# ───────────────────────── Cliopatria (Seshat polity polygons) ─────────────────
+
+CLIOPATRIA_PAGE = "https://github.com/Seshat-Global-History-Databank/cliopatria"
+CLIOPATRIA_GITHUB_API = (
+    "https://api.github.com/repos/Seshat-Global-History-Databank/cliopatria/contents"
+)
+CLIOPATRIA_ZIP = "cliopatria.geojson.zip"
+CLIOPATRIA_GEOJSON = "cliopatria.geojson"
+CLIOPATRIA_CACHE = "cliopatria_map_v1.pkl"
+CLIOPATRIA_MANIFEST = "cliopatria-download-manifest.json"
+CLIOPATRIA_RAW_ZIP = (
+    "https://raw.githubusercontent.com/Seshat-Global-History-Databank/"
+    "cliopatria/main/cliopatria.geojson.zip"
+)
+
+
+class Cliopatria(Source):
+    key = "cliopatria"
+    title = "Cliopatria · polity maps"
+    url = CLIOPATRIA_PAGE
+    about = ("Seshat Cliopatria: worldwide historical polity polygons "
+             "(~3400 BCE → present). F2 downloads the official GeoJSON zip; "
+             "F6 draws simplified outlines for the active epoch year. "
+             "License: CC BY 4.0. Complements Polaris codes — not a Y tree.")
+    size_hint = "~44 MB zip → ~170 MB GeoJSON + map cache"
+    can_download = True
+    can_verify = True
+
+    def geojson(self, path: Path) -> Path | None:
+        p = path / CLIOPATRIA_GEOJSON
+        return p if p.is_file() and p.stat().st_size > 0 else None
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        rows = leftovers(path)
+        gj = self.geojson(path)
+        facts: list[tuple[str, str]] = []
+        man = path / CLIOPATRIA_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                if data.get("release"):
+                    facts.append(("Release", str(data["release"])))
+                if data.get("github_sha"):
+                    facts.append(("GitHub SHA", str(data["github_sha"])[:12]))
+                if data.get("downloaded_at_utc"):
+                    facts.append(("Downloaded",
+                                  str(data["downloaded_at_utc"])[:19].replace("T", " ")
+                                  + " UTC"))
+                if data.get("license"):
+                    facts.append(("License", str(data["license"])))
+                if data.get("features"):
+                    facts.append(("Features", f"{int(data['features']):,}"))
+            except (ValueError, TypeError, OSError, KeyError):
+                pass
+        zpath = path / CLIOPATRIA_ZIP
+        if zpath.is_file():
+            rows.append(FileRow(zpath.name, zpath.stat().st_size, "source zip"))
+        cache = path / CLIOPATRIA_CACHE
+        if cache.is_file():
+            rows.append(FileRow(cache.name, cache.stat().st_size, "map ring cache"))
+        if man.exists():
+            rows.append(FileRow(man.name, man.stat().st_size, "download meta"))
+        if not gj:
+            if rows:
+                return Status("partial", "download incomplete", facts, rows)
+            return Status("missing", f"no {CLIOPATRIA_GEOJSON}", facts, rows)
+        size = gj.stat().st_size
+        rows.insert(0, FileRow(gj.name, size, "GeoJSON polities"))
+        note = human_size(size)
+        if cache.is_file():
+            note += " · cache ready"
+        else:
+            note += " · map cache pending (V builds it)"
+            return Status("partial", note, facts, rows)
+        return Status("ok", note, facts, rows)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / "cliopatria"
+
+    def _remote(self, job: Job) -> dict:
+        job.set_stage(f"querying GitHub for {CLIOPATRIA_ZIP}")
+        req = urllib.request.Request(
+            f"{CLIOPATRIA_GITHUB_API}/{CLIOPATRIA_ZIP}",
+            headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.load(resp)
+        if not isinstance(data, dict) or not data.get("download_url"):
+            raise RuntimeError(f"GitHub did not return download_url for {CLIOPATRIA_ZIP}")
+        return data
+
+    def _extract_geojson(self, path: Path, zip_dest: Path, job: Job) -> Path:
+        job.set_stage("unpacking Cliopatria GeoJSON")
+        with zipfile.ZipFile(zip_dest) as zf:
+            names = [n for n in zf.namelist()
+                     if n.lower().endswith(".geojson") and not n.endswith("/")]
+            if not names:
+                raise RuntimeError(f"{CLIOPATRIA_ZIP}: no .geojson inside")
+            # Prefer a polities-only / main payload; else first .geojson.
+            names.sort(key=lambda n: (0 if "polit" in n.lower() else 1, len(n)))
+            member = names[0]
+            info = zf.getinfo(member)
+            dest = path / CLIOPATRIA_GEOJSON
+            tmp = dest.with_suffix(dest.suffix + ".partial")
+            if tmp.exists():
+                tmp.unlink()
+            with zf.open(member) as src, tmp.open("wb") as out:
+                shutil.copyfileobj(src, out, length=1 << 20)
+            tmp.replace(dest)
+            job.set_stage("GeoJSON extracted", total=info.file_size, done=info.file_size)
+        return dest
+
+    def download(self, path: Path, job: Job) -> str:
+        remote = self._remote(job)
+        url = str(remote.get("download_url") or CLIOPATRIA_RAW_ZIP)
+        size = int(remote["size"]) if isinstance(remote.get("size"), int) else None
+        sha = str(remote.get("sha") or "")
+        ensure_space(path, (size or (50 << 20)) + (220 << 20))
+        path.mkdir(parents=True, exist_ok=True)
+        zip_dest = path / CLIOPATRIA_ZIP
+        res = fetch(url, zip_dest, job, CLIOPATRIA_ZIP, size)
+        gj = self._extract_geojson(path, zip_dest, job)
+        from . import cliopatria as clio
+        cache = clio.build_map_cache(gj, job=job)
+        n_feat = 0
+        try:
+            n_feat = int(__import__("pickle").loads(cache.read_bytes()).get("n") or 0)
+        except Exception:  # noqa: BLE001
+            n_feat = 0
+        (path / CLIOPATRIA_MANIFEST).write_text(json.dumps({
+            "source": "Seshat Global History Databank · Cliopatria",
+            "page": CLIOPATRIA_PAGE,
+            "doi": "10.1038/s41597-025-04516-9",
+            "release": "github-main",
+            "file": CLIOPATRIA_ZIP,
+            "geojson": CLIOPATRIA_GEOJSON,
+            "github_repo": "Seshat-Global-History-Databank/cliopatria",
+            "github_sha": sha or None,
+            "expected_size_bytes": size,
+            "features": n_feat,
+            "license": "CC BY 4.0",
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "download_result": res,
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+    def verify(self, path: Path, job: Job) -> str:
+        gj = self.geojson(path) if path.is_dir() else None
+        if not gj:
+            raise RuntimeError(f"no {CLIOPATRIA_GEOJSON} to verify")
+        job.set_stage(f"checking {CLIOPATRIA_GEOJSON}")
+        with gj.open("rb") as fh:
+            head = fh.read(64).lstrip()
+        if not head.startswith(b"{") and not head.startswith(b"["):
+            raise RuntimeError(f"{CLIOPATRIA_GEOJSON}: not JSON")
+        from . import cliopatria as clio
+        cache = clio.build_map_cache(gj, job=job)
+        try:
+            n_feat = int(__import__("pickle").loads(cache.read_bytes()).get("n") or 0)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"map cache unreadable: {exc}") from exc
+        man = path / CLIOPATRIA_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                data["features"] = n_feat
+                man.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except (ValueError, TypeError, OSError):
+                pass
+        return (f"OK · {n_feat:,} polities · "
+                f"{human_size(gj.stat().st_size)} · cache {human_size(cache.stat().st_size)}")
+
+
+# ───────────────────────── PhyloTree / HaploGrep mtDNA ─────────────────────
+
+PHYLOTREE_PAGE = "https://github.com/genepi/phylotree-fu-rcrs"
+PHYLOTREE_TREES_JSON = (
+    "https://raw.githubusercontent.com/genepi/haplogrep-trees/main/trees.json"
+)
+PHYLOTREE_ID = "phylotree-fu-rcrs"
+PHYLOTREE_MANIFEST = "phylotree-download-manifest.json"
+
+
+class PhyloTreeMt(Source):
+    key = "phylotree_mt"
+    title = "PhyloTree · mtDNA"
+    url = PHYLOTREE_PAGE
+    about = ("HaploGrep PhyloTree 17 Forensic Update (rCRS): mtDNA haplogroup tree "
+             "used by HaploGrep3. F2 downloads the official release zip. "
+             "Pairs with AmtDB for ancient mt context. License: HaploGrep trees.")
+    size_hint = "~12 MB zip (tree.xml + rCRS)"
+    can_download = True
+    can_verify = True
+
+    def tree_xml(self, path: Path) -> Path | None:
+        for cand in (path / "tree.xml", *path.glob("*/tree.xml")):
+            if cand.is_file() and cand.stat().st_size > 0:
+                return cand
+        return None
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        rows = leftovers(path)
+        xml = self.tree_xml(path)
+        facts: list[tuple[str, str]] = []
+        man = path / PHYLOTREE_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                if data.get("version"):
+                    facts.append(("Version", str(data["version"])))
+                if data.get("downloaded_at_utc"):
+                    facts.append(("Downloaded",
+                                  str(data["downloaded_at_utc"])[:19].replace("T", " ")
+                                  + " UTC"))
+            except (ValueError, TypeError, OSError):
+                pass
+        if not xml:
+            if rows:
+                return Status("partial", "download incomplete", facts, rows)
+            return Status("missing", "no tree.xml — press D", facts, rows)
+        n_hg = 0
+        try:
+            blob = xml.read_bytes()
+            n_hg = len(re.findall(br'haplogroup\s+name="', blob, re.I))
+        except OSError:
+            pass
+        facts.insert(0, ("Haplogroups", f"{n_hg:,}" if n_hg else "present"))
+        rows.insert(0, FileRow(xml.name, xml.stat().st_size, "PhyloTree XML"))
+        if man.exists():
+            rows.append(FileRow(man.name, man.stat().st_size, "download meta"))
+        return Status("ok", f"{n_hg:,} haplogroups · {human_size(xml.stat().st_size)}",
+                      facts, rows)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / self.key
+
+    def _remote(self, job: Job) -> tuple[str, str, str]:
+        job.set_stage("querying HaploGrep trees.json")
+        req = urllib.request.Request(
+            PHYLOTREE_TREES_JSON,
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            trees = json.load(resp)
+        for entry in trees:
+            if entry.get("id") != PHYLOTREE_ID:
+                continue
+            ver = str(entry.get("latest") or "")
+            for rel in entry.get("releases") or []:
+                if str(rel.get("version")) == ver and rel.get("url"):
+                    return ver, str(rel["url"]), str(rel.get("url") or "")
+            # Fallback: last release
+            for rel in reversed(entry.get("releases") or []):
+                if rel.get("url"):
+                    return str(rel.get("version") or ver), str(rel["url"]), str(rel["url"])
+        raise RuntimeError(f"{PHYLOTREE_ID} not found in trees.json")
+
+    def download(self, path: Path, job: Job) -> str:
+        ver, url, _ = self._remote(job)
+        path.mkdir(parents=True, exist_ok=True)
+        zip_name = f"phylotree-fu-rcrs-{ver}.zip"
+        dest = path / zip_name
+        ensure_space(path, (20 << 20))
+        res = fetch(url, dest, job, zip_name, None)
+        job.set_stage(f"unpacking {zip_name}")
+        with zipfile.ZipFile(dest) as zf:
+            zf.extractall(path)
+        (path / PHYLOTREE_MANIFEST).write_text(json.dumps({
+            "source": "HaploGrep PhyloTree FU rCRS",
+            "page": PHYLOTREE_PAGE,
+            "tree_id": PHYLOTREE_ID,
+            "version": ver,
+            "url": url,
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "download_result": res,
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+    def verify(self, path: Path, job: Job) -> str:
+        job.set_stage("checking PhyloTree")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+
+# ───────────────────────── AmtDB (ancient mtDNA) ───────────────────────────
+
+AMTDB_PAGE = "https://amtdb.org/"
+AMTDB_SAMPLES = "https://amtdb.org/samples"
+AMTDB_DOWNLOAD = "https://amtdb.org/download_metadata"
+AMTDB_CSV = "amtdb_metadata.csv"
+AMTDB_MANIFEST = "amtdb-download-manifest.json"
+
+
+class AmtDb(Source):
+    key = "amtdb"
+    title = "AmtDB · ancient mtDNA"
+    url = AMTDB_PAGE
+    about = ("Ancient mtDNA database (AmtDB): published ancient mitogenomes with "
+             "haplogroup, site, culture, and coordinates. F2 downloads the official "
+             "metadata CSV via the site export. Complements PhyloTree / AADR mt fields.")
+    size_hint = "~2–3 MB CSV (~3.7k samples)"
+    can_download = True
+    can_verify = True
+
+    def csv_path(self, path: Path) -> Path | None:
+        p = path / AMTDB_CSV
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+        alts = sorted(path.glob("*.csv"))
+        return alts[0] if alts else None
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        rows = leftovers(path)
+        csv_p = self.csv_path(path)
+        facts: list[tuple[str, str]] = []
+        man = path / AMTDB_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                if data.get("n_samples"):
+                    facts.append(("Samples", f"{int(data['n_samples']):,}"))
+                if data.get("downloaded_at_utc"):
+                    facts.append(("Downloaded",
+                                  str(data["downloaded_at_utc"])[:19].replace("T", " ")
+                                  + " UTC"))
+            except (ValueError, TypeError, OSError):
+                pass
+        if not csv_p:
+            if rows:
+                return Status("partial", "download incomplete", facts, rows)
+            return Status("missing", f"no {AMTDB_CSV} — press D", facts, rows)
+        n = 0
+        try:
+            with csv_p.open(encoding="utf-8", newline="") as f:
+                n = max(0, sum(1 for _ in f) - 1)
+        except OSError:
+            return Status("partial", f"cannot read {csv_p.name}", facts, rows)
+        facts.insert(0, ("Rows", f"{n:,}"))
+        rows.insert(0, FileRow(csv_p.name, csv_p.stat().st_size, "metadata CSV"))
+        if man.exists():
+            rows.append(FileRow(man.name, man.stat().st_size, "download meta"))
+        return Status("ok", f"{n:,} samples · {human_size(csv_p.stat().st_size)}",
+                      facts, rows)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / self.key
+
+    def download(self, path: Path, job: Job) -> str:
+        path.mkdir(parents=True, exist_ok=True)
+        job.set_stage("AmtDB · samples page")
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        req = urllib.request.Request(
+            AMTDB_SAMPLES, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
+        with opener.open(req, timeout=120) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+        csrf_m = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', page)
+        if not csrf_m:
+            raise RuntimeError("AmtDB: no CSRF token on /samples")
+        ids = [int(x) for x in re.findall(r'sample_id=["\'](\d+)["\']', page)]
+        if not ids:
+            # Fallback: map markers
+            mm = re.search(r'markers="(\[.*?\])"', page)
+            if mm:
+                markers = json.loads(html_lib.unescape(mm.group(1)))
+                ids = [int(m["id"]) for m in markers if "id" in m]
+        if not ids:
+            raise RuntimeError("AmtDB: no sample ids on /samples")
+        job.set_stage(f"AmtDB · metadata CSV ({len(ids):,} samples)")
+        body = urllib.parse.urlencode({
+            "csrfmiddlewaretoken": csrf_m.group(1),
+            "sample_ids": json.dumps(ids),
+        }).encode()
+        req = urllib.request.Request(
+            AMTDB_DOWNLOAD, data=body,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": AMTDB_SAMPLES,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/csv,*/*",
+            },
+        )
+        with opener.open(req, timeout=180) as resp:
+            data = resp.read()
+        if not data.startswith(b'"') and b"identifier" not in data[:200]:
+            raise RuntimeError("AmtDB: download did not return CSV")
+        dest = path / AMTDB_CSV
+        dest.write_bytes(data)
+        n = max(0, data.count(b"\n") - 1)
+        (path / AMTDB_MANIFEST).write_text(json.dumps({
+            "source": "AmtDB",
+            "page": AMTDB_PAGE,
+            "file": AMTDB_CSV,
+            "n_samples": n,
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+    def verify(self, path: Path, job: Job) -> str:
+        job.set_stage("checking AmtDB CSV")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+
+# ───────────────────────── UYSD (modern Y frequencies) ─────────────────────
+
+UYSD_PAGE = "https://ysnp.erasmusmc.nl"
+UYSD_GEOJSON = "regions_and_countries.geojson"
+UYSD_GEOJSON_URL = f"{UYSD_PAGE}/static/ysnp/data/{UYSD_GEOJSON}"
+UYSD_MANIFEST = "uysd-download-manifest.json"
+
+
+class Uysd(Source):
+    key = "uysd"
+    title = "UYSD · Y frequencies"
+    url = UYSD_PAGE
+    about = ("Universal Y-SNP Database (Erasmus MC, 2025): modern population "
+             "frequencies of Y haplogroups. F2 downloads region GeoJSON; "
+             "F3 fetches per-haplogroup frequencies on demand (cached). "
+             "YFull-style names (R-M269).")
+    size_hint = "~region GeoJSON + small per-HG cache"
+    can_download = True
+    can_verify = True
+
+    def geojson(self, path: Path) -> Path | None:
+        p = path / UYSD_GEOJSON
+        return p if p.is_file() and p.stat().st_size > 0 else None
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        rows = leftovers(path)
+        geo = self.geojson(path)
+        facts: list[tuple[str, str]] = []
+        man = path / UYSD_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                if data.get("n_regions"):
+                    facts.append(("Regions", f"{int(data['n_regions']):,}"))
+                if data.get("downloaded_at_utc"):
+                    facts.append(("Downloaded",
+                                  str(data["downloaded_at_utc"])[:19].replace("T", " ")
+                                  + " UTC"))
+            except (ValueError, TypeError, OSError):
+                pass
+        cache = path / "cache"
+        if cache.is_dir():
+            n_cache = len(list(cache.glob("*.json")))
+            if n_cache:
+                facts.append(("Cached haplogroups", f"{n_cache:,}"))
+        if not geo:
+            if rows:
+                return Status("partial", "download incomplete", facts, rows)
+            return Status("missing", f"no {UYSD_GEOJSON} — press D", facts, rows)
+        n_reg = 0
+        try:
+            data = json.loads(geo.read_text(encoding="utf-8"))
+            n_reg = len(data.get("features") or [])
+        except (ValueError, TypeError, OSError):
+            return Status("partial", f"{geo.name} is not valid GeoJSON", facts, rows)
+        facts.insert(0, ("Features", f"{n_reg:,}"))
+        rows.insert(0, FileRow(geo.name, geo.stat().st_size, "regions GeoJSON"))
+        if man.exists():
+            rows.append(FileRow(man.name, man.stat().st_size, "download meta"))
+        return Status("ok", f"{n_reg:,} regions · {human_size(geo.stat().st_size)}",
+                      facts, rows)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / self.key
+
+    def download(self, path: Path, job: Job) -> str:
+        path.mkdir(parents=True, exist_ok=True)
+        dest = path / UYSD_GEOJSON
+        ensure_space(path, (8 << 20))
+        res = fetch(UYSD_GEOJSON_URL, dest, job, UYSD_GEOJSON, None)
+        n_reg = 0
+        try:
+            data = json.loads(dest.read_text(encoding="utf-8"))
+            n_reg = len(data.get("features") or [])
+        except (ValueError, TypeError, OSError):
+            pass
+        (path / UYSD_MANIFEST).write_text(json.dumps({
+            "source": "UYSD · Erasmus MC",
+            "page": UYSD_PAGE,
+            "file": UYSD_GEOJSON,
+            "url": UYSD_GEOJSON_URL,
+            "n_regions": n_reg,
+            "citation": "Ralf et al. Eur J Hum Genet (2025) — UYSD",
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+            "download_result": res,
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+    def verify(self, path: Path, job: Job) -> str:
+        job.set_stage("checking UYSD GeoJSON")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+
+# ───────────────────────── ancIBD (ancient IBD network) ────────────────────
+
+ANCIBD_PAGE = "https://zenodo.org/records/8417049"
+ANCIBD_DOI = "10.5281/zenodo.8417049"
+ANCIBD_RECORD = "8417049"
+ANCIBD_ZIP = "ibd220.ibd.v54.1.pub.tsv.zip"
+ANCIBD_TSV = "ibd220.ibd.v54.1.pub.tsv"
+ANCIBD_INDEX = "ancibd-neighbors.pkl"
+ANCIBD_MANIFEST = "ancibd-download-manifest.json"
+# Exact bytes from Zenodo record 8417049 (not a rounded ~48 MB guess).
+ANCIBD_ZIP_SIZE = 47_477_555
+ANCIBD_ZIP_MD5 = "d5aa276101c7029a15c88d21809c7846"
+ANCIBD_URLS = (
+    f"https://zenodo.org/records/{ANCIBD_RECORD}/files/{ANCIBD_ZIP}?download=1",
+    f"https://zenodo.org/api/records/{ANCIBD_RECORD}/files/{ANCIBD_ZIP}/content",
+    f"https://zenodo.org/api/files/{ANCIBD_RECORD}/{ANCIBD_ZIP}",
+)
+
+
+class AncIbd(Source):
+    key = "ancibd"
+    title = "ancIBD · ancient kinship"
+    url = ANCIBD_PAGE
+    about = ("IBD segments among 4,248 published Eurasian aDNA individuals "
+             "(Ringbauer et al., Nat Genet 2023 / Zenodo). F2 downloads the "
+             "segment table and builds a neighbor index for F6 KIN. "
+             "License: CC BY 4.0. Pin: AADR-era v54.1 public release.")
+    size_hint = f"{ANCIBD_ZIP_SIZE / 1e6:.1f} MB zip → ~110 MB TSV + small index"
+    can_download = True
+    can_verify = True
+    download_note = ("If Zenodo blocks automated download, save the zip from the "
+                     "record page and P to this folder, then D to build the index.")
+
+    def tsv(self, path: Path) -> Path | None:
+        for cand in (path / ANCIBD_TSV, *path.glob("**/*.tsv")):
+            if cand.is_file() and cand.stat().st_size > 1_000_000:
+                return cand
+        return None
+
+    def index_path(self, path: Path) -> Path | None:
+        p = path / ANCIBD_INDEX
+        return p if p.is_file() and p.stat().st_size > 0 else None
+
+    def _check(self, path: Path) -> Status:
+        if not path.is_dir():
+            return Status("missing", "folder not found")
+        rows = leftovers(path)
+        tsv = self.tsv(path)
+        idx = self.index_path(path)
+        facts: list[tuple[str, str]] = []
+        man = path / ANCIBD_MANIFEST
+        if man.exists():
+            try:
+                data = json.loads(man.read_text(encoding="utf-8"))
+                if data.get("n_ids"):
+                    facts.append(("Individuals", f"{int(data['n_ids']):,}"))
+                if data.get("n_pairs"):
+                    facts.append(("Pairs ≥8 cM", f"{int(data['n_pairs']):,}"))
+                if data.get("downloaded_at_utc"):
+                    facts.append(("Downloaded",
+                                  str(data["downloaded_at_utc"])[:19].replace("T", " ")
+                                  + " UTC"))
+            except (ValueError, TypeError, OSError):
+                pass
+        if tsv:
+            rows.insert(0, FileRow(tsv.name, tsv.stat().st_size, "IBD segments"))
+        if idx:
+            rows.insert(0 if not tsv else 1,
+                        FileRow(idx.name, idx.stat().st_size, "neighbor index"))
+        if man.exists():
+            rows.append(FileRow(man.name, man.stat().st_size, "download meta"))
+        zips = list(path.glob("*.zip"))
+        for z in zips[:2]:
+            rows.append(FileRow(z.name, z.stat().st_size, "archive"))
+        if idx:
+            return Status("ok",
+                          f"index ready · {human_size(idx.stat().st_size)}"
+                          + (f" · TSV {human_size(tsv.stat().st_size)}" if tsv else ""),
+                          facts, rows)
+        if tsv:
+            return Status("partial", "TSV present — press D to build index", facts, rows)
+        if zips:
+            return Status("partial", "zip present — press D to unpack + index", facts, rows)
+        if rows:
+            return Status("partial", "download incomplete", facts, rows)
+        return Status("missing", f"no {ANCIBD_ZIP} — press D (or P after manual download)",
+                      facts, rows)
+
+    def suggest(self, store: Store) -> Path:
+        return store.path(self.key) or data_dir() / self.key
+
+    def _zenodo_file_meta(self, job: Job) -> dict:
+        """Resolve download URLs + exact size/md5 from Zenodo API (pinned fallbacks)."""
+        urls: list[str] = []
+        size = ANCIBD_ZIP_SIZE
+        md5 = ANCIBD_ZIP_MD5
+        try:
+            job.set_stage("ancIBD · resolving Zenodo file URL")
+            req = urllib.request.Request(
+                f"https://zenodo.org/api/records/{ANCIBD_RECORD}",
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            for f in data.get("files") or []:
+                key = str(f.get("key") or "")
+                if key != ANCIBD_ZIP and ANCIBD_ZIP not in key and not key.endswith(".tsv.zip"):
+                    continue
+                try:
+                    size = int(f.get("size") or size)
+                except (TypeError, ValueError):
+                    pass
+                raw_sum = str(f.get("checksum") or "")
+                if raw_sum.lower().startswith("md5:"):
+                    md5 = raw_sum.split(":", 1)[1].strip().lower() or md5
+                links = f.get("links") or {}
+                for k in ("download", "self", "content"):
+                    link = links.get(k)
+                    if link and link not in urls:
+                        urls.append(str(link))
+                bucket = links.get("bucket") or (data.get("links") or {}).get("bucket")
+                if bucket:
+                    cand = f"{bucket.rstrip('/')}/{urllib.parse.quote(key)}"
+                    if cand not in urls:
+                        urls.append(cand)
+        except Exception:  # noqa: BLE001
+            pass
+        for u in ANCIBD_URLS:
+            if u not in urls:
+                urls.append(u)
+        return {"urls": urls, "size": size, "md5": md5}
+
+    def _ensure_tsv(self, path: Path, job: Job) -> Path:
+        tsv = self.tsv(path)
+        if tsv:
+            return tsv
+        zips = sorted(path.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not zips:
+            last_err: Exception | None = None
+            dest = path / ANCIBD_ZIP
+            meta = self._zenodo_file_meta(job)
+            expect = int(meta["size"])
+            md5 = str(meta["md5"] or "") or None
+            ensure_space(path, max(60 << 20, expect + (8 << 20)))
+            hdrs = {
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+                "Referer": ANCIBD_PAGE + "/",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            for url in meta["urls"]:
+                try:
+                    job.set_stage("ancIBD · downloading from Zenodo")
+                    fetch(url, dest, job, ANCIBD_ZIP, expect, md5=md5, headers=hdrs)
+                    if dest.is_file() and dest.stat().st_size == expect:
+                        zips = [dest]
+                        break
+                    if dest.is_file():
+                        dest.unlink(missing_ok=True)
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    if dest.is_file() and dest.stat().st_size != expect:
+                        dest.unlink(missing_ok=True)
+                    # Drop tiny/error bodies; keep incomplete .part for Range resume.
+                    part = dest.with_name(dest.name + ".part")
+                    if part.is_file() and (
+                        part.stat().st_size < 1_000_000
+                        or part.stat().st_size > expect
+                    ):
+                        part.unlink(missing_ok=True)
+            if not zips:
+                raise RuntimeError(
+                    f"Zenodo download failed ({last_err}). "
+                    f"Download {ANCIBD_ZIP} from {ANCIBD_PAGE}, P to this folder, D again."
+                )
+        job.set_stage(f"unpacking {zips[0].name}")
+        with zipfile.ZipFile(zips[0]) as zf:
+            members = [n for n in zf.namelist()
+                       if n.endswith(".tsv") and not n.startswith("__")
+                       and "/." not in n]
+            if not members:
+                raise RuntimeError(f"{zips[0].name}: no .tsv inside")
+            member = max(members, key=lambda n: zf.getinfo(n).file_size)
+            target = path / Path(member).name
+            with zf.open(member) as src, target.open("wb") as out:
+                shutil.copyfileobj(src, out)
+        tsv = self.tsv(path)
+        if not tsv:
+            raise RuntimeError("unpack finished but TSV not found")
+        return tsv
+
+    def download(self, path: Path, job: Job) -> str:
+        path.mkdir(parents=True, exist_ok=True)
+        tsv = self._ensure_tsv(path, job)
+        from . import ancibd as ancibd_mod
+        job.set_stage("ancIBD · building neighbor index")
+        stats = ancibd_mod.build_index(tsv, path / ANCIBD_INDEX, job=job)
+        (path / ANCIBD_MANIFEST).write_text(json.dumps({
+            "source": "ancIBD · Ringbauer et al. 2023",
+            "page": ANCIBD_PAGE,
+            "doi": ANCIBD_DOI,
+            "tsv": tsv.name,
+            "index": ANCIBD_INDEX,
+            "citation": "Ringbauer et al. Nat Genet 56:143–151 (2023)",
+            "downloaded_at_utc": datetime.now(timezone.utc).isoformat(),
+            **stats,
+        }, indent=2), encoding="utf-8")
+        st = self.check(path)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+    def verify(self, path: Path, job: Job) -> str:
+        job.set_stage("checking ancIBD index")
+        st = self.check(path)
+        if st.state == "partial" and self.tsv(path) and not self.index_path(path):
+            return self.download(path, job)
+        if st.state != "ok":
+            raise RuntimeError(st.summary)
+        return st.summary
+
+
 class Gemini(Source):
     key = "gemini"
     title = "Google Gemini API"
@@ -1678,16 +2460,19 @@ class OpenHumans(Source):
         return ohdb.update_new_items(path, job, store=Store())
 
 
-SOURCES: list[Source] = [FtdnaDiscover(), FtdnaHaplotree(), YfullYtree(), Theytree(),
-                         Aadr(), ThousandGenomes(), RsidIdentity(), Seshat(),
+SOURCES: list[Source] = [FtdnaDiscover(), FtdnaHaplotree(), YfullYtree(), Theytree(), Uysd(),
+                         Aadr(), AadrHumanOrigins(), ThousandGenomes(), RsidIdentity(), AncIbd(),
+                         PhyloTreeMt(), AmtDb(),
+                         Seshat(), Cliopatria(),
                          OpenHumans(), GwasCatalog(), PgsModels(), Gemini()]
 BY_KEY = {s.key: s for s in SOURCES}
 
 # Группы левого меню F2: (заголовок, ключи источников по порядку).
 SOURCE_GROUPS: list[tuple[str, tuple[str, ...]]] = [
-    ("Y-DNA trees", ("ftdna_discover", "ftdna_haplotree", "yfull_ytree", "theytree")),
-    ("Reference panels", ("aadr", "1000g", "rsid_identity")),
-    ("History & lore", ("seshat",)),
+    ("Y-DNA trees", ("ftdna_discover", "ftdna_haplotree", "yfull_ytree", "theytree", "uysd")),
+    ("Reference panels", ("aadr", "aadr_ho", "1000g", "rsid_identity", "ancibd")),
+    ("mtDNA", ("phylotree_mt", "amtdb")),
+    ("History & lore", ("seshat", "cliopatria")),
     ("Public samples", ("openhumans",)),
     ("GWAS & polygenic", ("gwas_catalog", "pgs_models")),
     ("AI", ("gemini",)),

@@ -227,6 +227,67 @@ def modern_affinity(
     return out
 
 
+def local_ref(session: LineageSession) -> dict[str, Any]:
+    """Our mt tip, UYSD (Y tip), AmtDB parallels, ancIBD index presence."""
+    from ..core import ancibd as ancibd_mod
+    from ..core import mtdna as mtdna_mod
+    from ..core import uysd as uysd_mod
+
+    out: dict[str, Any] = {"need_from_user": []}
+    g = genome_db.get(session.genome, store=session.store, set_active_flag=False)
+    tip = mtdna_mod.tip_from_genome(g, session.store) if g is not None else None
+    if tip:
+        out["our_mt"] = {"tip": tip[0], "score": round(float(tip[1]), 3)}
+        amt = mtdna_mod.load_amtdb(session.store)
+        if amt is not None:
+            out["amtdb"] = [
+                {
+                    "id": s.identifier,
+                    "mt": s.mt_hg,
+                    "culture": s.culture,
+                    "country": s.country,
+                    "epoch": s.epoch,
+                    "year_from": s.year_from,
+                    "year_to": s.year_to,
+                }
+                for s in amt.match(tip[0], limit=8)
+            ]
+        else:
+            out["amtdb"] = None
+            out["need_from_user"].append("AmtDB missing — F2 amtdb · D")
+    else:
+        out["our_mt"] = None
+        out["amtdb"] = None
+        out["need_from_user"].append(
+            "Our mt tip unavailable — F2 PhyloTree + F1 MT calls on kit"
+        )
+
+    ytip = session.branch.tip
+    idx = uysd_mod.load_index(session.store)
+    if idx is not None and ytip:
+        rows = idx.frequencies(ytip, limit=8, fetch=False)
+        out["uysd"] = {
+            "haplogroup": ytip,
+            "top": [{"label": r.label, "pct": r.pct, "n": r.n} for r in rows],
+        }
+        if not rows:
+            out["need_from_user"].append(
+                f"UYSD cache empty for {ytip} — open F6 O % once to fetch"
+            )
+    else:
+        out["uysd"] = None
+        if idx is None:
+            out["need_from_user"].append("UYSD missing — F2 uysd · D")
+
+    aidx = ancibd_mod.load_index(session.store)
+    if aidx is not None:
+        out["ancibd"] = {"ready": True, "n_ids": len(aidx.neighbors)}
+    else:
+        out["ancibd"] = {"ready": False, "n_ids": 0}
+        out["need_from_user"].append("ancIBD index missing — F2 ancibd · D")
+    return out
+
+
 def lineage_tool_handlers(
     store: Store,
     *,
@@ -264,10 +325,14 @@ def lineage_tool_handlers(
     def tool_modern_affinity(limit: int = 15, **_kwargs: Any) -> dict[str, Any]:
         return modern_affinity(session(), limit=int(limit))
 
+    def tool_local_ref(**_kwargs: Any) -> dict[str, Any]:
+        return local_ref(session())
+
     return {
         "y_path": tool_y_path,
         "y_lore": tool_y_lore,
         "y_milestones": tool_y_milestones,
         "aadr_y_hits": tool_aadr_y_hits,
         "modern_affinity": tool_modern_affinity,
+        "local_ref": tool_local_ref,
     }

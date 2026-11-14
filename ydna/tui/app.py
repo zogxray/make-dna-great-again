@@ -152,7 +152,7 @@ class YDnaApp(App):
             _overlays._cache_sig = None
             if self.tree_ws and getattr(self.tree_ws, "ctx", None):
                 self.tree_ws.ctx.drop_overlays()
-        if key == "aadr" and (ws := self.screen) and getattr(ws, "mode_key", None) == "reference":
+        if key in ("aadr", "aadr_ho") and (ws := self.screen) and getattr(ws, "mode_key", None) == "reference":
             ws.reload()
         if key == "gwas_catalog" and (ws := self.screen) and getattr(ws, "mode_key", None) == "gwas":
             ws.reload(force=True)

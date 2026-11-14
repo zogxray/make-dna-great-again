@@ -29,9 +29,10 @@ _SEARCH_LIMIT = 8
 
 _LINEAGE_HINTS = re.compile(
     r"(?:"
-    r"\b(?:adam|y[- ]?dna|haplo|clade|tmrca|aadr|1000g|thousand genomes|"
-    r"ancestr\w*|bronze|neolithic|iron age|seshat|discover|paternal)\b|"
-    r"родослов\w*|эпох\w*|культур\w*|религ\w*|отцовск\w*"
+    r"\b(?:adam|y[- ]?dna|mt[- ]?dna|mtdna|haplo|clade|tmrca|aadr|1000g|"
+    r"thousand genomes|ancestr\w*|bronze|neolithic|iron age|seshat|discover|"
+    r"paternal|maternal|uysd|ancibd|amtdb)\b|"
+    r"родослов\w*|эпох\w*|культур\w*|религ\w*|отцовск\w*|материнск\w*"
     r")",
     re.I,
 )
@@ -111,6 +112,7 @@ def _heuristic_tools(question: str) -> list[dict[str, Any]]:
             {"tool": "y_milestones", "args": {"limit": 8, "with_lore": True}},
             {"tool": "aadr_y_hits", "args": {"limit_per_epoch": 6}},
             {"tool": "modern_affinity", "args": {"limit": 12}},
+            {"tool": "local_ref", "args": {}},
         ])
     if gwas or not lineage:
         toks = [t for t in re.split(r"[\s,;|/]+", q.lower()) if len(t) > 3]
@@ -177,7 +179,7 @@ def normalize_plan(data: dict[str, Any], *, question: str) -> dict[str, Any]:
 def plan_prompt(question: str, *, available_tools: list[str] | None = None) -> str:
     tools = available_tools or [
         "gwas_search", "gwas_trait", "pgs_search", "genome_rs", "profile_micronutrients",
-        "y_path", "y_lore", "y_milestones", "aadr_y_hits", "modern_affinity",
+        "y_path", "y_lore", "y_milestones", "aadr_y_hits", "modern_affinity", "local_ref",
     ]
     return "\n".join([
         "You plan a local genome investigation. Output ONLY one JSON object.",
@@ -204,10 +206,12 @@ def plan_prompt(question: str, *, available_tools: list[str] | None = None) -> s
         '- y_milestones: {"limit": 8, "with_lore": true}  (keep lean; lore is large)',
         '- aadr_y_hits: {"epochs": ["bronze","iron"], "limit_per_epoch": 6}  (epochs optional)',
         '- modern_affinity: {"limit": 12}  (cached f3 only)',
+        '- local_ref: {}  (Our mt tip, UYSD Y freq cache, AmtDB, ancIBD readiness)',
         "",
         "Rules:",
         "- Pick tools that answer THIS question; omit irrelevant domains.",
-        "- Ancestry / epochs / cultures / religions / Adam / Y / AADR / 1000G → y_* + aadr_* + modern_affinity.",
+        "- Ancestry / epochs / cultures / religions / Adam / Y / mt / AADR / 1000G → "
+        "y_* + aadr_* + modern_affinity + local_ref.",
         "- Traits / vitamins / disease / supplements → gwas_* / pgs_* / micronutrients.",
         "- Mixed questions may use both domains.",
         "- Do not invent results — only propose tool calls.",
@@ -417,10 +421,48 @@ def _compact_gwas_steps(facts: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _compact_local_ref(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not data:
+        return None
+    out: dict[str, Any] = {}
+    mt = data.get("our_mt")
+    if isinstance(mt, dict) and mt.get("tip"):
+        out["our_mt"] = {"tip": mt.get("tip"), "score": mt.get("score")}
+    elif mt is None and "our_mt" in data:
+        out["our_mt"] = None
+    uysd = data.get("uysd")
+    if isinstance(uysd, dict):
+        out["uysd"] = {
+            "haplogroup": uysd.get("haplogroup"),
+            "top": list(uysd.get("top") or [])[:8],
+        }
+    amtdb = data.get("amtdb")
+    if isinstance(amtdb, list):
+        out["amtdb"] = [
+            {
+                "id": r.get("id"),
+                "mt": r.get("mt"),
+                "culture": r.get("culture"),
+                "country": r.get("country"),
+                "epoch": r.get("epoch"),
+            }
+            for r in amtdb[:8]
+            if isinstance(r, dict)
+        ]
+    anc = data.get("ancibd")
+    if isinstance(anc, dict):
+        out["ancibd"] = {"ready": bool(anc.get("ready")), "n_ids": anc.get("n_ids")}
+    need = list(data.get("need_from_user") or [])[:6]
+    if need:
+        out["need_from_user"] = need
+    return out or None
+
+
 def lineage_tools_present(facts: dict[str, Any]) -> bool:
     names = {step.get("tool") for step in facts.get("tool_results") or []}
     return bool(names & {
         "y_path", "y_lore", "y_milestones", "aadr_y_hits", "modern_affinity",
+        "local_ref",
     })
 
 
@@ -455,6 +497,9 @@ def compact_facts_pack(facts: dict[str, Any]) -> dict[str, Any]:
     lore = _compact_lore(_tool_data(facts, "y_lore"), include_facts_text=True, max_facts=900)
     if lore:
         pack["y_lore"] = lore
+    local = _compact_local_ref(_tool_data(facts, "local_ref"))
+    if local:
+        pack["local_ref"] = local
     gwas = _compact_gwas_steps(facts)
     if gwas:
         pack["gwas"] = gwas
@@ -720,6 +765,15 @@ def facts_markdown(facts: dict[str, Any]) -> str:
                 f"aadr={'yes' if data.get('aadr') else 'no'} "
                 f"kg={'yes' if data.get('kg') else 'no'}"
             )
+        elif name == "local_ref":
+            mt = (data.get("our_mt") or {}) if isinstance(data.get("our_mt"), dict) else {}
+            uysd = data.get("uysd") or {}
+            summary = (
+                f"mt={mt.get('tip') or '—'} "
+                f"uysd={uysd.get('haplogroup') or '—'} "
+                f"amtdb={len(data.get('amtdb') or [])} "
+                f"ancibd={'yes' if (data.get('ancibd') or {}).get('ready') else 'no'}"
+            )
         elif name == "gwas_search":
             summary = f"query={data.get('query')!r} hits={data.get('hits')}"
         elif name == "gwas_trait":
@@ -771,7 +825,7 @@ def run_investigate(
     h = dict(handlers or {})
     available = sorted(set(h) | {
         "gwas_search", "gwas_trait", "pgs_search", "genome_rs", "profile_micronutrients",
-        "y_path", "y_lore", "y_milestones", "aadr_y_hits", "modern_affinity",
+        "y_path", "y_lore", "y_milestones", "aadr_y_hits", "modern_affinity", "local_ref",
     })
     job.stage = "flash · plan"
     plan_raw = chat.send(

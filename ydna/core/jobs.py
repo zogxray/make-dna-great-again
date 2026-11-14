@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-USER_AGENT = "Mozilla/5.0 (compatible; make-dna-great-again/0.1)"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36 make-dna-great-again/0.1"
+)
 CHUNK = 1 << 20
 RETRIES = 5
 
@@ -321,19 +324,22 @@ def ensure_space(target: Path, need: int) -> None:
 
 
 def fetch(url: str, dest: Path, job: Job, label: str, size: int | None = None,
-          md5: str | None = None) -> str:
+          md5: str | None = None, headers: dict[str, str] | None = None) -> str:
     """Скачивает url в dest через dest.part с докачкой (если сервер умеет Range) и повторами.
     Возвращает 'skipped' или 'downloaded'."""
     if dest.exists() and dest.stat().st_size > 0 and (size is None or dest.stat().st_size == size):
         return "skipped"
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
+    hdrs = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if headers:
+        hdrs.update(headers)
     for attempt in range(1, RETRIES + 1):
         have = part.stat().st_size if part.exists() else 0
         if size is not None and have > size:
             part.unlink()
             have = 0
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(url, headers=dict(hdrs))
         if have and (size is None or have < size):
             req.add_header("Range", f"bytes={have}-")
         try:

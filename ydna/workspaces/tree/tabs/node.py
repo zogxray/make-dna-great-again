@@ -851,6 +851,59 @@ def badges_block(doc: Doc, badges: list) -> None:
 
 # ───────────────────────── tabs ─────────────────────────
 
+def _uysd_freq_block(ctx, doc: Doc, node: dict) -> None:
+    """Modern Y frequencies from UYSD (F2) for this node / Our Y tip.
+
+    Uses disk cache only on the paint path (no network stall). A background
+    prefetch fills the cache for the next Overview open.
+    """
+    from ....core import uysd as uysd_mod
+
+    store = getattr(ctx, "store", None)
+    idx = uysd_mod.load_index(store)
+    if idx is None:
+        return
+    name = str(node.get("name") or "").strip()
+    tip = ""
+    branch = getattr(ctx, "branch", None)
+    if branch is not None:
+        tip = str(getattr(branch, "tip", "") or "")
+    query = name or tip
+    if not query:
+        return
+    rows = idx.frequencies(query, limit=6, fetch=False)
+    used = query
+    if not rows and tip and tip != query:
+        rows = idx.frequencies(tip, limit=6, fetch=False)
+        used = tip
+    doc.title(f"UYSD · modern freq  ·  {used}")
+    if not rows:
+        put(doc, ("○ cache miss · prefetching in background…", "#8A8294"), indent=1)
+        # Fire-and-forget fill for next paint.
+        app = getattr(ctx, "app", None)
+        if app is not None and hasattr(app, "run_worker"):
+            def _prefetch(q=used, s=store):
+                try:
+                    i = uysd_mod.load_index(s)
+                    if i:
+                        i.frequencies(q, limit=8, fetch=True)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                app.run_worker(_prefetch, thread=True, exclusive=False,
+                               group="uysd-prefetch")
+            except Exception:  # noqa: BLE001
+                pass
+        return
+    for r in rows:
+        mark = "~" if r.interpolated else " "
+        put(doc,
+            (f"{mark}{r.pct:5.1f}%  ", "#D4AD72"),
+            (f"{r.label}", "#FBF6F0"),
+            (f"  ·  {r.n_derived}/{r.n}", "#8A8294"),
+            indent=1)
+
+
 def _sources_status_block(ctx, doc: Doc, node: dict) -> None:
     """Сразу в Overview: какие базы включены и есть ли матч имени у текущего узла."""
     from ....core.overlays import resolve_overlay_dir
@@ -992,6 +1045,7 @@ def overview(ctx, doc: Doc, node: dict) -> None:
         cc = country_code(n)
         labels.append(f"{flag(cc)} {n}" if cc else n)
     doc.line(" · ".join(labels) if labels else "—", "", 1)
+    _uysd_freq_block(ctx, doc, node)
 
     ctx.branch_block(doc, node)
 

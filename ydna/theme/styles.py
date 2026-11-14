@@ -131,6 +131,10 @@ MAP = {
     "bg": BG,
     "coast": _fill(DIATONIC_HUE_STEP * 5.0, s=0.08, v=0.12),
     "border": _hsv_to_hex(_HD, 0.35, 0.35),
+    "polity": _hsv_to_hex(_HD, 0.22, 0.42),       # Cliopatria outline fallback
+    "polity_fill": _fill(DIATONIC_HUE_STEP * 2.0, s=0.06, v=0.10),
+    "habitat": _hsv_to_hex(_HD, 0.28, 0.48),      # AADR culture hull outline
+    "habitat_fill": _fill(DIATONIC_HUE_STEP * 3.0, s=0.05, v=0.11),
     "ring": _hsv_to_hex(_HD, 0.30, 0.28),
     "grid": _hsv_to_hex(_HD, 0.28, 0.22),
     "route": BAD,

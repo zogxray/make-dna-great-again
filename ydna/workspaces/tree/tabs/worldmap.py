@@ -1,7 +1,8 @@
 """Карта в стиле DEFCON для вкладки Map.
 
-Береговая линия и границы: Natural Earth 110m (public domain) через world-atlas,
-упрощены и вшиты в файл (_DATA). Рисуем на брайлевском холсте: 2x4 точки на символ.
+Береговая линия: Natural Earth 50m land (public domain) через world-atlas,
+упрощена и вшита в _DATA (только берега — без современных границ государств).
+Рисуем на брайлевском холсте: 2x4 точки на символ. Rebuild: scripts/build_worldmap_coast.py.
 """
 
 from __future__ import annotations
@@ -16,145 +17,217 @@ from ....theme.styles import MAP
 from ...base import click as click_style
 
 _DATA = (
-    "eNplXQmSJDkK/JDCTOjWW8b2/99YgTtIlW3d01OVGRmHDnAch/zvP0n/1brTJznVlb4iSdI3kjR96X//S//lc8Au6Wszff28WHDA"
-    "SF89h6dvp5y+lc5nZSR9ST90ztpy1VNUffMc/8n5WNOfsn3S3jz/2RnPL+fswk/WZod3PUiqfmTpZfzEteivxe51+2v5fH5VvcNz"
-    "OtxeOf9I6vqDH1b2OaT182JO5+p6S+cSOU6iB7dzN3LeH3q7I95q9gTtvFXPu3z5WzOVOe2R/rzU9CV7gqqXOqft8bxF77Lw7e3D"
-    "waH+ZEoqem+p+Rll5vNSS0WHXgej6vToX308G75zV+f1ff6v83B+0YfP9hS8Wzt3OUPX9rni+b/N8PlVR2vb8d8ZbBuuZZOij9Xj"
-    "HnRwelsJg6cHzzTtX1n2LFtPxKfk5A57Q0dZV5f9q392ixtq56WxZzpz8un9Nz6Onkf/Pb/ropo6F2dck97gtPeGLgnRV0U/ej5W"
-    "kk1d8bfPgOls24MWm25bTXrqZgtFl/uZq/O6Pj9u2IZUb/TM/fnPtsPi5/H2+WM74SyDgkVmn7YLZr0pnaGlY2efEbHBKrZ09OM6"
-    "sHofYm93zIPoB/WXrafMdgeiU6qPM21Apx1v/+rIb5yu2AfwXGIPZ7uNexX/buyuht2mq+Orvpc/u5XyHrFsn0psWh60uICxjZdv"
-    "XUzVxkpoOhLbBj1jynSp282fcbYz6UexFKadTDDcy6ZW7I71pakrV2fgvKQ/26RPfX1zceq17fBtm1jXRbWrNJuQYkOKBbBs2eHX"
-    "8zEbsmnT2fUyZgj0WrXYhtXnmxxTW9Vixs6mwR7dHqXZZTmIDQOImRKzivabDl+xddJ9bCeGUxelGimdZFs+58Wia013TLLF8G1a"
-    "sjOknOGJhSpqoL6JffHB4n169zZDhdcRzIyYcbbx9908jpFpXTDM2ZZgoxHWIUh+BrvZ4q8LLBVs24id3uwGM1dcxb3AhHCEdFtm"
-    "m1Z7BP2gPmSxyeFYYscneT7zVeyOjVHtCauwcH9+Nho4vCTuv4yRneNaPX9Y3j72gF7PfAS2m3kuNTcZl67PA5ftK96WWfE3G7el"
-    "XrTQp1W38Bg7GmO1FsnNfuE9YoQK9khzs2tmy25N58/WU6xc+6fGiTOvrwd3jn/zmxbB5OXYwzZYM8FYZ14UCwl+8INLF5oSdXZY"
-    "FXqbGXdaUqezt9uEBbNVdD5dcCbbeNwYBSOTeXzxYbV5b7yvzDNse2uGb7RX+KRYIZ0Lzj6hq8EX9Fav2bcPgO3rD/Zk4NQYOBt3"
-    "eKZFS8SpFzhs282YU71asaOr2WHY+8ZtZO5LnXUtneMyeNHYBsK9JIAA9mPCxhEDTdKwdvTshUtAHWwxB2LrXj20ORh4IXPXUu1m"
-    "xCa8Y3ngIUbcmvvrzyzjZ1bPPIq5e7VHAb0KXFGxSaATqLDpftvXuBUOjAEBmKJY+ZUL9xtuEqfbMUBLurKGCe6vH2pcCQburinV"
-    "7WZ+2ybAAEGDzR4JnmG4pcFYD6LM7iizOShx8KlTUDBBDTddfJRsdnSVNPPi3ZzSwkYUmwqdlwkL0LChJ03R5zeBpSndrYTdA650"
-    "1pqO/sJt6McF6Nkhgp5o26f0DjpclxTeiZm9sg1yAB+ZC7NVYtcoiU7H5k1GAJ9mC0tdTFKv47BuHaDadlh7vy9u626zTWy+4MMG"
-    "XT1mUp5THaTfSqPfMeNShbtc+ES0uIQWk74C5snR7tSHVMigOGLTvMCEVI6ixE4xTJcJCD5gofOhbb7VdtTwfTh5/j7O+eFN3YVO"
-    "GrkPy9CheD/P2wzc2nJpnHPsmQZkoPdVcQu2MHaiGb8og6h/JUQsn4cUbZ9pGVxEEvZjYUFMW3i2+ZbBRsBPBcGAkXr7FRYccYm+"
-    "CyRQESBkWzPqqach66/gViseWxdm1SWt19dHBfxeOO7DNRGANfcK5uo6wR2js6Vxia4NW6+VsIqRRCcYLXAmNnnjjoFPdqXXgH9q"
-    "tsOkwDZUmmp5P5ML3QBinR7ueDn+ERqXdS2Y4VmeZcxj/KfY+T10G+Pct4VuAGbblj3uQ/Lj8txLI9pqmLYPHqwl3veNuyzK0aVY"
-    "EWMJTlMcWtIDwf8VYlwYNmEYByxdGHOLPJ6eKDNhy9S4gkXNiOjoNTiQZldHhNO4u20hb/9zx9vmZPnN4uqiS17t4ITdB5ZadvHt"
-    "JgTjVR9IUgxbmfvt8BnTp494pMFPF1hsCyV0GSGwamaK4M6xH8SsYLb3p70TD1S6bqEd1inba/ow7QFm9C4K8XVF+YEyzzYQzuZ0"
-    "UAIosYn2A/h9m6vWrSY9m3AHfY3PRaNYw9fBKxEsCCEiB9JiO7XybrMknxC5GIigS50M2G3TMWBAJGFDhz8aHuYHroylpr8MxvdA"
-    "RIiOia+EuKfeQEF/b9tWjO3+eKtPxYuZq30xaIULzNzietW+dGfWGEfAuvKEL7H4a+ACu28YITr1QhPaA6cKrX1zY+RRZTWcUH1H"
-    "XgYq7rAHbcWTPcE1R2NHXDUiomv8Wz2st7UpMVgY32pBZMXMZziYHMGBAEdUQIpuZr6SEBgJxJBDi4pna9xnDB9sT4uuD2xAo1SM"
-    "E9AwevgLgENNEcEAB5PUPOiRNkwDDrWYD5OJC7gvq2+keELYCXbJLkiIZJYRwDYOtiCzgAMQxBqJ5tjtZ6MJNezz2WkMEV2S7qw3"
-    "ne8+7YE7Udu6Madh8HrDO1+i9cZpigW6GXEB+FCv7QxXt9E3MPWwjt/YhkoMOs7E4JhzLpnmuNnZZvrdVJUrihg41os4sCuwyvBt"
-    "FifYihQdSsDoxRh3Y0VMHo+BorXl+XXzV32UwRXwOQrQOapmBTrj1RrTMEApDTPkNZ57Gre5asKS67+UqsVqhMn1Wr/KbacEB7GQ"
-    "UcMidL8T/qAEDsBOFDd+YgalvluogIneDqgN+xL3GeAf7kmwKQ3aEsrBHAx65285y5oZ225GTro0PCoO76BHyLvwRUFNN2qGGD/c"
-    "S9WlvDwibyCTeZcWoZk/WzGvBsCrnUX07Y5YxjGQrDNH3QxFsxk18KYrsOOkM3XOL3kCw2kMQWLkDm7pBUik0afQCCm2jzlduJZH"
-    "G46LxoNTP8dWM1hz7Jwv/kqJtxCyOZ6ON5oA4pu/PrNshKXEm8cSbVttYF+NbTvO5ZzIqfV2ANrKAXVlc66aOnbQ3zXhv+wRBmgD"
-    "BpDuRZrxSBYJiIT/debAcx+ZoEKWk1Q93G9tx1RUBKH+Uj8bpQPjOpfSzALT3HVAMgXV901/BB+b6Vuo+c4qT4gcwayHRuXYxQWv"
-    "uMD+EiVGqqAUHRzxbVUJZRNJkwZT0JzgsiXZEEzq6zm24Tn/HvYJ22VnauK9A66KYbEdD1THttdI+8NLBUsH8+ADtzTGyO7HZ7CK"
-    "MJv2OX+aOnSamwMM8FzujtuTRVIg9szVgickkY5IsYE/Fo8bM8c3B4XoWyCC0kXzH4jPZ7v4RRlY5GsXhSHMjCi30fLNZx45Szyq"
-    "k/y4WQCAbHEcchnjlsIMr+u55CzGaZkps6VCy9fpPwV4DGjZDglc2dQWbRjR4VmvbnYIUcSGR7FESHFCMFaXcQxxLl0DhqXPzlFv"
-    "HOTcVF+2HS//YQXDi9sxKzv9J07kwrGYayP/HkQt79nzReXPqfa0txZWQsUFSf8YQNTbDECHAVtO+sUd0pdMnCGHD1BA1JuuvwwL"
-    "rE5k62vNIbg7kqKQoxda8+8hAEStcSu42n1tGI2SmWgr9IDbwBtIisnIXAjJkJ5wwMFgytMknyEMvmDzSA9hAUdxZG2rBXPSfUnu"
-    "GxD4Ola34bcq45x535ioB+mJBI7uZpvDAgjfSfw7HcoRbkF+Fw+bmBETzjH3QOmgLiJO2ekGDHKp4hLkliY7SV+46b2kC0/sIb1B"
-    "Zmeg4SjcEx2EZzzQokF2vrqG99VTqlMDCQ68wgAfphX+CYiUAbHfUVbnAmJru19eCSHecuNlo2T7bt8HrMcZtCm2OwAcxbMTg7ik"
-    "+qgOEPdf4SUysHgjIkPOI6apJTfj+rh+uTMGvTgRZFPQktOuk0jJ0xekWD2bWjwfWYjJYnucZ+ijeMrwhp5lnn0zu19iI2KRAN7l"
-    "GIu++03Y9jjjwVb5nEhBQ/I4eybyC8idkjbblC3o3QfaOdM9tqYTkrMHVaO9PbjtDNQgnck014pV4aklbsnW6QyK8xQR+XS3ukxc"
-    "NkClCsKsGKrfniVm2ntZhDiw/MoikPZELqw8eFkdfl0F3ZQcK2Lfwfy4EWxm3DuIArzjlNMAz6znzwx47u4liyGJlO4CB7psjraN"
-    "JUanhFNduK3IMIpfk/Su7HgN8ESwILvBJxuk5vlihBOIKJEiZ0J2GhHSHTVR3yGgS8wKGtsuTtX56BoR3YYT8QiUxDCPelCsZAoF"
-    "wCYWBOAZtt5I+RYeikxkIb+E3VKSRR0WVGC5QAby1XlZuZu87rBznMjqDumMAtQNOn8hgxh8ZpARgJ+DG0qy/8wZd3J1EuJsmJad"
-    "I0QqiCHsnh0/uTCAKd2GfJR4Umrzxw31Bunrppmbr0JDUQBsal92O8rGgVr3JQv6Cusmu+/xreRZRY4buRuEw5XxJbzK44ucrcfb"
-    "vi7qyNkD9c50wmY4vuAD5UWXFsBylio2g3MC4GQH3WcL8NYIHpg8F0I511IwVMk3UuX5ZixdifwRiS6mwRsTCnUCZOxEkG6kfzeF"
-    "0DKvIWEV3M+NCM3p9xtVCYM2qjLPMmGjYogqwlvmtvSewcpyrwHxD6o3xPUs8mZvb9wlgwxpC2TFFDsRxoAZ61dU8QQEx0+2kcE0"
-    "ZAY2DiHrMVXNSCNQIuJM3qNh6fDQhQ66gkbWJfxj/DHQlUCJ7Oi8azJ7vhNPht0XrivjJJ5upIUrHuWAf2BSjYNRn1BQyPT6kiZf"
-    "5NISiQDc+OpjpJbnC0q+epTi7H+jzs0yGua5tm1ZC2rP6CtmzTRqg3nFBftmq79KhCCg08Yl1Z1oL+CsBEEI0V0I62ToHC9w1e0y"
-    "k7Tl2ay8rmo/XlFlcY7lchNEVxNZv5mQhLb40jOzSJiBKjIPakn2y2QYHqXhClyjNqJYiFbERVKPpK8i+bmY3Gcu0gO/gbG3XEIo"
-    "FPXJxnxifhMt6kvfBeyu8PkoOvhkv7yAjAuagKu7k+I3DyX7mraP0L96avZyIzetVrjDNxnA/KonBq5a7H0s0EmwC8Dkae8KqtkC"
-    "RVMAds84OiFC5+7CEwmlUqUIJvSSS8GDx9ZOn8oFyXbQVqp0UWnkQUqOrIxvjkwJXJjaSENstY0qM4ROje4Do9coY0OefwTrLtQD"
-    "GBoRTzYyAGbqxHw/shCmyeBYrdCY5QeKGH4XQr+VgvYZqT5ZRcg8pLlAylOFxdV7YKOpuQLZiN+CMqpXNpYB/7ojVU+bMOHczYEg"
-    "4ERKBjdz9tr+J9UzmG9f9gEzXxyiCKJv3qda3mdRePER8K0bC+zUL1My/mH/K1DY4LDUS0wW0p8PD+0pVYjZLov9dWXMSgaGM2uC"
-    "rMeiaIxD35BQKxmL0JRZcaUBWA7WuN/FAUvh6MfdQeQguCRvfsHWWL4ktcHRfpPHngUdhJYw6s1C/5KgSWVQBT1pg5wUeZ3nQtuc"
-    "dCdyHE7bIKNCCPlQPrapwKVaBvYmdIYtocG0q1l38UtPO2dxtRe5Jdwp2I4KnNgRKbxZpTyVrQbBEZKwGlTlZUBXiuwLZdvGWhbO"
-    "YTxzHwbJ+xVigPq8q8qEqFRBcC0U9z8gamXG2tVwAWHyspi90ybNqxurmHTub7WGZXuM1N1mF6LuTha7OwATivsw8syIrMCBpgPO"
-    "r/5y/Um+0PK3oFHC4QeJyYhv37txtV/3BEkL6R+QoaNu4SVGJLSnaxqAWS4Hi7TpN/7ZbiQrui+P9Sfx6jj3n9zboLhhEaTdDAsZ"
-    "hfWI3CJzFaEptKiUW2A8FzAJce9ERNuRLmsMz9T3r2uCVMukOtcnEBCqrJhvMriboKzBhhA/z3ephG92l93ApBeCmXU38QeJxwoS"
-    "OAdv0n9OY9pyroIVKSc9aQzI2riQDZvgPAikBboJ7tCBPBKkycBP92rz+H5X21H8ZA7lki/nmKY0+wCXYDlMUJUgKDIhIfKOi3qE"
-    "zBxmeaolpgZg4iQJg+IbCNWY1smN5hu3hphIINMQWIUnfe9kYSFccGu/71PYk37VSbMCczYf4PXqYstlFx5Ca9xDHSAZRItMSCwr"
-    "RU2ACMUFoXC+gcTWicj28HxNWKfPAAqmcgSmAzM0r8rFr+BCYxDnL2/DHG31waY/KZA4gsK7oKtPy1OIv1uSuPS33EsqHb2Tq+VX"
-    "vMFPm3BnOTV5B2PqDObr0eAMgr8c3PnMd7ar516qK+z5DvkVYnvIKx52BXMSH+ZlGTs+kzPVQsCzfcUTQrbnLghFPqo6ZFC/FCfW"
-    "me0zYlOJohrbHMOxxB0fXvBz8bU4nVHvFOysfnUmBMQ2PvlfTEzl1x0hNQN9c+FwTAMI85Q3jnieAVA8c4+JUyCG529+hVs2smIS"
-    "C3ZwqzXHiJSmAoZ60hnmgDpE7N8O3GX4qzNrDbBmq6JRvVZdJZWTh2OLEPbx9Xul1QirPCLyOgLxUNrgecwGPzNDr5U9fjK8e5Gw"
-    "ksuu7wjDQGE58ZBZmjAy/IgUn4zFkz7YRGN4Okc/G4O/SJDxIAkqab2p0nFGdjOFI+2xo3LT+Eqmzyjb64lc6jNMnTlEP+kytsW1"
-    "S66zqowIy9XtnhtUJXGdEdFGbuZvzquq3rOH2tbhtP1MHuwWh21LjHTY5RtGLVL6ntKtlD1XAvfNoqPFmrhI2p3xEfEEDWZku3jO"
-    "vV+fHMi7mQgGetQ/ePoowPSmTxW3CyWMRjAOnoERT0Q2V9YIo9hIpZau55lGWsPyC4oShVVpVwxbrciyR84vYwU3IggixuGFYfJK"
-    "NIJlyZYrQW1eJUymcLH9GT/BbZWrbHVi5wp3dRsgwnBC+DMyybhmJSIifWi5yQog5tr7prCbBqE0niby5nbi2Q0cTuKCWzg5dC0M"
-    "2o7OMG9ezcY5QhkumJ/uCKxzJTC+vkWXxhcMJjscAwayE6sVcbl79cRavfWSeuURysjylo3oneLp1r039QaFYwSlRknhx+nLyO3k"
-    "hxrOvzfcyEJQJVVt+zQ614ZipXkVGgfFybhn0Sz+8a1KVLV2K2Maq4Llpjw1sAHIqY+UY7wRCaUU/omkGgFWedzk6L6Ut1xoFcUU"
-    "T9CVb0mHvCGHOmKXWTzFZJcVuk5e1zkBH3G2M0UFZt/rLze3jJ/sZiy9wNeqpa+x4tqi0yIrWUH2XCm8H6+1Nqxmi92Yhji7WWqU"
-    "C1FBL4HPVTti1LVNK0x2MM/FdDmQfsFFhpYmidU1RX3Zrb6LxDkdQSk/+hDMw8OIiu7S4pwd5ddXUAvivF7icoTA2OYjImTarRZa"
-    "oXxF7p/cei9bJ3+fESwm2LjGLBKgVv+7Qi2/dR6iWL2E7BD4qZgZlHfHHV1L48/XHqy//G/580D1T8lRFM72Z/FGwHqgVbv1bE98"
-    "uQBLBk3oJA+Z/wp8vltdXRjI98g89R8LJSMzB0lWt//ZClKxyuRyKCLMWl7W+oQipSYmuEfEFWRDuCdyLN53OZ952FFX5/uB+M8L"
-    "1+6myraor6KMH6/i2uvYfSrspeyThXHi1vIa77LSHkxGlYcZo6kQViFDBzQfJ4Kzs7LUQcojXzsho+ZLQHZZIE+WKIzDmcCZhLX3"
-    "FPVbttxgyt/DwpS3+LGkYBhCt2LW/ZitFXyx147PP6KlGtqdWwV4PmW6FooraFHa46i0MtZ2XydHSGGrhPwhjvE1jmTxjaJ1SLjp"
-    "lQ+/LklrY5bFrDvJbUOAl4Mrw9KVv3pY8t8eUNztDxGk30d92gswk/wUk7lWFzZmPqkrI+VQg3nXv+5HUHkfqFbmmhI32sbIdC8I"
-    "nEEFlZDBuL7sDp+f1zIPmylTreNygw49zQId7CgBr36IiGNwvPdF42wGiVecIWzUgvUnf2W4Se+gZtdm/0IqS4RbwFZYlCh3It+G"
-    "HE/ePcPKOwiS+izEGdrUSZDVLo8PNBwCKPYJKZ5f8xKq6omF0CijqB+qtXIZnpVYHZJdXfKwyhSzUVTQgjMIpuCfrJ3SspHihAxc"
-    "yb9bIQTg+kEpY+ywibcERAlhl+98Zm+Fi0XSr3Z6YFVhuEJffPYhWybENHYl9FvwTKy4fqqqLYUbR6v+gg4WOoqYzWM2N3L3znhX"
-    "TQVLca4wDj0bv1bxegd75cx/rX9ya36Ukg4BN9Tbjis04yzUZ7j9ceQJlh0GX0nz1mSjt3GICm3bpAPsAohMX05LJR4bsrAZ2ciV"
-    "HOv0KJYPlLFpZuiDGcO315l1e0D356E2Ibn+TzcYMWXOggCtwkA0Wxzdq5ir6xA8GT5CmWuO6MxFL1DTCtBpA8NcqxdXmtWmDs/o"
-    "jPx3zG518/aWDe2X34hyc/w2ftYfILnJvUN0qAsAmC0WxVaRUsGmRBFV4JRHrhxhwiWSVbRhIbIEB9qV6W/whNmr2kBql8cm9QM4"
-    "ypD0UBD9QGpNHMolbPrQ/Oy+JSIjBctc/pYyqEi3lKChK3moMMg9nxsx+GY+srPrDqvdsCH9VGqB2gipQGg9l4baQLot1KXn2DVu"
-    "HSdYoBCWalpJvGbr+52F4quAmwIRbZQYa2ntRBjp2jpzTiFtVY3FLKymmVcJ3y+rSh0KBeWcSOT+srPq8Xx6t3BxPw9gaRkzdyVH"
-    "tX0JAOnz1K60tpLcZulyvgmuzc1abr+KTBFW/tPFIkjufCFWc9cyvFjJ7WtXXnlwfcaLuva3MyRWhemVIfkuwur6gHcVHMimpEIh"
-    "LaUMie36/Sj3s+7xRpK0Q5oa4CWrqL+ViytcJ+IEIXN1+26Bg25V/ORM077Jsns3GwFDxrbfnk4gfq9ef549Gwww0UH5PWmpc0Zh"
-    "MZmn+AkvF/MwIY3P+RzZI8fbg8vzULS/XmefZbQNspaQsifkMqVS2IcKn4I8cEeXIFQFx91ltRYt+vSMFJUaVKcJsw8leR0Bdzc1"
-    "0RZALx/i+s4Mz407uZdU2YC0FLomL9sqd8jUyDAqmiiuaQ+X7BwmiugV73h/AgpnIzLDGNmmr05bC+21TVcJGp018XTvcAk7mmax"
-    "oFAZPB9/A/HR8sI234z3ppX69CubqMnLFyHMzUbZkr+XavlBO8fwvHv49oOiygId6hr18nYXul2mJLlyfFyXAqME6fkzORzj7ipV"
-    "yKaxkFwS2VxxHkK6vLTLGivdtqfD4dCmBTY7WjQ0arVYp5ijTcF+aoXZuGxFfuUWfDRqCeajGp9BgInLKmNhFUU1Kzh36pqjJ07s"
-    "s3K2Y52TgXoLauujXwDhVamk/yPEl6IQcG+r7Cd6mtg8NBEdYvEGpHpFgLy35UTpcMKzucSteKCyw0YQcjCEfhbfT1nJwoOMUHyS"
-    "G7XZiOqx5VUncrulOVJrr5K4MpKgI4s2TLdyRq4Et9+S/ew9hZiBZha7RLqHncKKJ/kLq7MbnfNkqwjnaso/O4rNIMrVcSHjOyjO"
-    "2u6ydqKEHxGwy4dHijDJpVLjknAepHkUs7ZKPmMdRd+5FWuqXQGzyxPdgcrNT92QsHi9Wg4ps+ubq9cnhafwKNW4idLYC4kN8DYL"
-    "YKsXADOj2qIvFntc0LjDpO/IWp1ZqegZVziaXt8kkDo3L/YsXgJAuajXtUxTyiLTtJB6b95OB71dfLlO7SPSqX32/nbtNuRCGZpB"
-    "iubpPK1NUiFfLg/W2kibeLvC4YOB7ZdvaLXWOdfcLiJY8bLK58kibe+XSEEvFotffCu9NRdL76eDE4NbnZq85mlGty3hFAbpOyrW"
-    "5GH6+w2qb8ToNzYTSxqq10r/jAVVeZW9brxwlS1cljd0dMjo84zov2Jm9c73hXRDMUIXTnjzdLxH/zvA0O0LkzU4XqSFbbcPZ2Em"
-    "VW4tAWqj9AWtN8X9IWpuG8PTr3lDhhANkO9CXXC9LUZnL9aRZhImsYrjp19NdZcf5eeDjX6ayyWwKZ0odPsAmMD+e3HJbA1vHpLB"
-    "n5/lMTMq9m0TdG95FTT6UJvfB7UokHmgZRZKMBY4Whjt+m8LH1bwluv1hCtEbhQ0zzTX3RLBq6spHoV5dJ8qIbC+uYO3jhPXmlH3"
-    "129nm/rzSFggLivZ7mUk+kN4/7qoot8XTvS6LbL6oFa8jDO9fkHbGTZ486Dn1uiRzps/gZrpMEt03pmxp+2APb19DvZnhHkaoqz5"
-    "tAto2upoLWz95oHs18KbXTWJFtzXxbS/N7XqrHAXhMH+1L7fvsZsbjQmXW9jMeAE6uCQh2usjfqeXhctystBJtnKvwWoVZ+qL2qY"
-    "2RtBJEUT20za5Y1GMRBfi5q9Hzm6jyOEzRQDRaxetRLULEmcUatOpNxScVcIsGrxp5MCK0PK9kbKKMONtOBZNWPk2/7OC6IHsvgs"
-    "DhBmiTic+6ZPayhIu4NRl10TxlSuZChI+m9tZ4jpXUsvNdoYcntVbIAItXu6fQNUYjGcGIZyI1ji/CTyz3F1oyJdSJGxb0Ucc1Zo"
-    "V8MyAz97veslk+rbtuJP2yEvFUKbuUgucpjCD2tri9brbdsFrPwUp7beqaMzYi9t18uZBaKcpERD2PJUx0Pu9LijMs7VVomV95Wn"
-    "I1H1sX5co/JRbe7oInpf15Z+xhjEK+fU+6q2upW+dGq2FZ7+HMiM6wwxEDksT3redMw2RYyzP6Qb5yVguj+0N7mKrGU2wQ1DUy4J"
-    "1vCjHv+2GzvrwVqTsNUdVYrqOX9K7kPJ6FeZ535WANmRnl5lET+pPGp47wEvnGDgEKkiVTtFMVZ5mlk4ormsTcPp6NocVp2BnVgs"
-    "TMZWd6KvjhNE0eSiCjJFTcva5ODYmqh6RWv587AWYPXfJTJuaNj+pGJVja2GL1rAxdAdB9C6p/fB9TyF1KKrdbCRyaNj9RHf7vEF"
-    "BG1B7xpaC/nZQ4Z9Mkvc5Wov892E+XbZiBzH7TSjVfh1eh29PC05vsLV2N4xadR+UuP8aEsIxDx/Uv8IM9iuQR1IdHA4czDY6bTM"
-    "FDXInoaNj+K4THC4AXrQDPw5nS7iSVzkakY/Bd+T9EgLmWkq7Ef+tP2I/RXNR4r31163Uu8uTZYPFUbk+a94kGmEEkgw9SxPYfw5"
-    "TDlwOFnss4olXmL4zq7otbMKjztxwh9D6u54TY179iKcyHluezUHN8Mf5ekFOKP+n+thXKr62fLaHqAh5+dt38IIi7VzuL4z9JuU"
-    "EYeXYqdQJnqvyKZZ00rxSpqSnr4kDALKz9XexOjDjNrbeQUaKFE2Riw0vMjrcyXYSNGgo7AYyx+F8dLnYY7DV3b5l07W82m/oIVR"
-    "e1wh0d82J4bTjRCikwblF7gMAOzz8CMUXbffprc977d4/2sPAI+qlMEOfOiI97GeOKrlkDr3NmYFJexWu89CvAY20w/qTx+qhn6U"
-    "P7uVC0TIJcW+cAm5Z9TdSflQoZkBqE9AiivhYhcQr1phX84whWc7tTJC+fnWC/NzLgpq/1rpKLOLN/Z5guYtR4UVovkm3ZyaN35y"
-    "/Ukt6OZh75cgD1eDNre05D0byi0jbdHQ2lXAF8+p2FFtPAIbiiMya9QQ+9Uf3xmZmHKxRIv7L77CSaOUv+pcVFCE0YSud90c9VmP"
-    "ggaj4h10ItGN99guhc0ynzoyHVOrfXXxY3UA9Xl/nPWUGLjkK+SHg8o3h8i3wVFHv9kWmOmjpJ9M+XfXS0ILaqc85Rbq4u5C5WuB"
-    "AOr2y62QoMg6P71z5G1o770i3C7ckpbpO5M/VO/qeWufHcZJfnogFoPzUai2o1+XtCg8Apsijx5XWy12eYE3K6FuXz5y0k933+aQ"
-    "ubtbWckpXYrE/za0u6U/65EDwItNZ8pyuu26ytMdqDuJFw3z0UNL5lU7Fu9449HXiLbWDWGbinZkBm/vnF9IB+Vq+8rDPrO8p7Lp"
-    "ZL1c/x+86mx/ZBkO8OiDdMWKResFOsTxCABXFGVVb1Ljhpi3cmXrzjG3O6xffOVI86bXTFdGv88aSKtfpRCEBbdXAwu9+tv07lom"
-    "ggVKBiWzIQsaHgmR2Isb6alCWedfvFGfQiAuvp28t7ZN9JPIVq/N3uIecxTf/FHKzgX1QwaUFBAXBrSnRwTgHgnrF05y3Syt5VT3"
-    "k+Tl90SAqqzJO43e1s/ytuNw3qq5TO1KY7yN8HRVhfUWH8hQyO3rpZWvwfVVanjCCImWG/RGPnd56XgPmvAy/9O1NN981ifPL4/K"
-    "iv6j3JCATZy8SUx1QzXIGBWusG0MqDXDzVF/YTHCT8gESwvPfNu3ejvCjWHcwcBDWxvsmkoDynyK0ENh0SCEls6vJGo/Cvdyv4yA"
-    "3/gRDCHlBnHaBWVb9JRez5d6rMdyuwQje1nmIAiCZEbuzen0Vq++bqSJUSLEb95J/IaEgqzfhla6xT6AOOVmrdjCNjoCTa/izVf2"
-    "8hgjvwV+LxdbxO0/fD34U/TgrKwyIDQc3Eb4gobCLqNKK0ZbjbOruyfvs1XioFhZ3u8Ty3aQJbBC8OaveTMJ1m4+hYb+vVuZ/aQr"
-    "o/jKbySqzKVmtqca3lcYzfTxtRUZTdy8bTMSA4bG0HpqetNFINSX/GGnzcwa1eXlxc15AwM/2qBlsH8qDCy+k4qbn2Cj8UuM+l36"
-    "LgN8vtuD3+0yuTZYxVMncl+uM8yOuV+bYAI579Yr8cj+BSUlZrYnCRNUzX1DFiktyv/Fu4XVv+1W4wy3STZetGlAAWn93ZmTMWCP"
-    "iPTdHnm72wBxUgvZ/qC/ufXv99h84yeBZYdQHTvejwlJaW+11/E9C0LO+ue75SJzK3+79Tafd5Q9ma78JwRowZ1EDQJTK3HgWQK1"
-    "P3UJ4yf4ENcGXEpM1RAqV/j3FZfwUJ0dp9IkDHJin0tx8hsX5VsXx2M/TMj//g+T60sk"
+    "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"
 )
 
 BG = MAP["bg"]
-COL = {k: MAP[k] for k in ("coast", "border", "ring", "grid", "route")}
+COL = {k: MAP[k] for k in (
+    "coast", "border", "polity", "polity_fill", "habitat", "habitat_fill",
+    "ring", "grid", "route")}
 _BITS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
-_PRIO = ("route", "coast", "border", "ring", "grid")
+# First in _PRIO wins when layers share a braille cell.
+_PRIO = ("route", "kin", "freq", "habitat", "polity", "coast", "border", "ring",
+         "habitat_fill", "polity_fill", "grid")
 _cache: list | None = None
 # Framing → (cells, color) for grid+coast+border. Filters/blink reuse the same box.
 _BASE_CACHE: dict[tuple, tuple[dict, dict]] = {}
-_BASE_CACHE_MAX = 8
+_BASE_CACHE_MAX = 16
 
 
 def _polys() -> list[tuple[int, list[tuple[float, float]]]]:
@@ -178,9 +251,37 @@ def _base_frame_key(cols: int, rows: int, lon_c: float, lat_c: float,
     return (cols, rows, round(lon_c, 5), round(lat_c, 5), round(scale, 5), gstep)
 
 
+def world_base_params(cols: int, max_rows: int) -> tuple[int, float, float, float, int]:
+    """Framing for ``world=True`` scatter maps (matches ``scatter_map``).
+
+    Returns ``(rows, lon_c, lat_c, scale, gstep)`` — ``rows`` may be < max_rows.
+    """
+    cols = max(30, cols)
+    max_rows = max(12, max_rows)
+    lon0, lon1, lat0, lat1 = -180.0, 180.0, -58.0, 84.0
+    lon_c, lat_c = (lon0 + lon1) / 2, (lat0 + lat1) / 2
+    W = cols * 2
+    scale = min(W / max(1e-6, lon1 - lon0), (max_rows * 4) / max(1e-6, lat1 - lat0))
+    rows = max(12, min(max_rows, math.ceil((lat1 - lat0) * scale / 4)))
+    gstep = 10 if scale >= 1.2 else 30
+    return rows, lon_c, lat_c, scale, gstep
+
+
+def prewarm_world_base(cols: int = 80, max_rows: int = 24) -> None:
+    """Rasterize the default world coast once into ``_BASE_CACHE`` (first-paint win)."""
+    cols = max(30, int(cols))
+    max_rows = max(12, int(max_rows))
+    rows, lon_c, lat_c, scale, gstep = world_base_params(cols, max_rows)
+    key = _base_frame_key(cols, rows, lon_c, lat_c, scale, gstep)
+    if key in _BASE_CACHE:
+        return
+    cv = _Canvas(cols, rows)
+    _paint_base(cv, lon_c=lon_c, lat_c=lat_c, scale=scale, gstep=gstep)
+
+
 def _paint_base(cv: "_Canvas", *, lon_c: float, lat_c: float, scale: float,
                 gstep: int) -> None:
-    """Grid + Natural Earth coast/borders. Cached by map framing."""
+    """Grid + Natural Earth 50m coasts. Cached by map framing."""
     key = _base_frame_key(cv.cols, cv.rows, lon_c, lat_c, scale, gstep)
     hit = _BASE_CACHE.get(key)
     if hit is not None:
@@ -224,6 +325,12 @@ def _paint_base(cv: "_Canvas", *, lon_c: float, lat_c: float, scale: float,
 
 def _d(x: Any) -> dict:
     return x if isinstance(x, dict) else {}
+
+
+def _layer_fg(cv: "_Canvas", cx: int, cy: int, top: str) -> str:
+    if top in ("route", "kin", "freq", "polity", "polity_fill", "habitat", "habitat_fill"):
+        return cv.color.get((cx, cy), COL.get(top, COL["route"]))
+    return COL[top]
 
 
 class _Canvas:
@@ -637,7 +744,7 @@ def defcon_map(doc: Any, mm: Any, ancient: list, title: str,
             elif (cx, r) in cv.cells:
                 layers = cv.cells[(cx, r)]
                 top = next(l for l in _PRIO if l in layers)
-                fg = cv.color.get((cx, r), COL["route"]) if top == "route" else COL[top]
+                fg = _layer_fg(cv, cx, r, top)
                 mask = 0
                 for v in layers.values():
                     mask |= v
@@ -736,7 +843,7 @@ def _big_triangle(cv: _Canvas, cx: int, cy: int, color: str) -> None:
 
 
 def _cell_is_ocean(cv: "_Canvas", cx: int, cy: int) -> bool:
-    """True for empty/grid sea — no coast, border, or sample marks."""
+    """True for empty/grid sea — no coast / polity / habitat / sample marks."""
     if not (0 <= cx < cv.cols and 0 <= cy < cv.rows):
         return False
     if (cx, cy) in cv.over or (cx, cy) in cv.taken:
@@ -745,6 +852,212 @@ def _cell_is_ocean(cv: "_Canvas", cx: int, cy: int) -> bool:
     if not layers:
         return True
     return set(layers).issubset({"grid"})
+
+
+def _convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Andrew's monotone chain. Returns CCW ring (open; caller may close)."""
+    pts = sorted(set(points))
+    if len(pts) <= 1:
+        return list(pts)
+    if len(pts) == 2:
+        return [pts[0], pts[1], pts[0]]
+
+    def cross(o, a, b) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[tuple[float, float]] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[tuple[float, float]] = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _pad_ring(ring: list[tuple[float, float]], frac: float = 0.12
+              ) -> list[tuple[float, float]]:
+    """Expand ring from centroid so the area reads thicker than the point cloud."""
+    if len(ring) < 3:
+        return ring
+    cx = sum(p[0] for p in ring) / len(ring)
+    cy = sum(p[1] for p in ring) / len(ring)
+    out: list[tuple[float, float]] = []
+    for x, y in ring:
+        out.append((cx + (x - cx) * (1.0 + frac), cy + (y - cy) * (1.0 + frac)))
+    return out
+
+
+def culture_habitat_hulls(
+    pts: list[tuple[float, float, dict]],
+    *,
+    min_sites: int = 3,
+    limit: int = 10,
+    only_cultures: set[str] | frozenset[str] | None = None,
+) -> list[dict]:
+    """Convex-hull ranges for cultures with enough distinct sample sites.
+
+    Each dict: culture, n, ring (lon/lat), color, rank, lon, lat.
+    Skips cultures that wrap the antimeridian (lon span > 180°).
+    ``only_cultures``: build just those names (focus path — skip the full scan).
+    """
+    buckets: dict[str, list[tuple[float, float, dict]]] = {}
+    for lon, lat, p in pts:
+        cult = (p.get("culture") or "").strip()
+        if not cult:
+            continue
+        if only_cultures is not None and cult not in only_cultures:
+            continue
+        buckets.setdefault(cult, []).append((float(lon), float(lat), p))
+
+    scored: list[tuple[int, float, str, list[tuple[float, float]], str]] = []
+    for cult, rows in buckets.items():
+        uniq: dict[tuple[float, float], dict] = {}
+        best_rank = -1.0
+        best_color = COL["habitat"]
+        for lon, lat, p in rows:
+            key = (round(lon, 2), round(lat, 2))
+            uniq.setdefault(key, p)
+            rnk = float(p.get("rank") if p.get("rank") is not None else -1.0)
+            if rnk >= best_rank:
+                best_rank = rnk
+                best_color = p.get("color") or best_color
+        if len(uniq) < min_sites:
+            continue
+        coords = list(uniq.keys())
+        xs = [c[0] for c in coords]
+        if max(xs) - min(xs) > 180.0:
+            continue
+        hull = _convex_hull(coords)
+        if len(hull) < 3:
+            continue
+        scored.append((len(rows), best_rank, cult, _pad_ring(hull), str(best_color)))
+
+    scored.sort(key=lambda t: (-t[0], -t[1], t[2]))
+    out: list[dict] = []
+    for n, rank, cult, ring, color in scored[: max(1, limit)]:
+        cx = sum(p[0] for p in ring) / len(ring)
+        cy = sum(p[1] for p in ring) / len(ring)
+        out.append({
+            "culture": cult,
+            "label": cult,
+            "n": n,
+            "ring": ring,
+            "color": color,
+            "rank": rank,
+            "lon": cx,
+            "lat": cy,
+            "kind": "habitat",
+        })
+    return out
+
+
+def _paint_habitats(cv: "_Canvas", hulls: list[dict], *,
+                    lon_c: float, lat_c: float, scale: float,
+                    focus_cult: str | None = None,
+                    fill: bool = False) -> set[str]:
+    """Draw culture convex hulls (outline; fill only when focused). Return drawn."""
+    if not hulls:
+        return set()
+    px = lambda lon, lat: ((lon - lon_c) * scale + cv.W / 2,
+                           (lat_c - lat) * scale + cv.H / 2)
+    drawn: set[str] = set()
+    ordered = sorted(hulls, key=lambda h: -int(h.get("n") or 0))
+    for hull in reversed(ordered):
+        cult = (hull.get("culture") or "").strip()
+        ring = hull.get("ring") or ()
+        if not cult or len(ring) < 3:
+            continue
+        color = hull.get("color") or COL["habitat"]
+        focused = bool(focus_cult and cult == focus_cult)
+        pts = [px(float(lon), float(lat)) for lon, lat in ring]
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+        if fill or focused:
+            _fill_ring(cv, pts, "habitat_fill",
+                       color if focused else COL["habitat_fill"])
+        for a, b in zip(pts, pts[1:]):
+            cv.line(a[0], a[1], b[0], b[1], "habitat", color)
+        drawn.add(cult)
+    return drawn
+
+
+def _paint_polities(cv: "_Canvas", polities: list[dict], *,
+                    lon_c: float, lat_c: float, scale: float,
+                    focus_name: str | None = None,
+                    fill: bool = False) -> list[tuple[str, str, str | None]]:
+    """Draw Cliopatria rings (outline; fill only for focused polity). Return legend."""
+    if not polities:
+        return []
+    px = lambda lon, lat: ((lon - lon_c) * scale + cv.W / 2,
+                           (lat_c - lat) * scale + cv.H / 2)
+    legend: list[tuple[str, str, str | None]] = []
+    for pol in reversed(polities):
+        color = pol.get("color") or COL["polity"]
+        rings = pol.get("rings") or ()
+        name = (pol.get("name") or pol.get("id") or "").strip()
+        focused = bool(focus_name and name == focus_name)
+        for ring in rings:
+            if not ring or len(ring) < 3:
+                continue
+            pts = [px(float(lon), float(lat)) for lon, lat in ring]
+            if pts[0] != pts[-1]:
+                pts.append(pts[0])
+            # Default: outline only so genotype points stay readable.
+            if fill or focused:
+                _fill_ring(cv, pts, "polity_fill",
+                           color if focused else COL["polity_fill"])
+            for a, b in zip(pts, pts[1:]):
+                cv.line(a[0], a[1], b[0], b[1], "polity", color)
+    budget = max(4, min(8, cv.rows // 3))
+    for pol in polities[:budget]:
+        lab = (pol.get("label") or pol.get("name") or "¶").strip()
+        name = (pol.get("name") or lab).strip()
+        key = f"p:{name}"
+        mark = "◆" if focus_name and name == focus_name else "¶"
+        legend.append((
+            f"{mark} {lab}"[:20],
+            pol.get("color") or COL["polity"],
+            f"screen.map_focus({key!r})",
+        ))
+    return legend
+
+
+def _fill_ring(cv: "_Canvas", pts: list[tuple[float, float]],
+               layer: str, color: str) -> None:
+    """Scanline fill of a closed ring in canvas pixels (even-odd)."""
+    if len(pts) < 4:
+        return
+    ys = [p[1] for p in pts]
+    y0, y1 = int(min(ys)), int(max(ys))
+    if y1 < 0 or y0 >= cv.H:
+        return
+    y0 = max(0, y0)
+    y1 = min(cv.H - 1, y1)
+    # Braille row stride (~4 px) keeps fill light.
+    for y in range(y0, y1 + 1, 2):
+        xs: list[float] = []
+        for (x0, y_a), (x1, y_b) in zip(pts, pts[1:]):
+            if (y_a <= y < y_b) or (y_b <= y < y_a):
+                if y_b == y_a:
+                    continue
+                t = (y - y_a) / (y_b - y_a)
+                xs.append(x0 + t * (x1 - x0))
+        if len(xs) < 2:
+            continue
+        xs.sort()
+        for i in range(0, len(xs) - 1, 2):
+            xa, xb = int(xs[i]), int(xs[i + 1])
+            if xb < 0 or xa >= cv.W:
+                continue
+            xa = max(0, xa)
+            xb = min(cv.W - 1, xb)
+            # Dotted fill — every 2nd pixel on x.
+            for x in range(xa, xb + 1, 2):
+                cv.dot(x, y, layer, color)
 
 
 def _geo_ocean_score(lon: float, lat: float) -> int:
@@ -896,18 +1209,88 @@ def _focus_radii(px_xy: list[tuple[float, float]], *, scale: float,
     return ox, oy, [outer * 0.35, outer * 0.65, outer]
 
 
+def _freq_color(pct: float) -> str:
+    """Warm scale for UYSD modern frequency discs."""
+    if pct >= 60:
+        return "#E07A3A"
+    if pct >= 35:
+        return "#D4AD72"
+    if pct >= 15:
+        return "#A89070"
+    return "#71697A"
+
+
+def _paint_freq_heat(cv: "_Canvas", discs: list[dict], *,
+                     lon_c: float, lat_c: float, scale: float,
+                     focus_id: str | None = None) -> list[tuple[str, str, str | None]]:
+    """UYSD frequency discs — under genotype points."""
+    legend: list[tuple[str, str, str | None]] = []
+    px = lambda lon, lat: ((lon - lon_c) * scale + cv.W / 2, (lat_c - lat) * scale + cv.H / 2)
+    ranked = sorted(discs, key=lambda d: -float(d.get("pct") or 0))
+    for d in ranked:
+        lon, lat = d.get("lon"), d.get("lat")
+        if lon is None or lat is None:
+            continue
+        pct = float(d.get("pct") or 0)
+        color = _freq_color(pct)
+        x, y = px(float(lon), float(lat))
+        cv.dot(round(x), round(y), "freq", color)
+        if pct >= 40:
+            cv.dot(round(x) + 1, round(y), "freq", color)
+        lab = (d.get("label") or d.get("id") or "%").strip()
+        did = str(d.get("id") or "")
+        mark = "◆" if focus_id and (did == focus_id or lab == focus_id) else "%"
+        key = f"u:{lab}"
+        legend.append((f"{mark}{pct:4.0f}% {lab}"[:20], color,
+                       f"screen.map_focus({key!r})"))
+    return legend[:10]
+
+
+def _paint_kin_edges(cv: "_Canvas", edges: list[dict], *,
+                     lon_c: float, lat_c: float, scale: float) -> int:
+    """ancIBD segments as faint lines between AADR points."""
+    px = lambda lon, lat: ((lon - lon_c) * scale + cv.W / 2, (lat_c - lat) * scale + cv.H / 2)
+    n = 0
+    for e in edges:
+        try:
+            x0, y0 = px(float(e["lon1"]), float(e["lat1"]))
+            x1, y1 = px(float(e["lon2"]), float(e["lat2"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        cm = float(e.get("cm") or 0)
+        color = "#53A94B" if cm >= 50 else "#7A9E6A" if cm >= 20 else "#5A7A58"
+        cv.line(x0, y0, x1, y1, "kin", color)
+        n += 1
+    return n
+
+
 def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
                 cols: int = 96, max_rows: int = 28, selected: str | None = None,
                 selected_blink: bool = True,
                 culture_labels: bool = False,
                 anchors: list[dict] | None = None,
+                polities: list[dict] | None = None,
+                show_habitat: bool = False,
+                show_polity: bool = False,
+                freq_discs: list[dict] | None = None,
+                kin_edges: list[dict] | None = None,
+                show_freq: bool = False,
+                show_kin: bool = False,
+                show_amtdb: bool = False,
                 map_focus: str | None = None) -> None:
-    """Точки на брайлевской карте. Подписи культур/Seshat — сводка в океане.
+    """Точки на брайлевской карте. Подписи культур/Seshat/Cliopatria — в океане.
 
     culture_labels: ocean legend of cultures (count · name), not over land/points.
-    anchors: Seshat names in the same ocean summary (not labeled on the map).
+    show_habitat: draw culture convex-hull ranges (≥3 sites); outline only.
+      Focus ``c:…`` still draws that one hull when the overlay is off.
+    show_polity: draw Cliopatria outlines; focus ``p:…`` draws one when off.
+    show_freq: UYSD modern Y frequency discs.
+    show_kin: ancIBD kinship edges between visible / selected samples.
+    show_amtdb: AmtDB ancient mt anchors (via anchors kind=amtdb).
+    anchors: Seshat / AmtDB names in the same ocean summary (not labeled on the map).
+    polities: Cliopatria rings for the epoch year (used when show_polity / focus).
     selected_blink: when False, hide ◆ / triangle highlight (pulse off-phase).
-    map_focus: 'c:Culture' or 's:SeshatLabel' — DEFCON rings around that cluster.
+    map_focus: 'c:Culture' / 's:Seshat' / 'p:Polity' / 'u:Region' / 'm:AmtDB' / 'k:gid'.
     """
     cols = max(30, cols)
     pts = [(float(p["lon"]), float(p["lat"]), p) for p in points
@@ -944,11 +1327,50 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
     astep = 20 if scale >= 1.2 else 60
     _paint_base(cv, lon_c=lon_c, lat_c=lat_c, scale=scale, gstep=gstep)
 
+    focus_cult = map_focus[2:] if map_focus and map_focus.startswith("c:") else None
+    focus_sesh = map_focus[2:] if map_focus and map_focus.startswith("s:") else None
+    focus_pol = map_focus[2:] if map_focus and map_focus.startswith("p:") else None
+    focus_uysd = map_focus[2:] if map_focus and map_focus.startswith("u:") else None
+    focus_amt = map_focus[2:] if map_focus and map_focus.startswith("m:") else None
+    focus_kin = map_focus[2:] if map_focus and map_focus.startswith("k:") else None
+
+    # Habitation hulls under points (overlay on, or single focused culture).
+    hulls: list[dict] = []
+    habitat_cults: set[str] = set()
+    if culture_labels and (show_habitat or focus_cult):
+        only = None if show_habitat else (
+            frozenset({focus_cult}) if focus_cult else None)
+        hulls = culture_habitat_hulls(
+            pts, limit=max(6, min(12, rows // 2)), only_cultures=only)
+        habitat_cults = _paint_habitats(
+            cv, hulls, lon_c=lon_c, lat_c=lat_c, scale=scale,
+            focus_cult=focus_cult, fill=False)
+
+    # Cliopatria under points (overlay on, or single focused polity).
+    polity_legend: list[tuple[str, str, str | None]] = []
+    pol_list = list(polities or [])
+    if show_polity or focus_pol:
+        draw_pols = pol_list if show_polity else [
+            p for p in pol_list
+            if (p.get("name") or p.get("id") or "").strip() == focus_pol
+        ]
+        polity_legend = _paint_polities(
+            cv, draw_pols, lon_c=lon_c, lat_c=lat_c, scale=scale,
+            focus_name=focus_pol, fill=False)
+
+    freq_legend: list[tuple[str, str, str | None]] = []
+    n_kin = 0
+    if show_freq and freq_discs:
+        freq_legend = _paint_freq_heat(
+            cv, freq_discs, lon_c=lon_c, lat_c=lat_c, scale=scale,
+            focus_id=focus_uysd)
+    if show_kin and kin_edges:
+        n_kin = _paint_kin_edges(
+            cv, kin_edges, lon_c=lon_c, lat_c=lat_c, scale=scale)
+
     selected_cell = None
     # culture → (count, best_rank, color)
     cult_sum: dict[str, tuple[int, float, str]] = {}
-    focus_cult = map_focus[2:] if map_focus and map_focus.startswith("c:") else None
-    focus_sesh = map_focus[2:] if map_focus and map_focus.startswith("s:") else None
     focus_xy: list[tuple[float, float]] = []
     focus_rank = -1.0
     focus_color = COL["ring"]
@@ -972,6 +1394,44 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
             focus_xy.append(px(lon, lat))
             focus_rank = float(a.get("rank") if a.get("rank") is not None else 50.0)
             focus_color = a.get("color") or "#AEA5B8"
+    elif focus_pol:
+        for pol in (polities or []):
+            name = (pol.get("name") or pol.get("id") or "").strip()
+            if name != focus_pol:
+                continue
+            lon, lat = pol.get("lon"), pol.get("lat")
+            if lon is None or lat is None:
+                continue
+            focus_xy.append(px(float(lon), float(lat)))
+            focus_rank = float(pol.get("rank") if pol.get("rank") is not None else 70.0)
+            focus_color = pol.get("color") or COL["polity"]
+    elif focus_uysd:
+        for d in (freq_discs or []):
+            lab = (d.get("label") or d.get("id") or "").strip()
+            if lab != focus_uysd and str(d.get("id") or "") != focus_uysd:
+                continue
+            lon, lat = d.get("lon"), d.get("lat")
+            if lon is None or lat is None:
+                continue
+            focus_xy.append(px(float(lon), float(lat)))
+            focus_rank = float(d.get("pct") or 40.0)
+            focus_color = _freq_color(float(d.get("pct") or 0))
+    elif focus_amt:
+        for lon, lat, a in anchor_pts:
+            lab = (a.get("label") or a.get("id") or "").strip()
+            aid = str(a.get("id") or "").strip()
+            if lab != focus_amt and aid != focus_amt and not lab.startswith(focus_amt):
+                continue
+            focus_xy.append(px(lon, lat))
+            focus_rank = 55.0
+            focus_color = a.get("color") or "#B04A4A"
+    elif focus_kin:
+        for lon, lat, p in pts:
+            if str(p.get("id") or "") != focus_kin:
+                continue
+            focus_xy.append(px(lon, lat))
+            focus_rank = 60.0
+            focus_color = "#53A94B"
     focus_hub: tuple[float, float] | None = None
     if focus_xy:
         ox, oy, radii = _focus_radii(focus_xy, scale=scale, rank=focus_rank)
@@ -1025,32 +1485,68 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
             sel_cult = (selected_cell[2].get("culture")
                         or selected_cell[2].get("label") or "")
         budget = max(6, min(12, rows - 3))
+        if show_habitat and habitat_cults:
+            legend.append(("⌂ ranges", "#8A8294", None))
         for cult, (n, _rank, color) in ranked[:budget]:
-            mark = "◆" if cult and cult == sel_cult else "·"
+            if cult and cult == sel_cult:
+                mark = "◆"
+            elif show_habitat and cult in habitat_cults:
+                mark = "⌂"
+            else:
+                mark = "·"
             key = f"c:{cult}"
             legend.append((
                 f"{mark}{n:>3} {cult}"[:20],
                 f"bold {color}",
                 f"screen.map_focus({key!r})",
             ))
-    if culture_labels and anchor_pts:
+    if culture_labels and show_polity and polity_legend:
         if legend:
-            legend.append(("§ Seshat", "#8A8294", None))
-        seshat_budget = max(2, min(5, rows // 4))
-        ranked_a = sorted(
-            anchor_pts,
-            key=lambda t: -float(t[2].get("rank") if t[2].get("rank") is not None else 0),
-        )
-        for _lon, _lat, a in ranked_a[:seshat_budget]:
-            lab = (a.get("label") or a.get("id") or "§").strip()
-            key = f"s:{lab}"
-            mark = "◆" if focus_sesh and (lab == focus_sesh
-                                          or str(a.get("id") or "") == focus_sesh) else "§"
-            legend.append((
-                f"{mark} {lab}"[:20],
-                a.get("color") or "#AEA5B8",
-                f"screen.map_focus({key!r})",
-            ))
+            legend.append(("¶ Cliopatria", "#8A8294", None))
+        legend.extend(polity_legend)
+    if culture_labels and anchor_pts:
+        seshat_a = [t for t in anchor_pts if t[2].get("kind") != "amtdb"]
+        amtdb_a = [t for t in anchor_pts if t[2].get("kind") == "amtdb"]
+        if seshat_a:
+            if legend:
+                legend.append(("§ Seshat", "#8A8294", None))
+            seshat_budget = max(2, min(5, rows // 4))
+            ranked_a = sorted(
+                seshat_a,
+                key=lambda t: -float(t[2].get("rank") if t[2].get("rank") is not None else 0),
+            )
+            for _lon, _lat, a in ranked_a[:seshat_budget]:
+                lab = (a.get("label") or a.get("id") or "§").strip()
+                key = f"s:{lab}"
+                mark = "◆" if focus_sesh and (lab == focus_sesh
+                                              or str(a.get("id") or "") == focus_sesh) else "§"
+                legend.append((
+                    f"{mark} {lab}"[:20],
+                    a.get("color") or "#AEA5B8",
+                    f"screen.map_focus({key!r})",
+                ))
+        if (show_amtdb or focus_amt) and amtdb_a:
+            if legend:
+                legend.append(("m AmtDB", "#8A8294", None))
+            for _lon, _lat, a in amtdb_a[:6]:
+                lab = (a.get("label") or a.get("id") or "m").strip()
+                aid = str(a.get("id") or lab)
+                key = f"m:{aid}"
+                mark = "◆" if focus_amt and (aid == focus_amt or lab.startswith(focus_amt)) else "m"
+                legend.append((
+                    f"{mark} {lab}"[:20],
+                    a.get("color") or "#B04A4A",
+                    f"screen.map_focus({key!r})",
+                ))
+                # Mark AmtDB sites on the map itself.
+                cx, cy = cell(_lon, _lat)
+                cv.mark(cx, cy, "◦", a.get("color") or "#B04A4A")
+    if show_freq and freq_legend:
+        if legend:
+            legend.append(("% UYSD", "#8A8294", None))
+        legend.extend(freq_legend)
+    if show_kin and n_kin:
+        legend.append((f"≈ {n_kin} IBD edges", "#53A94B", None))
     if legend:
         _ocean_legend(cv, legend, lon_c=lon_c, lat_c=lat_c, scale=scale)
 
@@ -1068,11 +1564,42 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
         doc.t.append("\n")
 
     head = f" {title} "
-    if map_focus:
-        tag = map_focus[2:] if map_focus[:2] in ("c:", "s:") else map_focus
-        tail = f" ◉ {tag} · {len(pts)} pts "
+    # Right-side mode chip: what O is showing (default = sites only).
+    if show_freq:
+        mode = f"O: % UYSD freq"
+        if freq_discs:
+            mode += f" ({len(freq_discs)})"
+    elif show_kin:
+        mode = f"O: ≈ ancIBD kin"
+        if n_kin:
+            mode += f" ({n_kin})"
+    elif show_amtdb:
+        mode = "O: m AmtDB mt"
+    elif show_habitat and show_polity:
+        mode = f"O: ⌂ habitat + ¶ empires"
+        if hulls or pol_list:
+            mode += f" ({len(hulls)}/{len(pol_list)})"
+    elif show_habitat:
+        mode = f"O: ⌂ habitat ranges"
+        if hulls:
+            mode += f" ({len(hulls)})"
+    elif show_polity:
+        mode = f"O: ¶ Cliopatria empires"
+        if pol_list:
+            mode += f" ({len(pol_list)})"
     else:
-        tail = f" {len(pts)} pts "
+        mode = "O: sites only"
+        if focus_cult and hulls:
+            mode += " · ⌂ focus"
+        elif focus_pol:
+            mode += " · ¶ focus"
+    bits = [f"{len(pts)} pts", mode]
+    meta = " · ".join(bits)
+    if map_focus:
+        tag = map_focus[2:] if map_focus[:2] in ("c:", "s:", "p:") else map_focus
+        tail = f" ◉ {tag} · {meta} "
+    else:
+        tail = f" {meta} "
     pad_line([(head, "bold #5882C7"),
               (" " * max(1, total_w - len(head) - len(tail)), "#FBF6F0"),
               (tail, "#5A7CB3")])
@@ -1093,7 +1620,7 @@ def scatter_map(doc: Any, points: list[dict], title: str, *, world: bool = True,
             elif (cx, r) in cv.cells:
                 layers = cv.cells[(cx, r)]
                 top = next(l for l in _PRIO if l in layers)
-                fg = cv.color.get((cx, r), COL["route"]) if top == "route" else COL[top]
+                fg = _layer_fg(cv, cx, r, top)
                 mask = 0
                 for v in layers.values():
                     mask |= v
