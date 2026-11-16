@@ -54,6 +54,8 @@ WARN = _fill(40.0, s=0.08, v=0.05)
 WARN_BOLD = f"bold {WARN}"
 BAD = _fill(120.0, s=0.05, v=0.03)                        # triad / error
 BAD_BOLD = f"bold {BAD}"
+RED = _fill(35.0, s=0.10, v=0.08)                         # harmony crimson (active jobs badge)
+RED_BOLD = f"bold {RED}"
 ALERT = _fill(DIATONIC_HUE_STEP * 6.0, s=0.08, v=0.04)     # фиолетовый акцент / mismatch
 
 # ── шкала приглушения (вместо grey85…grey23) ──────────────────────────

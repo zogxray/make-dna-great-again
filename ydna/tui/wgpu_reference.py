@@ -225,14 +225,12 @@ class ReferenceScreen(Screen):
 
     # ── compose ──────────────────────────────────────────────────────
     def compose(self):
-        yield ModeBar(
-            "reference",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "reference", self._labels)
 
         for cid in ("source", "epochs", "regions"):
-            bar = RichText(id=cid)
+            bar = RichText(id=cid, can_focus=False)
             bar.layout_hint_h = 22
             bar.on_action = self._run_action
             yield bar
@@ -240,10 +238,10 @@ class ReferenceScreen(Screen):
         groups = OptionList(id="groups", on_highlight=self._on_highlight, row_lines=2)
         self._groups_box = Panel(groups, title="GROUPS", id="groups-box")
 
-        card_tabs = RichText(id="card-tabs")
+        card_tabs = RichText(id="card-tabs", can_focus=False)
         card_tabs.layout_hint_h = 22
         card_tabs.on_action = self._run_action
-        card_body = RichText(id="card")
+        card_body = RichText(id="card", can_focus=False)
         card_body.on_action = self._run_action
         card_scroll = VerticalScroll(card_body, id="card-scroll")
         card_inner = Vertical(card_tabs, card_scroll, id="card-inner")
@@ -251,22 +249,24 @@ class ReferenceScreen(Screen):
 
         left = Vertical(self._groups_box, self._card_box, id="left-col")
 
-        view_tabs = RichText(id="view-tabs")
+        view_tabs = RichText(id="view-tabs", can_focus=False)
         view_tabs.layout_hint_h = 22
         view_tabs.on_action = self._run_action
-        map_body = RichText(id="map")
+        map_body = RichText(id="map", can_focus=False)
         map_body.on_action = self._run_action
         map_body.fill_bg = False
         map_body.FONT_SIZE = _MAP_FONT
         map_body.LINE_H = _CELL_H
         map_scroll = VerticalScroll(map_body, id="map-scroll")
-        score = RichText(id="score-filter")
+        score = RichText(id="score-filter", can_focus=False)
         score.layout_hint_h = 110
         score.on_action = self._run_action
         map_inner = Vertical(view_tabs, map_scroll, score, id="map-inner")
         self._map_box = Panel(map_inner, title="MAP", id="map-box")
 
         yield Horizontal(left, self._map_box, id="main")
+        from .app_api import focus_next
+
         yield KeyBar([
             ("←→", "Epoch", lambda: self.action_epoch_step(1)),
             ("Space", "Play", lambda: self.action_toggle_play()),
@@ -283,7 +283,7 @@ class ReferenceScreen(Screen):
             ("T", "Card tab", lambda: self.action_cycle_card_tab()),
             ("X", "Clear filter", lambda: self.action_score_clear()),
             ("C", "Cancel", lambda: self.action_cancel()),
-            ("Tab", "Panel", lambda: self.app._cycle_focus() if self.app else None),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("F1–F10", "Modes", None),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ])

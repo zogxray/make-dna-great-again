@@ -52,15 +52,134 @@ def test_wgpu_help_markdown_viewer_and_jobs_widgets(tmp_path, monkeypatch):
             assert dg.value == "0"
             assert sp is not None and rl is not None
 
-            # Switch to Help (F3 in this 3-mode harness) -> MarkdownViewer + TOC toggle
+            # Switch to Help (F3 in this 3-mode harness) -> MarkdownViewer + expanded TOC tree
             await pilot.press("f3")
             await pilot.pause()
             mv = pilot.query_one("#help-viewer", MarkdownViewer)
             assert mv.show_table_of_contents is True
-            assert len(mv.table_of_contents.root.children) >= 1
+            assert len(mv.table_of_contents.root.children) == 1
+            h1 = mv.table_of_contents.root.children[0]
+            assert h1.is_expanded is True
+            titles = [c.label for c in h1.children]
+            assert "F1 · Genome" in titles and "F2 · Data" in titles and "F10 · Help" in titles
+            # F2 · Data contains nested bold subtitles
+            f2_node = next(c for c in h1.children if c.label == "F2 · Data")
+            assert f2_node.is_expanded is True
+            assert any("GWAS Catalog" in sub.label for sub in f2_node.children)
+            # Anchor jumps land on the exact heading line (0px drift)
+            from textual_wgpu.fonts import cell_height
+
+            sc = mv._scroll
+            ch = cell_height(mv.document.FONT_SIZE)
+            strips = mv.document.render_lines()
+            for slug, expected in (("f1-genome", "F1 · Genome"), ("gwas-catalog", "GWAS Catalog"), ("f5-gwas", "F5 · GWAS")):
+                assert mv.goto_anchor(slug) is True
+                landed = int(round(sc.scroll_py)) // ch
+                assert expected.lower() == strips[landed].plain().strip().lower()
+            # Smooth pixel scroll via wheel & 1-line up/down
+            sc.scroll_to(y=0)
+            app.on_wheel(sc.rect.x + 20, sc.rect.y + 20, 0, 12.0)
+            assert 0 < sc.scroll_py < sc._row_h
             await pilot.press("t")
             assert mv.show_table_of_contents is False
             await pilot.press("t")
             assert mv.show_table_of_contents is True
+
+            # F8 Jobs(X) badge + harmony crimson color when active jobs exist
+            from textual_wgpu.widgets import ModeBar
+            from ydna.core.jobs import JOBS, Job
+            from ydna.theme.styles import RED
+            from ydna.tui.app_api import _hex_rgba
+
+            mb = pilot.query_one(ModeBar)
+            assert "F8 Jobs " in mb.render_lines()[0].plain()
+            JOBS.items["_test_active"] = Job("_test_active", "Test job", status="running")
+            try:
+                strips_mb = mb.render_lines()
+                plain_mb = strips_mb[0].plain()
+                assert "F8 Jobs(1)" in plain_mb
+                red_rgba = _hex_rgba(RED)
+                assert any(
+                    "Jobs(1)" in seg.text and seg.style == red_rgba
+                    for seg in strips_mb[0].segments
+                )
+            finally:
+                JOBS.items.pop("_test_active", None)
+
+
+def test_wgpu_chat_has_scrollbar_and_scrolls_to_bottom_on_enter(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    from textual_wgpu.widgets import Scrollbar, VerticalScroll
+    from ydna.core import chat
+    from ydna.tui.wgpu_chat import ChatScreen
+
+    t = chat.new_thread()
+    t.title = "Long thread"
+    for i in range(25):
+        t.messages.append(chat.Message("user" if i % 2 == 0 else "model", f"Message line {i}\n" * 2))
+    chat.save(t)
+
+    async def _run():
+        app = ModeApp(
+            [
+                ("help", "Help", HelpScreen),
+                ("chat", "Chat", ChatScreen),
+            ],
+            theme=_theme(),
+            start="chat",
+        )
+        async with app.run_test(size=(1000, 600)) as pilot:
+            await pilot.pause()
+            app.screen.reload(keep=t.id)
+            await pilot.pause()
+            sc = pilot.query_one("#thread-scroll", VerticalScroll)
+            assert isinstance(sc._scrollbar, Scrollbar)
+            assert sc._max_scroll() > 0
+            assert sc.scroll_y == sc._max_scroll()
+            # Re-entering Chat from Help also scrolls to bottom
+            sc.scroll_home()
+            assert sc.scroll_y == 0
+            await pilot.press("f1")
+            await pilot.pause()
+            await pilot.press("f2")
+            await pilot.pause()
+            assert sc.scroll_y == sc._max_scroll()
+
+            # F7 Chat has titled CHATS / CHAT · ... / MESSAGE / NOTES panels & clean Tab / Shift+Tab
+            from textual_wgpu.widgets import Panel
+
+            panels = {p.id: p for p in app.screen.walk_descendants() if isinstance(p, Panel)}
+            assert panels["chats-box"].title == "CHATS"
+            assert panels["thread-box"].title.startswith("CHAT")
+            assert panels["prompt-box"].title == "MESSAGE"
+            assert panels["notes-box"].title == "NOTES"
+            assert panels["thread-box"].rect.h > 200
+            assert sc.rect.h > 150
+            assert panels["prompt-box"].rect.h == 132
+            assert panels["chats-box"].rect.h > 200
+            assert panels["notes-box"].rect.h > 200
+
+            stops = [getattr(w, "id", None) for w in app._focusables()]
+            assert stops == ["chats", "thread-scroll", "prompt", "notes"]
+            # Cycle forward with Tab and backward with Shift+Tab
+            app.set_focus(pilot.query_one("#chats"))
+            await pilot.press("tab")
+            assert getattr(app._focus, "id", None) == "thread-scroll"
+            await pilot.press("tab")
+            assert getattr(app._focus, "id", None) == "prompt"
+            await pilot.press("shift+tab")
+            assert getattr(app._focus, "id", None) == "thread-scroll"
+
+            # F10 Help Tab switches focus cleanly between md-toc (CONTENTS) and md-scroll (HELP)
+            await pilot.press("f1")
+            await pilot.pause()
+            help_stops = [getattr(w, "id", None) for w in app._focusables()]
+            assert help_stops == ["md-toc", "md-scroll"]
+            await pilot.press("tab")
+            assert getattr(app._focus, "id", None) == "md-toc"
+            await pilot.press("tab")
+            assert getattr(app._focus, "id", None) == "md-scroll"
 
     asyncio.run(_run())

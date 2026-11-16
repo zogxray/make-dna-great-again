@@ -206,6 +206,11 @@ class ChatWorkspace(Workspace):
                 and self.current is not None):
             box = self.query_one("#thread-box")
             box.border_subtitle = self._thread_subtitle()
+            if not self.select_mode:
+                try:
+                    self.query_one("#thread-scroll").scroll_end(animate=False)
+                except Exception:  # noqa: BLE001
+                    pass
             self.update_status()
             self._focus_prompt()
             return

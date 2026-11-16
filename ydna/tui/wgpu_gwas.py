@@ -118,17 +118,15 @@ class GwasScreen(Screen):
 
     # ── compose ──────────────────────────────────────────────────────
     def compose(self):
-        yield ModeBar(
-            "gwas",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
 
-        stats = RichText(id="stats")
+        yield make_mode_bar(self, "gwas", self._labels)
+
+        stats = RichText(id="stats", can_focus=False)
         stats_box = Panel(stats, title="MATCH", id="stats-box")
         stats_box.layout_hint_h = 90
 
-        trait_tabs = RichText(id="trait-tabs")
+        trait_tabs = RichText(id="trait-tabs", can_focus=False)
         trait_tabs.layout_hint_h = 28
         trait_tabs.on_action = self._run_action
         search = Input(
@@ -147,7 +145,7 @@ class GwasScreen(Screen):
         traits_inner = Vertical(trait_tabs, search, traits, id="traits-inner")
         self._traits_box = Panel(traits_inner, title="TRAITS", id="traits-box")
 
-        legend = RichText(id="assoc-legend")
+        legend = RichText(id="assoc-legend", can_focus=False)
         legend.layout_hint_h = 28
         assocs = OptionList(
             id="assocs",
@@ -158,7 +156,7 @@ class GwasScreen(Screen):
         assoc_inner = Vertical(legend, assocs, id="assoc-inner")
         self._assoc_box = Panel(assoc_inner, title="ASSOCIATIONS", id="assoc-box")
 
-        det_tabs = RichText(id="det-tabs")
+        det_tabs = RichText(id="det-tabs", can_focus=False)
         det_tabs.layout_hint_h = 28
         det_tabs.on_action = self._run_action
         detail = RichText(id="detail")

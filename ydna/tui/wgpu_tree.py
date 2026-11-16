@@ -98,6 +98,7 @@ from ..workspaces.tree.workspace import (
     SECTION_LABELS,
     _no_branch_reason,
 )
+from .app_api import focus_next
 from .wgpu_jobs import _text_lines
 
 TREE_W = 72
@@ -609,12 +610,10 @@ class TreeScreen(Screen):
 
     # ── compose ──────────────────────────────────────────────────────
     def compose(self):
-        yield ModeBar(
-            "tree",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
-        stats = RichText(id="stats")
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "tree", self._labels)
+        stats = RichText(id="stats", can_focus=False)
         stats.layout_hint_h = 28
         search = TextArea(
             "",
@@ -627,10 +626,10 @@ class TreeScreen(Screen):
         top = Horizontal(stats, search, id="top")
         top.layout_hint_h = 28
 
-        crumbs = RichText(id="crumbs")
+        crumbs = RichText(id="crumbs", can_focus=False)
         crumbs.layout_hint_h = 22
         crumbs.on_action = self._run_action
-        colhead = RichText(id="colhead")
+        colhead = RichText(id="colhead", can_focus=False)
         colhead.layout_hint_h = 20
         tree = OptionList(
             id="tree",
@@ -639,12 +638,12 @@ class TreeScreen(Screen):
             on_row_click=self._tree_row_click,
             row_lines=1,
         )
-        legend = RichText(id="legend")
+        legend = RichText(id="legend", can_focus=False)
         legend.layout_hint_h = 36
         tree_inner = Vertical(crumbs, colhead, tree, legend, id="tree-inner")
         self._tree_box = Panel(tree_inner, title="PHYLOGENETIC TREE", id="tree-box")
 
-        tabs = RichText(id="tabs")
+        tabs = RichText(id="tabs", can_focus=False)
         tabs.layout_hint_h = 44
         tabs.hit_builder = self._tab_hits
         inspector = RichText(id="inspector")
@@ -1497,7 +1496,7 @@ class TreeScreen(Screen):
             if n_miss and not (self_miss and n_miss == 1):
                 items.append(("⇧D", "Fetch branch", lambda: self.fetch_branch()))
         items += [
-            ("Tab", "Panel", lambda: self.toggle_panel()),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("Esc", "Back", lambda: self.back()),
             ("I", "Issues", lambda: self.issues()),
             ("?", "Help", lambda: self.help()),
@@ -2172,18 +2171,10 @@ class TreeScreen(Screen):
         return False
 
     def toggle_panel(self) -> bool:
-        """Tab: tree ↔ inspector (Textual action_toggle_panel)."""
+        """Tab: cycle search ↔ tree ↔ inspector via ModeApp focus chain."""
         if not self.ready or self.app is None:
             return False
-        try:
-            tree = self.query_one("#tree", OptionList)
-            insp = self.query_one("#inspector", RichText)
-        except KeyError:
-            return False
-        if self.app._focus is tree:
-            self.app.set_focus(insp)
-        else:
-            self.app.set_focus(tree)
+        self.app.focus_next()
         return True
 
     def _search_submit(self) -> None:

@@ -24,8 +24,6 @@ class HelpScreen(Screen):
     """
 
     DEFAULT_CSS = """
-    #help-box { height: 1fr; border: round $primary; }
-    #help-box:focus-within { border: round $accent; }
     #help-viewer { height: 1fr; }
     #status { height: 1; padding: 0 1; background: $boost; }
     """
@@ -48,13 +46,17 @@ class HelpScreen(Screen):
         self._help_w = 0
 
     def compose(self):
-        yield ModeBar(
-            "help",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
+        from .app_api import focus_next, make_mode_bar
+
+        yield make_mode_bar(self, "help", self._labels)
+        viewer = MarkdownViewer(
+            HELP_MD,
+            show_table_of_contents=True,
+            toc_title="CONTENTS",
+            doc_title="HELP · flow & screens",
+            id="help-viewer",
         )
-        viewer = MarkdownViewer(HELP_MD, show_table_of_contents=True, id="help-viewer")
-        yield Panel(viewer, title="HELP · flow & screens", id="help-box")
+        yield viewer
         yield KeyBar([
             ("↑↓", "Scroll", None),
             ("PgUp/Dn", "Page", None),
@@ -63,6 +65,7 @@ class HelpScreen(Screen):
             ("drag", "Select", None),
             ("Ctrl+C", "Copy", None),
             ("Ctrl+A", "All", lambda: self.select_all()),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("F1–F10", "Modes", None),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ])
@@ -161,12 +164,12 @@ class HelpScreen(Screen):
     def scroll_up(self) -> None:
         sc = self._scroll()
         if sc is not None:
-            sc.scroll(-3)
+            sc.scroll_pixels(-sc._row_h)
 
     def scroll_down(self) -> None:
         sc = self._scroll()
         if sc is not None:
-            sc.scroll(3)
+            sc.scroll_pixels(sc._row_h)
 
     def scroll_page_up(self) -> None:
         sc = self._scroll()

@@ -21,6 +21,7 @@ from textual_wgpu.widgets import (
     StatusBar,
     TextArea,
     Vertical,
+    VerticalScroll,
 )
 
 from ..core import chat
@@ -59,9 +60,10 @@ class ChatScreen(Screen):
     DEFAULT_CSS = """
     #main { height: 1fr; }
     #chats-box { width: 28; border: round $primary; }
-    #thread-box { width: 1fr; border: round $primary; }
+    #thread-box { width: 1fr; height: 1fr; border: round $primary; }
+    #prompt-box { border: round $primary; }
     #notes-box { width: 42; border: round $primary; }
-    #chats-box:focus-within, #thread-box:focus-within, #notes-box:focus-within { border: round $accent; }
+    #chats-box:focus-within, #thread-box:focus-within, #prompt-box:focus-within, #notes-box:focus-within { border: round $accent; }
     #chats { height: 1fr; border: none; background: transparent; }
     #status { height: 1; padding: 0 1; background: $boost; }
     """
@@ -97,16 +99,15 @@ class ChatScreen(Screen):
         self._models_pick_open = False
 
     def compose(self):
-        yield ModeBar(
-            "chat",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "chat", self._labels)
         chats = OptionList(id="chats", on_highlight=self._on_chat_hi, row_lines=3)
         chats_box = Panel(chats, title="CHATS", id="chats-box")
 
-        thread_md = RichText(id="thread-md")
+        thread_md = RichText(id="thread-md", can_focus=False)
         thread_md.on_action = self._run_action
+        thread_scroll = VerticalScroll(thread_md, id="thread-scroll")
         thread_sel = TextArea(
             "",
             id="thread-sel",
@@ -116,7 +117,7 @@ class ChatScreen(Screen):
         )
         thread_sel.layout_hint_h = 0
         thread_sel.disabled = True
-        thread_switch = Vertical(thread_md, thread_sel, id="thread-switch")
+        thread_switch = Vertical(thread_scroll, thread_sel, id="thread-switch")
         thread_panel = Panel(thread_switch, title="CHAT", id="thread-box")
         actions = KeyBar([
             ("Ctrl+S / Ctrl+Enter", "Send", lambda: self.send_prompt()),
@@ -130,8 +131,9 @@ class ChatScreen(Screen):
             placeholder="message · Enter = new line · Ctrl+S / Ctrl+Enter = send",
             clip_strict=True,
         )
-        prompt.layout_hint_h = 110
-        mid = Vertical(thread_panel, actions, prompt, id="thread-col")
+        prompt_box = Panel(prompt, title="MESSAGE", id="prompt-box")
+        prompt_box.layout_hint_h = 132
+        mid = Vertical(thread_panel, actions, prompt_box, id="thread-col")
 
         notes = TextArea(
             "",
@@ -142,6 +144,8 @@ class ChatScreen(Screen):
         notes_box = Panel(notes, title="NOTES", id="notes-box")
 
         yield Horizontal(chats_box, mid, notes_box, id="main")
+        from .app_api import focus_next
+
         yield KeyBar([
             ("A", "New", lambda: self.new_chat()),
             ("U", "Channel", lambda: self.pick_provider()),
@@ -152,7 +156,7 @@ class ChatScreen(Screen):
             ("Ctrl+C", "Copy", None),
             ("Del", "Delete", lambda: self.delete_chat()),
             ("C", "Cancel", lambda: self.cancel()),
-            ("Tab", "Focus", None),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("Ctrl+S/↵", "Send", lambda: self.send_prompt()),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ])
@@ -169,6 +173,7 @@ class ChatScreen(Screen):
             pass
         self.reload()
         self._focus_prompt()
+        self.call_after_refresh(self._scroll_thread_end)
         if self.app is not None and hasattr(self.app, "set_interval"):
             self._tick_handle = self.app.set_interval(0.2, self._tick)
 
@@ -183,6 +188,8 @@ class ChatScreen(Screen):
         except Exception:  # noqa: BLE001
             self._show()
             self.update_status()
+        self._scroll_thread_end()
+        self.call_after_refresh(self._scroll_thread_end)
 
     def _notify(self, msg: str) -> None:
         if self.app is not None and hasattr(self.app, "notify"):
@@ -287,18 +294,29 @@ class ChatScreen(Screen):
         return " · ".join(bits)
 
     def _set_select_layout(self) -> None:
-        md = self.query_one("#thread-md", RichText)
+        sc = self.query_one("#thread-scroll", VerticalScroll)
         sel = self.query_one("#thread-sel", TextArea)
         if self.select_mode:
-            md.layout_hint_h = 0
+            sc.layout_hint_h = 0
             sel.layout_hint_h = None
             sel.disabled = False
             sel.read_only = True
         else:
-            md.layout_hint_h = None
+            sc.layout_hint_h = None
             sel.layout_hint_h = 0
             sel.disabled = True
             sel.read_only = True
+
+    def _scroll_thread_end(self) -> None:
+        if self.select_mode:
+            return
+        try:
+            sc = self.query_one("#thread-scroll", VerticalScroll)
+        except KeyError:
+            return
+        sc.scroll_end()
+        if self.app is not None:
+            self.app.request_draw()
 
     def _active_chat_job(self):
         for key in (JOB_INV, JOB_STORY, JOB):
@@ -320,20 +338,23 @@ class ChatScreen(Screen):
                 area.load_text(plain)
         else:
             body = self.query_one("#thread-md", RichText)
+            sc = self.query_one("#thread-scroll", VerticalScroll)
             body.on_action = self._run_action
-            width = max(40, (body.rect.w - 12) // 8) if body.rect.w else 72
+            avail_w = body.rect.w or (sc.rect.w - sc.BAR_W - 4)
+            width = max(40, (avail_w - 12) // 8) if avail_w > 24 else 72
             try:
                 rich = _renderable_text(
                     thread_view(t, waiting, draft, width=width), width=width,
                 )
-                body.update(rich)
+                body.update(rich, home=False)
             except Exception:  # noqa: BLE001
-                body.update(thread_text(t, waiting, draft))
+                body.update(thread_text(t, waiting, draft), home=False)
+            self._scroll_thread_end()
         notes = self.query_one("#notes", TextArea)
         if t and notes.text != t.notes:
             notes.load_text(t.notes)
         box = self.query_one("#thread-box", Panel)
-        box.title = fit(t.title, 40) if t else "CHAT"
+        box.title = f"CHAT · {fit(t.title, 34)}" if (t and t.title) else "CHAT"
         box.subtitle = self._thread_subtitle()
         self._sync_prompt_lock()
         self.update_status()

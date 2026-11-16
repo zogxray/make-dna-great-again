@@ -17,7 +17,7 @@ from textual.screen import ModalScreen, Screen
 from textual.selection import Selection
 from textual.widgets import Button, ProgressBar, Static, TextArea
 
-from ..theme.styles import HI, HI_REV, MUTED
+from ..theme.styles import HI, HI_REV, MUTED, RED
 
 # Порядок = клавиши F1, F2, ...
 MODE_LABELS = [("genome", "Genome"), ("data", "Data"), ("tree", "Tree"),
@@ -59,16 +59,41 @@ def click(action: str, style: str = "") -> Style:
     return Style.parse(style) + meta if style else meta
 
 
+def _active_jobs_count() -> int:
+    from ..core.jobs import JOBS
+
+    return sum(1 for j in JOBS.items.values() if j.active or j.status == "queued")
+
+
 class ModeBar(Static):
     DEFAULT_CSS = "ModeBar { height: 1; padding: 0 1; background: $boost; }"
 
     def __init__(self, active: str) -> None:
+        self._active_mode = active
+        self._last_jobs = _active_jobs_count()
+        super().__init__(self._build_text(active, self._last_jobs))
+
+    @staticmethod
+    def _build_text(active: str, jobs_n: int) -> Text:
         t = Text(no_wrap=True)
         for i, (key, title) in enumerate(MODE_LABELS):
-            style = HI_REV if key == active else MUTED
-            t.append(f" F{i + 1} {title} ", style=click(f"app.mode('{key}')", style))
+            label_title = f"{title}({jobs_n})" if (key == "jobs" and jobs_n > 0) else title
+            if key == "jobs" and jobs_n > 0:
+                style = f"bold reverse {RED}" if key == active else f"bold {RED}"
+            else:
+                style = HI_REV if key == active else MUTED
+            t.append(f" F{i + 1} {label_title} ", style=click(f"app.mode('{key}')", style))
             t.append(" ")
-        super().__init__(t)
+        return t
+
+    def on_mount(self) -> None:
+        self.set_interval(0.5, self._sync_jobs)
+
+    def _sync_jobs(self) -> None:
+        n = _active_jobs_count()
+        if n != self._last_jobs:
+            self._last_jobs = n
+            self.update(self._build_text(self._active_mode, n))
 
 
 class KeyBar(Static):

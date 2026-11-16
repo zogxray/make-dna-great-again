@@ -96,11 +96,9 @@ class SamplesScreen(Screen):
         self._labels = list(MODE_LABELS)
 
     def compose(self):
-        yield ModeBar(
-            "samples",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "samples", self._labels)
         title = Static(
             "Open Humans · D downloads this row · ● READY / ○ NEED labeled, both OK",
             id="oh-title",
@@ -108,7 +106,7 @@ class SamplesScreen(Screen):
         title.layout_hint_h = 24
         yield title
 
-        filters = RichText(id="oh-filters")
+        filters = RichText(id="oh-filters", can_focus=False)
         filters.layout_hint_h = 40
         ol = OptionList(id="oh-files", on_highlight=self._on_highlight)
         list_body = Vertical(filters, ol, id="oh-list-inner")
@@ -119,6 +117,7 @@ class SamplesScreen(Screen):
         file_panel = Panel(detail, title="FILE", id="oh-file-box")
 
         yield Horizontal(list_panel, file_panel, id="oh-main")
+        from .app_api import focus_next
 
         yield KeyBar([
             ("↑↓", "Row", None),
@@ -133,6 +132,7 @@ class SamplesScreen(Screen):
             ("F/W/H/K/Y", "Filters", None),
             ("X", "Noise", lambda: self.toggle_noise()),
             ("/", "Query", lambda: self.query()),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ])
         yield StatusBar(id="oh-status")

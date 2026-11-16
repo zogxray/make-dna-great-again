@@ -96,11 +96,9 @@ class GenomeScreen(Screen):
         self._labels = list(MODE_LABELS)
 
     def compose(self):
-        yield ModeBar(
-            "genome",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "genome", self._labels)
         files = OptionList(
             id="files",
             row_lines=4,
@@ -116,7 +114,7 @@ class GenomeScreen(Screen):
             on_submit=self._filter_submit,
         )
         filt.layout_hint_rows = 3
-        head = RichText(WgpuChromView.header(), id="colhead")
+        head = RichText(WgpuChromView.header(), id="colhead", can_focus=False)
         head.layout_hint_rows = 1
         chroms = WgpuChromView(id="chroms")
         chroms.on_moved = self._chrom_moved
@@ -124,7 +122,7 @@ class GenomeScreen(Screen):
         content_inner = Vertical(filt, head, chroms, id="content-inner")
         content_box = Panel(content_inner, title="CHROMOSOMES", id="content-box")
 
-        summary = RichText(id="summary")
+        summary = RichText(id="summary", can_focus=False)
         summary.on_action = self._run_action
         sum_box = Panel(
             VerticalScroll(summary, id="summary-scroll"),
@@ -133,6 +131,8 @@ class GenomeScreen(Screen):
         )
 
         yield Horizontal(files_box, content_box, sum_box, id="main")
+        from .app_api import focus_next
+
         yield KeyBar([
             ("Enter", "Load", lambda: self.load_highlighted()),
             ("O/Ins", "Add", lambda: self.open()),
@@ -144,7 +144,7 @@ class GenomeScreen(Screen):
             ("Z", "Collapse", lambda: self.collapse_all()),
             ("N", "Next Y", lambda: self.next_derived()),
             ("Esc", "Clear filter", lambda: self.clear_chrom_filter()),
-            ("Tab", "Focus", None),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ])
         yield StatusBar(id="status")

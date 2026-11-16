@@ -113,11 +113,9 @@ class JobsScreen(Screen):
         self._tick_handle = None
 
     def compose(self):
-        yield ModeBar(
-            "jobs",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "jobs", self._labels)
         ol = OptionList(id="jobs", row_lines=2)
         list_panel = Panel(ol, title="JOBS", id="list-box")
         metrics = Horizontal(
@@ -130,6 +128,8 @@ class JobsScreen(Screen):
         det_body = Vertical(metrics, Rule(id="jobs-rule"), detail)
         det_panel = Panel(det_body, title="DETAIL", id="det-box")
         yield Horizontal(list_panel, det_panel, id="main")
+        from .app_api import focus_next
+
         yield KeyBar([
             ("↑↓", "Select", None),
             ("P", "Pause/Resume", lambda: self.pause()),
@@ -138,6 +138,7 @@ class JobsScreen(Screen):
             ("X", "Clear done", lambda: self.clear_done()),
             ("A", "Pause all", lambda: self.pause_all()),
             ("/|F", "Filter", lambda: self.cycle_filter()),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("F1–F10", "Modes", None),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ])

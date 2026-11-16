@@ -115,13 +115,11 @@ class PgsScreen(Screen):
 
     # ── compose ──────────────────────────────────────────────────────
     def compose(self):
-        yield ModeBar(
-            "pgs",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
 
-        list_tabs = RichText(id="list-tabs")
+        yield make_mode_bar(self, "pgs", self._labels)
+
+        list_tabs = RichText(id="list-tabs", can_focus=False)
         list_tabs.layout_hint_h = 40
         list_tabs.on_action = self._run_action
         search = Input(
@@ -144,7 +142,7 @@ class PgsScreen(Screen):
         card_w.on_action = self._run_action
         card_box = Panel(card_w, title="MODEL", id="card-box")
 
-        over_tabs = RichText(id="over-tabs")
+        over_tabs = RichText(id="over-tabs", can_focus=False)
         over_tabs.layout_hint_h = 28
         over_tabs.on_action = self._run_action
         over = RichText(id="over")

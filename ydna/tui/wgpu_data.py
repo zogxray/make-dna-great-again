@@ -100,11 +100,9 @@ class DataScreen(Screen):
 
     # ── compose ──────────────────────────────────────────────────────
     def compose(self):
-        yield ModeBar(
-            "data",
-            self._labels,
-            on_select=lambda i: self.app.set_mode(i) if self.app else None,
-        )
+        from .app_api import make_mode_bar
+
+        yield make_mode_bar(self, "data", self._labels)
         sources = OptionList(id="sources", row_lines=3)
         src_box = Panel(sources, title="SOURCES", id="src-box")
 
@@ -786,6 +784,8 @@ class DataScreen(Screen):
         )
 
     def _key_items(self) -> list[tuple[str, str, Callable[[], None] | None]]:
+        from .app_api import focus_next
+
         try:
             s = self.source
         except Exception:  # noqa: BLE001
@@ -799,6 +799,7 @@ class DataScreen(Screen):
                 ("R", "Recheck", lambda: self.recheck()),
                 ("C", "Cancel", lambda: self.cancel_job()),
                 ("Del", "Forget path", lambda: self.clear_path()),
+                ("Tab", "Panel", lambda: focus_next(self)),
                 ("F1–F10", "Modes", None),
                 ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
             ]
@@ -810,6 +811,7 @@ class DataScreen(Screen):
             ("R", "Recheck", lambda: self.recheck()),
             ("C", "Cancel", lambda: self.cancel_job()),
             ("Del", "Forget", lambda: self.clear_path()),
+            ("Tab", "Panel", lambda: focus_next(self)),
             ("F1–F10", "Modes", None),
             ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
         ]

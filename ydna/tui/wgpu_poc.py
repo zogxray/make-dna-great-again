@@ -19,6 +19,10 @@ def run_wgpu_poc() -> int:
     try:
         from textual_wgpu import fonts as tw_fonts
         from textual_wgpu.mode_app import ModeApp
+
+        from .app_api import register_click_meta
+
+        register_click_meta()
     except ImportError as exc:
         print(
             "textual-wgpu is not installed in this environment.\n"
@@ -63,11 +67,23 @@ def run_wgpu_poc() -> int:
         for key, title in MODE_LABELS
     ]
 
-    ModeApp(
+    app = ModeApp(
         modes,
         theme=theme,
         title="MDGA · CRT",
         start="genome",
         post_fx={"bloom": crt.BLOOM, "scanlines": crt.SCANLINES},
-    ).run()
+    )
+    from .app_api import active_jobs_count
+
+    last_jobs = [-1]
+
+    def _poll_jobs() -> None:
+        cur = active_jobs_count()
+        if cur != last_jobs[0]:
+            last_jobs[0] = cur
+            app.request_draw()
+
+    app.set_interval(0.5, _poll_jobs)
+    app.run()
     return 0
