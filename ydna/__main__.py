@@ -31,6 +31,10 @@ def _tui_parser() -> argparse.ArgumentParser:
         help="Open in a separate terminal window (desktop), then exit this process",
     )
     parser.add_argument(
+        "--ui", choices=("textual", "wgpu", "textual-wgpu"), default="textual",
+        help="UI backend (wgpu=ModeApp CRT; textual-wgpu=experimental Textual-compat shim)",
+    )
+    parser.add_argument(
         "--input", type=Path, default=None,
         help="Папка с JSON-файлами Discover (по умолчанию — путь из режима Data, "
              "иначе data/ftdna/discover)",
@@ -54,6 +58,13 @@ def main(argv: list[str] | None = None) -> int:
     # ``python -m ydna.cli`` is separate; here only the ``ydna cli`` spelling.
 
     args = _tui_parser().parse_args(argv)
+    if args.ui == "wgpu":
+        from .tui.wgpu_poc import run_wgpu_poc
+        return run_wgpu_poc()
+    if args.ui == "textual-wgpu":
+        from .compat_wgpu import install_textual_wgpu_shim
+        install_textual_wgpu_shim()
+
     from .tui.run import run_tui
     return run_tui(folder=args.input, genomes=args.genome, window=args.window)
 
