@@ -102,7 +102,7 @@ def _md(body: str, *, width: int = _MD_WIDTH) -> Text:
 
 
 def thread_view(t: Thread | None, waiting: bool, draft: str = "",
-                *, width: int | None = None) -> RenderableType:
+                *, width: int | None = None, image_renderer=None) -> RenderableType:
     """Markdown-вид для просмотра (model bodies baked to Text)."""
     w = width or _MD_WIDTH
     parts: list[RenderableType] = []
@@ -121,7 +121,11 @@ def thread_view(t: Thread | None, waiting: bool, draft: str = "",
         parts.append(_header_rich(m.role, m.at, edit))
         if m.role == "model":
             from .images import render_model_body
-            parts.append(render_model_body(m.text, md_render=_md, width=w))
+            parts.append(
+                render_model_body(
+                    m.text, md_render=_md, width=w, image_renderer=image_renderer,
+                ),
+            )
         else:
             parts.append(_plain(m.text, BODY_STYLE.get(m.role, "")))
     if waiting:
@@ -131,7 +135,11 @@ def thread_view(t: Thread | None, waiting: bool, draft: str = "",
             head.append(" streaming\n", style=WARN)
             parts.append(head)
             from .images import render_model_body
-            parts.append(render_model_body(draft, md_render=_md, width=w))
+            parts.append(
+                render_model_body(
+                    draft, md_render=_md, width=w, image_renderer=image_renderer,
+                ),
+            )
         else:
             head.append(" …\n", style=WARN)
             parts.append(head)

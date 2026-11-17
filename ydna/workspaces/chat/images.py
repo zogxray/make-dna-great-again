@@ -160,8 +160,14 @@ def split_markdown_with_images(body: str) -> list[tuple[str, str | None, str]]:
     return chunks
 
 
-def render_model_body(body: str, *, md_render, width: int) -> RenderableType:
-    """Markdown text + inline half-block previews (resolve Commons search on the fly)."""
+def render_model_body(
+    body: str,
+    *,
+    md_render,
+    width: int,
+    image_renderer=None,
+) -> RenderableType:
+    """Markdown text + inline previews (half-block for TTY, or custom native renderer)."""
     parts = split_markdown_with_images(body)
     has_img = any(u for _t, u, _c in parts)
     if not has_img:
@@ -192,7 +198,10 @@ def render_model_body(body: str, *, md_render, width: int) -> RenderableType:
             miss.append(f"  {resolved}\n", style=DIM)
             renderables.append(miss)
             continue
-        img = halfblock_image(local, max_cols=min(56, max(24, width - 4)))
+        if image_renderer is not None:
+            img = image_renderer(local, width)
+        else:
+            img = halfblock_image(local, max_cols=min(56, max(24, width - 4)))
         if img is None:
             miss = Text()
             miss.append("  (image preview unavailable — install pillow)\n", style=MUTED)

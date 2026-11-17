@@ -41,6 +41,18 @@ _CUSTOM_MODEL = "__custom__"
 
 
 def _renderable_text(renderable, *, width: int) -> Text:
+    from rich.console import Group
+
+    if isinstance(renderable, Text):
+        return renderable
+    if isinstance(renderable, Group):
+        out = Text()
+        for item in renderable.renderables:
+            part = _renderable_text(item, width=width)
+            if out.plain and not out.plain.endswith("\n"):
+                out.append("\n")
+            out.append_text(part)
+        return out
     console = Console(
         width=max(40, width),
         height=max(128, width * 4),
@@ -342,9 +354,27 @@ class ChatScreen(Screen):
             body.on_action = self._run_action
             avail_w = body.rect.w or (sc.rect.w - sc.BAR_W - 4)
             width = max(40, (avail_w - 12) // 8) if avail_w > 24 else 72
+            from textual_wgpu.compositor import make_image_text
+            from textual_wgpu.fonts import cell_height
+
+            max_img_w = max(200, min(540, (avail_w if avail_w > 24 else 560) - 36))
+            row_h = max(1, cell_height(body.FONT_SIZE))
+
+            def _img_renderer(path: Path, _cols: int):
+                return make_image_text(
+                    path,
+                    max_width_px=max_img_w,
+                    max_height_px=340,
+                    row_height_px=row_h,
+                    indent_px=16,
+                )
+
             try:
                 rich = _renderable_text(
-                    thread_view(t, waiting, draft, width=width), width=width,
+                    thread_view(
+                        t, waiting, draft, width=width, image_renderer=_img_renderer,
+                    ),
+                    width=width,
                 )
                 body.update(rich, home=False)
             except Exception:  # noqa: BLE001

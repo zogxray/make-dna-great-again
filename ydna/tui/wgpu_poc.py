@@ -15,26 +15,14 @@ def _crt_theme():
     return Theme.from_mapping(crt.theme_mapping())
 
 
-def run_wgpu_poc() -> int:
-    try:
-        from textual_wgpu import fonts as tw_fonts
-        from textual_wgpu.mode_app import ModeApp
-
-        from .app_api import register_click_meta
-
-        register_click_meta()
-    except ImportError as exc:
-        print(
-            "textual-wgpu is not installed in this environment.\n"
-            "  pip install -e ../textual-wgpu\n"
-            f"({exc})",
-            file=sys.stderr,
-        )
-        return 1
+def build_wgpu_app():
+    from textual_wgpu import fonts as tw_fonts
+    from textual_wgpu.mode_app import ModeApp
 
     from ..theme import crt
+    from .app_api import active_jobs_count, register_click_meta
 
-    # Palette + Terminus-like mono + CRT post-FX (bloom / scanlines).
+    register_click_meta()
     crt.apply_styles()
     tw_fonts.configure(mono_paths=crt.MONO_PATHS, width_scale=crt.WIDTH_SCALE)
 
@@ -74,8 +62,6 @@ def run_wgpu_poc() -> int:
         start="genome",
         post_fx={"bloom": crt.BLOOM, "scanlines": crt.SCANLINES},
     )
-    from .app_api import active_jobs_count
-
     last_jobs = [-1]
 
     def _poll_jobs() -> None:
@@ -85,5 +71,19 @@ def run_wgpu_poc() -> int:
             app.request_draw()
 
     app.set_interval(0.5, _poll_jobs)
+    return app
+
+
+def run_wgpu_poc() -> int:
+    try:
+        app = build_wgpu_app()
+    except ImportError as exc:
+        print(
+            "textual-wgpu is not installed in this environment.\n"
+            "  pip install -e ../textual-wgpu\n"
+            f"({exc})",
+            file=sys.stderr,
+        )
+        return 1
     app.run()
     return 0

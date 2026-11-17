@@ -172,6 +172,18 @@ def test_wgpu_chat_has_scrollbar_and_scrolls_to_bottom_on_enter(tmp_path, monkey
             await pilot.press("shift+tab")
             assert getattr(app._focus, "id", None) == "thread-scroll"
 
+            # Mouse click inside CHAT body / title focuses #thread-scroll, and wheel scrolls it
+            md_w = pilot.query_one("#thread-md")
+            app.set_focus(pilot.query_one("#notes"))
+            app.on_pointer(md_w.rect.x + 20, md_w.rect.y + 20, 1)
+            app.on_pointer_up(md_w.rect.x + 20, md_w.rect.y + 20, 1)
+            assert getattr(app._focus, "id", None) == "thread-scroll"
+
+            sc.scroll_home()
+            assert sc.scroll_y == 0
+            app.on_wheel(md_w.rect.x + 20, md_w.rect.y + 20, 0.0, 120.0)
+            assert sc.scroll_y > 0
+
             # F10 Help Tab switches focus cleanly between md-toc (CONTENTS) and md-scroll (HELP)
             await pilot.press("f1")
             await pilot.pause()
@@ -181,5 +193,62 @@ def test_wgpu_chat_has_scrollbar_and_scrolls_to_bottom_on_enter(tmp_path, monkey
             assert getattr(app._focus, "id", None) == "md-toc"
             await pilot.press("tab")
             assert getattr(app._focus, "id", None) == "md-scroll"
+
+    asyncio.run(_run())
+
+
+def test_wgpu_chat_renders_native_images_not_halfblocks(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    from PIL import Image, ImageDraw
+    from textual_wgpu.widgets import VerticalScroll
+    from ydna.core import chat, media_cache
+    from ydna.tui.wgpu_chat import ChatScreen
+    from ydna.workspaces.chat import images as chat_images
+
+    img_path = tmp_path / "swatch.png"
+    src = Image.new("RGBA", (180, 90), (220, 40, 40, 255))
+    for x in range(90, 180):
+        for y in range(90):
+            src.putpixel((x, y), (40, 90, 230, 255))
+    src.save(img_path)
+    monkeypatch.setattr(media_cache, "ensure_local_image", lambda url, **kw: img_path)
+    monkeypatch.setattr(chat_images, "ensure_local_image", lambda url, **kw: img_path)
+
+    t = chat.new_thread()
+    t.title = "Native image chat"
+    t.messages.append(chat.Message("user", "Show image"))
+    t.messages.append(chat.Message("model", "Preview:\n\n![Swatch](https://example.org/swatch.png)\n"))
+    chat.save(t)
+
+    async def _run():
+        app = ModeApp([("chat", "Chat", ChatScreen)], theme=_theme(), start="chat")
+        async with app.run_test(size=(1100, 720)) as pilot:
+            await pilot.pause()
+            app.screen.reload(keep=t.id)
+            await pilot.pause()
+            md = pilot.query_one("#thread-md")
+            sc = pilot.query_one("#thread-scroll", VerticalScroll)
+            strips = md.render_lines()
+            assert any(seg.meta and "@image" in seg.meta for st in strips for seg in st.segments)
+            assert not any("▄" in st.plain() or "▀" in st.plain() for st in strips)
+            assert any(act == "screen.edit_msg(0)" for *_, act in md._click_spans)
+
+            frame = Image.new("RGBA", (1100, 720))
+            app.screen.paint(ImageDraw.Draw(frame))
+            reds = sum(
+                1
+                for y in range(sc.rect.y, sc.rect.y1)
+                for x in range(sc.rect.x, sc.rect.x1 - 10)
+                if frame.getpixel((x, y))[:3] == (220, 40, 40)
+            )
+            blues = sum(
+                1
+                for y in range(sc.rect.y, sc.rect.y1)
+                for x in range(sc.rect.x, sc.rect.x1 - 10)
+                if frame.getpixel((x, y))[:3] == (40, 90, 230)
+            )
+            assert reds > 1000 and blues > 1000
 
     asyncio.run(_run())
